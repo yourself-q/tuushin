@@ -26,6 +26,7 @@ Linux is intended but has not been tested yet. MIT licensed.
 | `teleop/` | Master and slave controllers, the device interface (`Device1D`) with simulated devices, `HapticLink` (one end of a session over UDP), and real-time master and slave nodes. |
 | `net/` | UDP sockets with kernel receive timestamps, clock-skew estimation from four-timestamp exchanges, channel models (fixed delay, jitter, Gilbert-Elliott loss, bottleneck queue, recorded traces), and path measurement with probes and a reflector. |
 | `wire/` | The datagram format: a 32-byte header whose echo fields let each end measure the round trip from ordinary traffic, as RTCP does. |
+| `crypto/` | A Noise_NNpsk0 handshake and ChaCha20-Poly1305 on libsodium: a pre-shared key becomes fresh keys for every session, and every datagram is authenticated and encrypted (see Authentication below). |
 | `sim/` | A deterministic 1-DoF teleoperation simulator built on the same controllers and devices. |
 | `tools/` | `tuushin-sim`, `tuushin-teleop` (master and slave as two processes), `tuushin-probe` (measure a path, write replayable traces). |
 
@@ -37,7 +38,8 @@ cmake --build build
 ./build/tests/tuushin_tests          # all tests; pass a name to run a subset
 ```
 
-No dependencies beyond a C++17 compiler and CMake.
+Needs a C++17 compiler, CMake and libsodium (ISC licence):
+`brew install libsodium`, or `apt install libsodium-dev pkg-config`.
 
 ## Quick start
 
@@ -61,6 +63,16 @@ network had caused it:
 Each simulated device cuts its force when no command has come for two
 periods, as haptic devices do (`--watchdog MS` changes it, 0 disables it;
 see Loop stalls below).
+
+Across a network the slave should accept only its own master. Make a key,
+copy it to the other machine over a channel you trust (scp, say), and pass
+it to both ends:
+
+```sh
+./build/tools/tuushin-teleop keygen haptic.key       # mode 0600, never overwrites
+./build/tools/tuushin-teleop slave --port 47100 --key-file haptic.key
+./build/tools/tuushin-teleop master HOST --port 47100 --key-file haptic.key
+```
 
 Measure a real path and replay it:
 
@@ -169,15 +181,61 @@ without the watchdog fell below −1 mJ (the worst to −6 mJ); with it the
 worst of 48 sessions was −1e−5 J, and of 60 under 24 busy processes
 −2e−5 J.
 
+## Authentication
+
+Without a key, anyone who can send datagrams to the slave's port can drive
+the robot, and one forged datagram is enough to stall a session: claiming
+a sequence number far ahead, it makes every genuine sample look stale
+(`tests/test_teleop_auth.cpp` shows both). With `--key-file`:
+
+- The master opens with a Noise_NNpsk0_25519_ChaChaPoly_SHA256 handshake
+  (Perrin, *The Noise Protocol Framework*, rev. 34), the pattern for two
+  ends that share only a symmetric key. Its prologue binds the session id
+  and the passivity scheme. Both ends get two new keys, one per direction,
+  from the pre-shared key and two ephemeral X25519 keys, so every session
+  has its own keys, and a pre-shared key stolen later does not decrypt a
+  recorded session (forward secrecy).
+- Every haptic datagram is then sealed with ChaCha20-Poly1305: the sequence
+  number is the nonce, and the header, which stays readable, is associated
+  data. A datagram is authenticated before its sequence number reaches the
+  replay window, so a forged one changes nothing.
+- The first handshake message can be replayed: the slave cannot tell a
+  recorded hello from a new one. So it starts a session only once a sample
+  sealed under that handshake's keys arrives, which only the master that
+  holds the ephemeral key can produce. And, as in WireGuard's initiation
+  (Donenfeld, NDSS 2017), the hello carries the master's wall-clock time
+  inside its encryption: the slave answers only a hello newer than the
+  newest it has answered, so once a newer one has arrived a recorded hello
+  costs it neither a key exchange nor a reply. A copy of the current hello, even one that arrives ahead
+  of the genuine one from another address, gets the very same reply, which
+  only the master can use.
+
+What it costs, measured on an Apple M4: 16 bytes per datagram (84 instead
+of 68 for one degree of freedom), 0.39 µs to seal and 0.39 µs to open one,
+about 72 µs per end for the handshake, once per session. Over loopback the
+round trip did not change measurably (p50 0.041 to 0.044 ms sealed, 0.041
+to 0.047 ms open, five sessions each). The hello reply (80 bytes) is
+smaller than the hello (88 bytes), so the slave cannot be used to amplify
+traffic.
+
 ## Known issues
 
 - **Devices need a watchdog.** The stall handling above relies on the
   device cutting a stale force by itself; a host process cannot do it while
   it is descheduled. Behind a device without one, a stalled loop leaves the
   last force on (the first row of the table above).
-- **No authentication or encryption.** Anyone who can send datagrams from
-  the peer's address with the session id can inject samples. Do not drive
-  real hardware over an untrusted network with this yet.
+- **Authentication is opt-in and needs a key handed over out of band.**
+  Without `--key-file` nothing is authenticated (the tools say so at start).
+  The key belongs to one master-slave pair, like a WireGuard preshared key;
+  there are no public-key identities, and the key changes only when you
+  make a new one.
+- **A flood of forged hellos costs the slave CPU** while it waits for a
+  session: about 10 µs to reject each one. There is no cookie mechanism
+  (WireGuard's answer to this under load).
+- The slave forgets the newest hello time when it restarts, so one recorded
+  hello can be answered once more afterwards (still without starting a
+  session). A master whose wall clock is set back is refused until it
+  passes the newest time the slave has seen.
 - **Simulated devices only, one degree of freedom.** `teleop::Device1D` is
   the interface a real device will implement.
 - **The slave needs a reachable UDP port.** A master behind a NAT works (the
@@ -215,6 +273,11 @@ The code cites its sources where it uses them. The main ones:
 - H. Schulzrinne et al., RFC 3550 (RTP), for the jitter estimate and the echo
   fields; S. B. Moon, P. Skelly and D. Towsley, and V. Paxson, for clock-skew
   estimation from one-way delays.
+- T. Perrin, "The Noise Protocol Framework", revision 34, 2018, for the
+  handshake; checked against the cacophony test vectors.
+- J. A. Donenfeld, "WireGuard: next generation kernel network tunnel", NDSS
+  2017, for the timestamped first message (section 5.1) and the counter
+  nonce with a replay window.
 
 ## License
 
