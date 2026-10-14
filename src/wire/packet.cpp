@@ -142,7 +142,7 @@ std::optional<Header> decode_header(const std::uint8_t* data, std::size_t size) 
   if (data == nullptr || size < kHeaderSize || size > kMaxDatagram) return std::nullopt;
   if (data[0] != kMagic0 || data[1] != kMagic1 || data[2] != kVersion) return std::nullopt;
   const std::uint8_t type = data[3];
-  if (type < 1 || type > 5) return std::nullopt;
+  if (type < 1 || type > 6) return std::nullopt;
   Header h;
   h.type = static_cast<PacketType>(type);
   h.session = get_u32(data + 4);

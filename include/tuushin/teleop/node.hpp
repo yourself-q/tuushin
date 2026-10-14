@@ -12,6 +12,7 @@
 #include "tuushin/net/channel.hpp"
 #include "tuushin/net/clock_sync.hpp"
 #include "tuushin/net/probe.hpp"
+#include "tuushin/net/rendezvous.hpp"
 #include "tuushin/net/udp.hpp"
 #include "tuushin/teleop/controller.hpp"
 #include "tuushin/teleop/device.hpp"
@@ -60,6 +61,23 @@ class Ticker {
   std::vector<double> lateness_;
 };
 
+// Meeting the other end through a rendezvous server (net/rendezvous.hpp),
+// for two ends that are both behind NATs. It needs a pre-shared key: the
+// handshake is what tells the slave's reply from anything else at its
+// candidate addresses.
+struct RendezvousConfig {
+  net::Endpoint server;
+  net::RendezvousId id{};  // crypto::rendezvous_id(psk)
+  // Master: how long to wait for the server to announce a slave.
+  Nanos wait = 30 * kNanosPerSecond;
+  // Slave: how often, and for how long after the server announced a master,
+  // to send punches to all its candidates. The master's hellos come every
+  // hello_interval, so a punch interval well below it lets the second hello
+  // through at the latest.
+  Nanos punch_interval = 50 * kNanosPerMilli;
+  Nanos punch_duration = 5 * kNanosPerSecond;
+};
+
 struct MasterNodeConfig {
   MasterConfig control;
   Nanos duration = 10 * kNanosPerSecond;
@@ -74,13 +92,21 @@ struct MasterNodeConfig {
   // Pre-shared key; without one the session is not authenticated.
   std::optional<crypto::Key> psk;
   Nanos hello_interval = 200 * kNanosPerMilli;
+  // From the first hello; with a rendezvous, from when the server announced
+  // the slave.
   Nanos handshake_timeout = 5 * kNanosPerSecond;
+  // Find the slave through a rendezvous server; needs psk.
+  std::optional<RendezvousConfig> rendezvous;
 };
 
 struct MasterNodeReport {
   std::uint32_t session = 0;
+  net::Endpoint slave;            // where the session ran to
   bool authenticated = false;     // the handshake completed; datagrams sealed
   bool handshake_failed = false;  // no reply authenticated in time; no session ran
+  bool rendezvous_failed = false;  // the server announced no slave in time
+  net::Endpoint observed;          // this end's address as the server saw it
+  std::vector<net::Endpoint> candidates;  // the slave's, as the server announced them
   std::uint64_t ticks = 0, skipped = 0;
   net::DelayStats lateness;  // ns
   HapticLink::Counters link;
@@ -119,7 +145,10 @@ std::optional<std::uint64_t> hello_time(const std::vector<std::uint8_t>& payload
 
 // Runs a session against the slave at `slave` until cfg.duration elapses or
 // `stop` becomes true. `device` is sampled every tick; `emulation`, if set,
-// impairs the master-to-slave datagrams in-process.
+// impairs the master-to-slave datagrams in-process. With cfg.rendezvous,
+// `slave` may be left invalid: the hellos go to every candidate the server
+// announces (and to `slave` if valid), and the session runs to wherever the
+// first reply that authenticates came from.
 MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& slave,
                                  Device1D& device, const MasterNodeConfig& cfg,
                                  std::unique_ptr<net::ChannelModel> emulation = nullptr,
@@ -144,6 +173,9 @@ struct SlaveNodeConfig {
   // Hellos at or before this wall-clock time (ns, as in hello_payload) are
   // not answered; the newest answered one raises it as the node runs.
   std::uint64_t newest_hello = 0;
+  // Register with a rendezvous server while idle, and punch towards every
+  // master it announces; needs psk.
+  std::optional<RendezvousConfig> rendezvous;
 };
 
 struct SlaveSessionReport {
@@ -170,6 +202,9 @@ struct SlaveNodeHooks {
   // Called when a session or a handshake is refused (scheme mismatch, a key
   // on one end only, a hello that does not authenticate), with a reason.
   std::function<void(const std::string&)> on_refused;
+  // Called with what the rendezvous server said: this end's address as it
+  // saw it, and every master it announced.
+  std::function<void(const std::string&)> on_rendezvous;
 };
 
 // Serves sessions one after the other until `stop` becomes true, or after

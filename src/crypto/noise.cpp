@@ -90,6 +90,15 @@ std::optional<Key> key_from_hex(const std::string& text) {
   return k;
 }
 
+std::array<std::uint8_t, 16> rendezvous_id(const Key& psk) {
+  init();
+  static const char kLabel[] = "tuushin rendezvous v1";
+  std::array<std::uint8_t, 16> id{};
+  crypto_generichash(id.data(), id.size(), reinterpret_cast<const unsigned char*>(kLabel),
+                     sizeof kLabel - 1, psk.data(), psk.size());
+  return id;
+}
+
 void seal(const Key& k, std::uint64_t n, const std::uint8_t* ad, std::size_t ad_len,
           const std::uint8_t* pt, std::size_t pt_len, std::vector<std::uint8_t>& out) {
   unsigned char nonce[12];

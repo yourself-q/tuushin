@@ -59,6 +59,14 @@ Key random_key();
 std::string to_hex(const Key& k);
 std::optional<Key> key_from_hex(const std::string& text);
 
+// The identifier the two ends of a pair register under at a rendezvous
+// server (net/rendezvous.hpp): BLAKE2b with a 16-byte output, keyed with the
+// pre-shared key, over a fixed label. It tells the server which two
+// registrations belong together without telling it the key, and nobody
+// without the key can compute it. The label keeps it apart from every
+// other use of the key.
+std::array<std::uint8_t, 16> rendezvous_id(const Key& psk);
+
 // AEAD_CHACHA20_POLY1305 (RFC 8439) with the nonce Noise uses for
 // ChaChaPoly: 32 zero bits followed by the 64-bit counter `n`, little-endian.
 // A key must never be used twice with the same `n`.

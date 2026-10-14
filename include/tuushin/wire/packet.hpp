@@ -52,6 +52,8 @@ enum class PacketType : std::uint8_t {
   kProbeEcho = 3,   // reflector's answer to a probe; payload is padding
   kHello = 4,       // handshake message 1 (crypto::NoiseNNpsk0), initiator
   kHelloReply = 5,  // handshake message 2, responder; echo_seq = the hello's seq
+  kPunch = 6,       // opens the sender's NAT towards the receiver (net/rendezvous.hpp);
+                    // no payload, session 0; receivers ignore it
 };
 
 struct Header {

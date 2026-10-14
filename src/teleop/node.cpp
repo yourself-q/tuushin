@@ -112,14 +112,22 @@ std::uint64_t wall_clock_ns() {
 }
 
 // The master's side of the handshake: resends its hello every
-// hello_interval until a reply from the slave authenticates, keeping a
-// simulated device's physics current with the actuator off meanwhile.
-std::optional<crypto::SessionKeys> master_handshake(net::UdpSocket& socket,
-                                                    const net::Endpoint& slave,
-                                                    std::uint32_t session, Device1D& device,
-                                                    const MasterNodeConfig& cfg,
-                                                    const std::atomic<bool>* stop,
-                                                    std::vector<std::uint8_t>& buf) {
+// hello_interval to every candidate address of the slave until a reply
+// authenticates, keeping a simulated device's physics current with the
+// actuator off meanwhile. With a rendezvous the candidates come from the
+// server, and the reply may come from anywhere: a slave behind a NAT that
+// maps each destination to its own port answers from an address the server
+// never saw, and only the slave can make a reply that authenticates.
+struct Handshake {
+  crypto::SessionKeys keys;
+  net::Endpoint slave;
+};
+
+std::optional<Handshake> master_handshake(net::UdpSocket& socket, const net::Endpoint& slave,
+                                          std::uint32_t session, Device1D& device,
+                                          const MasterNodeConfig& cfg,
+                                          const std::atomic<bool>* stop,
+                                          std::vector<std::uint8_t>& buf, MasterNodeReport& rep) {
   const Passivity scheme = cfg.control.passivity;
   const auto prologue = handshake_prologue(session, scheme);
   crypto::NoiseNNpsk0 hs(crypto::NoiseNNpsk0::Role::kInitiator, *cfg.psk, prologue.data(),
@@ -132,31 +140,80 @@ std::optional<crypto::SessionKeys> master_handshake(net::UdpSocket& socket,
   h.flags = scheme_flags(scheme);
   std::vector<std::uint8_t> out;
   device.command_force(0.0);
+
+  std::optional<net::RendezvousClient> rv;
+  std::optional<net::Endpoint> server;
+  if (cfg.rendezvous) {
+    rv.emplace(cfg.rendezvous->server, cfg.rendezvous->id, net::RendezvousRole::kMaster,
+               net::host_addresses(socket));
+    server = cfg.rendezvous->server.for_family(socket.is_ipv6());
+  }
+  // A slave address given directly, in the form this socket sends to.
+  std::optional<net::Endpoint> direct;
+  if (slave.valid()) direct = slave.for_family(socket.is_ipv6());
+  std::vector<net::Endpoint> targets;
+  if (direct) targets.push_back(*direct);
+  std::uint64_t peer_changes = 0;
+
   const Nanos start = monotonic_now();
+  Nanos known_since = targets.empty() ? -1 : start;  // when the first candidate was known
   Nanos next_hello = start;
   for (;;) {
     const Nanos now = monotonic_now();
     device.read_position(now);
-    if (now - start >= cfg.handshake_timeout || (stop && stop->load())) return std::nullopt;
-    if (now >= next_hello) {
-      ++h.seq;
-      h.send_time = now;
-      wire::encode_raw(h, msg1.data(), msg1.size(), out);
-      socket.send_to(slave, out.data(), out.size());
+    if (stop && stop->load()) return std::nullopt;
+    if (known_since < 0 && now - start >= cfg.rendezvous->wait) {
+      rep.rendezvous_failed = true;
+      return std::nullopt;
+    }
+    if (known_since >= 0 && now - known_since >= cfg.handshake_timeout) return std::nullopt;
+    if (rv) {
+      if (const auto reg = rv->poll(now); reg && server) {
+        socket.send_to(*server, reg->data(), reg->size());
+      }
+    }
+    if (known_since >= 0 && now >= next_hello) {
+      for (const auto& t : targets) {
+        ++h.seq;
+        h.send_time = monotonic_now();
+        wire::encode_raw(h, msg1.data(), msg1.size(), out);
+        socket.send_to(t, out.data(), out.size());
+      }
       next_hello = now + cfg.hello_interval;
     }
-    socket.wait_readable(std::min(next_hello - now, 10 * kNanosPerMilli));
+    Nanos wake = now + 10 * kNanosPerMilli;
+    if (known_since >= 0) wake = std::min(wake, next_hello);
+    if (rv) wake = std::min(wake, rv->next_due());
+    if (wake > now) socket.wait_readable(wake - now);
     for (;;) {
       net::Endpoint from;
       const auto n = socket.recv_from(buf.data(), buf.size(), &from);
       if (!n) break;
-      if (*n > wire::kMaxDatagram || from != slave) continue;
+      if (*n > wire::kMaxDatagram) continue;
+      if (rv && rv->on_datagram(buf.data(), *n, from, monotonic_now())) {
+        rep.observed = rv->observed();
+        if (rv->peer_changes() != peer_changes) {
+          peer_changes = rv->peer_changes();
+          rep.candidates = rv->peer();
+          targets = net::sendable(rv->peer(), socket);
+          if (direct && std::find(targets.begin(), targets.end(), *direct) == targets.end()) {
+            targets.push_back(*direct);
+          }
+          if (known_since < 0) {
+            known_since = monotonic_now();
+            next_hello = known_since;
+          }
+        }
+        continue;
+      }
       const auto rh = wire::decode_header(buf.data(), *n);
       if (!rh || rh->type != wire::PacketType::kHelloReply || rh->session != session ||
           scheme_of(*rh) != scheme) {
         continue;
       }
-      if (hs.read_message(buf.data() + wire::kHeaderSize, rh->payload_len)) return hs.split();
+      if (hs.read_message(buf.data() + wire::kHeaderSize, rh->payload_len)) {
+        return Handshake{hs.split(), from};
+      }
     }
   }
 }
@@ -194,17 +251,31 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
                                  Device1D& device, const MasterNodeConfig& cfg,
                                  std::unique_ptr<net::ChannelModel> emulation,
                                  const std::atomic<bool>* stop) {
+  if (cfg.rendezvous && !cfg.psk) {
+    throw std::invalid_argument("run_master_node: a rendezvous needs a pre-shared key");
+  }
+  if (!cfg.rendezvous && !slave.valid()) {
+    throw std::invalid_argument("run_master_node: no slave address and no rendezvous");
+  }
   MasterNodeReport rep;
   rep.session = cfg.session != 0 ? cfg.session : random_session();
+  // The form this socket sends to and receives from: a dual-stack socket
+  // sees an IPv4 slave as IPv4-mapped.
+  if (slave.valid()) rep.slave = slave.for_family(socket.is_ipv6()).value_or(slave);
   socket.enable_rx_timestamps();
   std::vector<std::uint8_t> buf(wire::kMaxDatagram + 1);
-  HapticLink link(socket, rep.session, slave, cfg.control.passivity);
+  std::optional<crypto::SessionKeys> keys;
   if (cfg.psk) {
-    const auto keys = master_handshake(socket, slave, rep.session, device, cfg, stop, buf);
-    if (!keys) {
+    const auto hs = master_handshake(socket, slave, rep.session, device, cfg, stop, buf, rep);
+    if (!hs) {
       rep.handshake_failed = true;
       return rep;
     }
+    keys = hs->keys;
+    rep.slave = hs->slave;
+  }
+  HapticLink link(socket, rep.session, rep.slave, cfg.control.passivity);
+  if (keys) {
     link.set_keys(*keys);
     rep.authenticated = true;
   }
@@ -359,6 +430,31 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
     last_refused = session;
   };
 
+  // Rendezvous: registered while idle, it announces masters; each one
+  // announced is punched towards for a while, so that its hellos get
+  // through this end's NAT.
+  std::optional<net::RendezvousClient> rv;
+  std::optional<net::Endpoint> rv_server;
+  if (cfg.rendezvous) {
+    if (!cfg.psk) throw std::invalid_argument("run_slave_node: a rendezvous needs a pre-shared key");
+    rv.emplace(cfg.rendezvous->server, cfg.rendezvous->id, net::RendezvousRole::kSlave,
+               net::host_addresses(socket));
+    rv_server = cfg.rendezvous->server.for_family(socket.is_ipv6());
+  }
+  bool rv_answered = false;
+  std::uint64_t rv_changes = 0;
+  std::vector<net::Endpoint> punch_to;
+  Nanos punch_until = -1, next_punch = 0;
+  std::vector<std::uint8_t> punch;
+  {
+    wire::Header ph;
+    ph.type = wire::PacketType::kPunch;
+    wire::encode_raw(ph, nullptr, 0, punch);
+  }
+  auto tell = [&](const std::string& what) {
+    if (hooks.on_rendezvous) hooks.on_rendezvous(what);
+  };
+
   while (!stopped()) {
     // Idle: wait for the first datagram of a session, keeping a simulated
     // device's physics current with the actuator off.
@@ -374,9 +470,24 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
     std::optional<First> first;
     pending.clear();
     while (!stopped() && !first) {
-      socket.wait_readable(100 * kNanosPerMilli);
+      {
+        const Nanos t = monotonic_now();
+        Nanos wake = t + 100 * kNanosPerMilli;
+        if (rv) wake = std::min(wake, rv->next_due());
+        if (punch_until > t) wake = std::min(wake, next_punch);
+        if (wake > t) socket.wait_readable(wake - t);
+      }
       const Nanos now = monotonic_now();
       device.read_position(now);
+      if (rv) {
+        if (const auto reg = rv->poll(now); reg && rv_server) {
+          socket.send_to(*rv_server, reg->data(), reg->size());
+        }
+      }
+      if (now < punch_until && now >= next_punch) {
+        for (const auto& t : punch_to) socket.send_to(t, punch.data(), punch.size());
+        next_punch = now + cfg.rendezvous->punch_interval;
+      }
       pending.erase(std::remove_if(pending.begin(), pending.end(),
                                    [&](const PendingHandshake& p) {
                                      return now - p.answered > cfg.handshake_timeout;
@@ -388,6 +499,23 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
         const auto n = socket.recv_from(buf.data(), buf.size(), &from, &rx);
         if (!n) break;
         if (*n > wire::kMaxDatagram) continue;
+        if (rv && rv->on_datagram(buf.data(), *n, from, now)) {
+          if (!rv_answered) {
+            rv_answered = true;
+            tell("registered at " + rv->server().to_string() + ", which sees this end at " +
+                 rv->observed().to_string());
+          }
+          if (rv->peer_changes() != rv_changes) {
+            rv_changes = rv->peer_changes();
+            punch_to = net::sendable(rv->peer(), socket);
+            punch_until = now + cfg.rendezvous->punch_duration;
+            next_punch = now;
+            std::string list;
+            for (const auto& c : rv->peer()) list += (list.empty() ? "" : ", ") + c.to_string();
+            tell("master announced at " + list);
+          }
+          continue;
+        }
         const auto h = wire::decode_header(buf.data(), *n);
         if (!h || (h->type != wire::PacketType::kHaptic && h->type != wire::PacketType::kHello)) {
           continue;
@@ -395,15 +523,15 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
         const auto scheme = scheme_of(*h);
         if (!scheme) continue;
         if (*scheme != cfg.control.passivity && !cfg.adopt_scheme) {
-          refuse(h->session,
-                 "session from " + from.to_string() + " runs another passivity scheme; refused");
+          refuse(h->session, "session from " + from.canonical().to_string() +
+                                 " runs another passivity scheme; refused");
           continue;
         }
         const std::uint8_t* const payload = buf.data() + wire::kHeaderSize;
 
         if (h->type == wire::PacketType::kHello) {
           if (!cfg.psk) {
-            refuse(h->session, "session from " + from.to_string() +
+            refuse(h->session, "session from " + from.canonical().to_string() +
                                    " wants authentication, but this slave has no key; refused");
             continue;
           }
@@ -423,18 +551,18 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
                                  prologue.data(), prologue.size());
           const auto hello = hs.read_message(payload, h->payload_len);
           if (!hello) {
-            refuse(h->session, "handshake from " + from.to_string() +
+            refuse(h->session, "handshake from " + from.canonical().to_string() +
                                    " does not authenticate (another key?); refused");
             continue;
           }
           const auto stamp = hello_time(*hello);
           if (!stamp) {
-            refuse(h->session, "handshake from " + from.to_string() +
+            refuse(h->session, "handshake from " + from.canonical().to_string() +
                                    " carries no time (another version?); refused");
             continue;
           }
           if (*stamp <= newest_hello) {
-            refuse(h->session, "handshake from " + from.to_string() +
+            refuse(h->session, "handshake from " + from.canonical().to_string() +
                                    " is not newer than the last one answered (replayed?); refused");
             continue;
           }
@@ -465,7 +593,8 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
         std::optional<crypto::SessionKeys> keys;
         if (cfg.psk) {
           if (!(h->flags & wire::kFlagSealed)) {
-            refuse(h->session, "unauthenticated session from " + from.to_string() + " refused");
+            refuse(h->session,
+                   "unauthenticated session from " + from.canonical().to_string() + " refused");
             continue;
           }
           for (const auto& p : pending) {
@@ -488,6 +617,7 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
       }
     }
     if (!first) break;
+    punch_until = -1;
 
     SlaveSessionReport rep;
     rep.session = first->h.session;

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "tuushin/time.hpp"
 
@@ -22,10 +23,30 @@ class Endpoint {
   static std::optional<Endpoint> resolve(const std::string& host, std::uint16_t port,
                                          bool prefer_ipv6 = false);
 
+  // An endpoint from a raw address: 4 bytes for IPv4, 16 for IPv6, in
+  // network order. nullopt for any other length.
+  static std::optional<Endpoint> from_address(const std::uint8_t* addr, std::size_t len,
+                                              std::uint16_t port);
+
   bool valid() const { return len_ != 0; }
   bool is_ipv6() const;
   std::uint16_t port() const;
   std::string to_string() const;  // "1.2.3.4:5" or "[::1]:5"
+
+  // The raw address as from_address takes it; an IPv4-mapped IPv6 address
+  // (::ffff:a.b.c.d) gives its 4 IPv4 bytes. Empty if not valid().
+  std::vector<std::uint8_t> address() const;
+  // An IPv4-mapped IPv6 endpoint as plain IPv4; anything else unchanged. A
+  // dual-stack socket reports IPv4 peers in the mapped form, so compare
+  // canonical forms when the two may come from different sockets.
+  Endpoint canonical() const;
+  // The endpoint in the form a socket of the given family sends to: IPv4
+  // becomes IPv4-mapped for an IPv6 socket, a mapped address plain IPv4 for
+  // an IPv4 socket. nullopt for an IPv6 address and an IPv4 socket.
+  std::optional<Endpoint> for_family(bool ipv6) const;
+  // Loopback, link-local, unspecified or multicast: an address that means
+  // nothing to a host elsewhere.
+  bool is_local_only() const;
 
   friend bool operator==(const Endpoint& a, const Endpoint& b);
   friend bool operator!=(const Endpoint& a, const Endpoint& b) { return !(a == b); }
@@ -107,6 +128,9 @@ class UdpSocket {
   UdpSocket& operator=(UdpSocket&& o) noexcept;
 
   Endpoint local_endpoint() const;
+  // True for an IPv6 socket, which also sends to IPv4 peers in the mapped
+  // form (Endpoint::for_family).
+  bool is_ipv6() const { return ipv6_; }
 
   // Marks outgoing datagrams with a DSCP code point (RFC 2474), for example
   // 46 (Expedited Forwarding, RFC 3246) for haptic samples. Many networks
@@ -146,5 +170,13 @@ class UdpSocket {
   bool rx_timestamps_ = false;
   RxStampConverter stamps_;
 };
+
+// The addresses at which another host could reach `socket` without a NAT
+// in between: the bound address, or for a wildcard socket the addresses of
+// the host's interfaces that are up (of the socket's family; both for a
+// dual-stack IPv6 socket), all with the socket's port. Loopback and
+// link-local addresses are left out (Endpoint::is_local_only). At most
+// `limit` are returned, IPv4 first.
+std::vector<Endpoint> host_addresses(const UdpSocket& socket, std::size_t limit = 8);
 
 }  // namespace tuushin::net

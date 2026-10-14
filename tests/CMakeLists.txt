@@ -14,6 +14,7 @@ add_executable(tuushin_tests
   test_teleop_node.cpp
   test_teleop_stall.cpp
   test_teleop_auth.cpp
+  test_rendezvous.cpp
 )
 target_link_libraries(tuushin_tests PRIVATE tuushin)
 add_test(NAME tuushin_tests COMMAND tuushin_tests)

@@ -145,7 +145,7 @@ TEST_CASE(wire_decoder_rejects_malformed) {
   CHECK(!decode_header(b.data(), b.size()).has_value());
   b = mutated(3, 0);  // type
   CHECK(!decode_header(b.data(), b.size()).has_value());
-  b = mutated(3, 6);
+  b = mutated(3, 7);
   CHECK(!decode_header(b.data(), b.size()).has_value());
   b = mutated(3, static_cast<std::uint8_t>(PacketType::kHello));  // a header, but not haptic
   CHECK(decode_header(b.data(), b.size()).has_value());
@@ -195,6 +195,14 @@ TEST_CASE(wire_split_codecs_match_the_whole_datagram) {
   REQUIRE(hh);
   CHECK(hh->type == PacketType::kHelloReply && hh->payload_len == sizeof msg);
   CHECK(std::memcmp(raw.data() + kHeaderSize, msg, sizeof msg) == 0);
+
+  Header punch;
+  punch.type = PacketType::kPunch;
+  CHECK(encode_raw(punch, nullptr, 0, raw) == kHeaderSize);
+  const auto ph = decode_header(raw.data(), raw.size());
+  REQUIRE(ph);
+  CHECK(ph->type == PacketType::kPunch && ph->payload_len == 0 && ph->session == 0);
+  CHECK(!decode_haptic(raw.data(), raw.size()));
 }
 
 TEST_CASE(wire_decoder_survives_random_input) {

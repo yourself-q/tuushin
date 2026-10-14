@@ -2,6 +2,8 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -12,6 +14,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -121,6 +124,84 @@ std::optional<Endpoint> Endpoint::resolve(const std::string& host, std::uint16_t
   }
   freeaddrinfo(res);
   return out;
+}
+
+std::optional<Endpoint> Endpoint::from_address(const std::uint8_t* addr, std::size_t len,
+                                               std::uint16_t port) {
+  Endpoint e;
+  if (len == 4) {
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+    std::memcpy(&a.sin_addr, addr, 4);
+    std::memcpy(e.data(), &a, sizeof a);
+    e.set_size(sizeof a);
+    return e;
+  }
+  if (len == 16) {
+    sockaddr_in6 a{};
+    a.sin6_family = AF_INET6;
+    a.sin6_port = htons(port);
+    std::memcpy(&a.sin6_addr, addr, 16);
+    std::memcpy(e.data(), &a, sizeof a);
+    e.set_size(sizeof a);
+    return e;
+  }
+  return std::nullopt;
+}
+
+namespace {
+
+bool is_v4_mapped(const sockaddr_in6& a) {
+  static const std::uint8_t kPrefix[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+  return std::memcmp(&a.sin6_addr, kPrefix, sizeof kPrefix) == 0;
+}
+
+}  // namespace
+
+std::vector<std::uint8_t> Endpoint::address() const {
+  if (!valid()) return {};
+  if (is_ipv6()) {
+    const auto* a = static_cast<const sockaddr_in6*>(data());
+    const auto* b = reinterpret_cast<const std::uint8_t*>(&a->sin6_addr);
+    if (is_v4_mapped(*a)) return std::vector<std::uint8_t>(b + 12, b + 16);
+    return std::vector<std::uint8_t>(b, b + 16);
+  }
+  const auto* a = static_cast<const sockaddr_in*>(data());
+  const auto* b = reinterpret_cast<const std::uint8_t*>(&a->sin_addr);
+  return std::vector<std::uint8_t>(b, b + 4);
+}
+
+Endpoint Endpoint::canonical() const {
+  if (!is_ipv6()) return *this;
+  const auto a = address();
+  return a.size() == 4 ? *from_address(a.data(), 4, port()) : *this;
+}
+
+std::optional<Endpoint> Endpoint::for_family(bool ipv6) const {
+  if (!valid()) return std::nullopt;
+  const auto a = address();
+  if (a.size() == 16) return ipv6 ? std::optional<Endpoint>(*this) : std::nullopt;
+  if (!ipv6) return from_address(a.data(), 4, port());
+  std::uint8_t mapped[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+  std::memcpy(mapped + 12, a.data(), 4);
+  return from_address(mapped, 16, port());
+}
+
+bool Endpoint::is_local_only() const {
+  const auto a = address();
+  if (a.size() == 4) {
+    const bool zero = a[0] == 0 && a[1] == 0 && a[2] == 0 && a[3] == 0;
+    return zero || a[0] == 127 || (a[0] == 169 && a[1] == 254) || a[0] >= 224;
+  }
+  if (a.size() == 16) {
+    bool zero = true;
+    for (int i = 0; i < 15; ++i) zero = zero && a[i] == 0;
+    const bool unspecified_or_loopback = zero && (a[15] == 0 || a[15] == 1);
+    const bool link_local = a[0] == 0xfe && (a[1] & 0xc0) == 0x80;
+    return unspecified_or_loopback || link_local || a[0] == 0xff;
+  }
+  return true;
 }
 
 bool Endpoint::is_ipv6() const { return valid() && as_sa(*this)->sa_family == AF_INET6; }
@@ -353,6 +434,45 @@ bool UdpSocket::wait_readable(Nanos timeout) {
   const int r = ::poll(&p, 1, ms);
   return r > 0 && (p.revents & POLLIN) != 0;
 #endif
+}
+
+std::vector<Endpoint> host_addresses(const UdpSocket& socket, std::size_t limit) {
+  std::vector<Endpoint> v4, v6;
+  const Endpoint local = socket.local_endpoint();
+  const auto bound = local.address();
+  bool wildcard = !bound.empty();
+  for (const auto b : bound) wildcard = wildcard && b == 0;
+  if (!wildcard) {
+    const Endpoint c = local.canonical();
+    if (c.valid() && !c.is_local_only()) (c.is_ipv6() ? v6 : v4).push_back(c);
+  } else {
+    ifaddrs* list = nullptr;
+    if (::getifaddrs(&list) == 0) {
+      for (const ifaddrs* i = list; i != nullptr; i = i->ifa_next) {
+        if (i->ifa_addr == nullptr || (i->ifa_flags & IFF_UP) == 0 ||
+            (i->ifa_flags & IFF_LOOPBACK) != 0) {
+          continue;
+        }
+        std::optional<Endpoint> e;
+        if (i->ifa_addr->sa_family == AF_INET) {
+          const auto* a = reinterpret_cast<const sockaddr_in*>(i->ifa_addr);
+          e = Endpoint::from_address(reinterpret_cast<const std::uint8_t*>(&a->sin_addr), 4,
+                                     local.port());
+        } else if (i->ifa_addr->sa_family == AF_INET6 && socket.is_ipv6()) {
+          const auto* a = reinterpret_cast<const sockaddr_in6*>(i->ifa_addr);
+          e = Endpoint::from_address(reinterpret_cast<const std::uint8_t*>(&a->sin6_addr), 16,
+                                     local.port());
+        }
+        if (!e || e->is_local_only()) continue;
+        auto& out = e->is_ipv6() ? v6 : v4;
+        if (std::find(out.begin(), out.end(), *e) == out.end()) out.push_back(*e);
+      }
+      ::freeifaddrs(list);
+    }
+  }
+  v4.insert(v4.end(), v6.begin(), v6.end());
+  if (v4.size() > limit) v4.resize(limit);
+  return v4;
 }
 
 }  // namespace tuushin::net
