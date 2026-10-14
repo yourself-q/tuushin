@@ -6,19 +6,32 @@
 //   on the robot side:     tuushin-teleop slave --port 47100
 //   on the operator side:  tuushin-teleop master HOST --port 47100 --duration 20 --log m.csv
 //
+// With a shared key (tuushin-teleop keygen FILE, copied to both machines,
+// then --key-file FILE on both ends) the ends authenticate each other and
+// seal every datagram; without one, anyone who can reach the slave's port
+// can drive it.
+//
 // Both ends can impair their outgoing datagrams in-process to try a path on
 // loopback: --emulate-delay 25 on each end gives a 50 ms round trip, and
 // --emulate-trace replays a path recorded with tuushin-probe.
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
+#include "tuushin/crypto/noise.hpp"
 #include "tuushin/net/channel.hpp"
 #include "tuushin/net/trace.hpp"
 #include "tuushin/net/udp.hpp"
@@ -38,6 +51,8 @@ void on_signal(int) { g_stop.store(true); }
 void usage() {
   std::fprintf(stderr,
                "usage:\n"
+               "  tuushin-teleop keygen FILE\n"
+               "      write a new random key to FILE (mode 0600; never overwrites)\n"
                "  tuushin-teleop slave [options]\n"
                "      --bind HOST          local address (all)\n"
                "      --once               serve one session, then exit\n"
@@ -54,6 +69,8 @@ void usage() {
                "      --ipv6               prefer IPv6 when HOST has both\n"
                "      --log FILE           per-tick CSV log\n"
                "  common options\n"
+               "      --key-file FILE      shared key (keygen): authenticate the other end\n"
+               "                           and seal every datagram\n"
                "      --port P             slave's UDP port (47100)\n"
                "      --scheme S           none, channel or reflect (reflect)\n"
                "      --rate HZ            control rate (1000)\n"
@@ -88,6 +105,7 @@ struct Options {
   double watchdog_ms = -1.0;  // negative: the PC's holding horizon
   bool ipv6 = false;
   std::string log;
+  std::string key_file;
   // master
   double duration = 10.0;
   double max_force = 20.0;
@@ -170,12 +188,53 @@ void print_link(const teleop::HapticLink::Counters& c, const char* rx_dir) {
               static_cast<unsigned long long>(c.sent),
               static_cast<unsigned long long>(c.send_failed),
               static_cast<unsigned long long>(c.emulated_lost));
-  std::printf("received %llu %s, missing %llu (%.2f %%), late %llu, duplicates %llu, foreign %llu\n",
+  std::printf("received %llu %s, missing %llu (%.2f %%), late %llu, duplicates %llu, foreign %llu",
               static_cast<unsigned long long>(c.received), rx_dir,
               static_cast<unsigned long long>(c.missing), lost,
               static_cast<unsigned long long>(c.late),
               static_cast<unsigned long long>(c.duplicates),
               static_cast<unsigned long long>(c.foreign));
+  if (c.unauthentic) {
+    std::printf(", not authentic %llu", static_cast<unsigned long long>(c.unauthentic));
+  }
+  std::printf("\n");
+}
+
+// keygen: a fresh key in hex, in a file only its owner can read. An existing
+// file is left alone, since overwriting a key locks out the other end.
+int run_keygen(const std::string& path) {
+  const std::string text = crypto::to_hex(crypto::random_key()) + "\n";
+  const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+  if (fd < 0) throw std::runtime_error("cannot create " + path + ": " + std::strerror(errno));
+  const bool ok = ::write(fd, text.data(), text.size()) == static_cast<ssize_t>(text.size());
+  ::close(fd);
+  if (!ok) throw std::runtime_error("cannot write " + path);
+  std::fprintf(stderr, "wrote a new key to %s; copy it to the other end over a channel you trust\n",
+               path.c_str());
+  return 0;
+}
+
+std::optional<crypto::Key> load_key(const Options& o) {
+  if (o.key_file.empty()) {
+    std::fprintf(stderr,
+                 "note: no --key-file; datagrams are not authenticated, so anyone who can "
+                 "reach the slave can drive it\n");
+    return std::nullopt;
+  }
+  std::FILE* f = std::fopen(o.key_file.c_str(), "r");
+  if (!f) throw std::runtime_error("cannot open key file " + o.key_file);
+  char text[256];
+  const std::size_t n = std::fread(text, 1, sizeof text - 1, f);
+  std::fclose(f);
+  text[n] = '\0';
+  const auto key = crypto::key_from_hex(text);
+  if (!key) throw std::runtime_error(o.key_file + " does not hold a key (64 hex digits)");
+  struct stat st;
+  if (::stat(o.key_file.c_str(), &st) == 0 && (st.st_mode & 077) != 0) {
+    std::fprintf(stderr, "note: %s is readable by other users (chmod 600 it)\n",
+                 o.key_file.c_str());
+  }
+  return key;
 }
 
 net::UdpSocket open_socket(const Options& o, const net::Endpoint& local) {
@@ -201,6 +260,7 @@ int run_master(const Options& o) {
   cfg.control.deadband_params.k = o.deadband;
   cfg.duration = from_seconds(o.duration);
   cfg.log_path = o.log;
+  cfg.psk = load_key(o);
 
   const Nanos start = monotonic_now();
   teleop::OperatorParams op;
@@ -212,6 +272,13 @@ int run_master(const Options& o) {
                emulating(o) ? ", emulating impairments" : "");
   const auto rep =
       teleop::run_master_node(sock, *peer, device, cfg, make_emulation(o, start, 1), &g_stop);
+  if (rep.handshake_failed) {
+    std::printf("handshake with %s failed: no authenticated reply within %.0f s (is the slave "
+                "running, with the same key?)\n",
+                peer->to_string().c_str(), to_seconds(cfg.handshake_timeout));
+    return 2;
+  }
+  if (rep.authenticated) std::printf("authenticated (%s)\n", crypto::NoiseNNpsk0::kProtocolName);
 
   std::printf("session %08x, %llu ticks (%llu skipped), master PC active %.1f %%\n", rep.session,
               static_cast<unsigned long long>(rep.ticks),
@@ -220,7 +287,8 @@ int run_master(const Options& o) {
   print_stats("tick late", rep.lateness, 1e3, "us");
   print_link(rep.link, "from the slave");
   if (!rep.slave_answered) {
-    std::printf("no answer from the slave at %s\n", peer->to_string().c_str());
+    std::printf("no answer from the slave at %s%s\n", peer->to_string().c_str(),
+                cfg.psk ? "" : " (a slave with --key-file refuses a master without one)");
     return 2;
   }
   print_stats("rtt", rep.rtt, 1e6, "ms");
@@ -254,6 +322,7 @@ int run_slave(const Options& o) {
   cfg.adopt_scheme = o.adopt;
   cfg.once = o.once;
   cfg.log_prefix = o.log;
+  cfg.psk = load_key(o);
 
   teleop::WallParams wall;
   wall.k = o.wall_k;
@@ -267,8 +336,9 @@ int run_slave(const Options& o) {
   }
   hooks.on_refused = [](const std::string& why) { std::fprintf(stderr, "%s\n", why.c_str()); };
   hooks.on_session_end = [](const teleop::SlaveSessionReport& r) {
-    std::printf("session %08x from %s, scheme %s, ended by %s\n", r.session,
+    std::printf("session %08x from %s, scheme %s, %s, ended by %s\n", r.session,
                 r.master.to_string().c_str(), scheme_name(r.scheme),
+                r.authenticated ? "authenticated" : "not authenticated",
                 r.ended_by_final ? "the master" : "timeout or stop");
     std::printf("%llu ticks (%llu skipped), slave PC active %.1f %%\n",
                 static_cast<unsigned long long>(r.ticks), static_cast<unsigned long long>(r.skipped),
@@ -279,10 +349,10 @@ int run_slave(const Options& o) {
                 r.max_force, r.slave_net);
     std::fflush(stdout);
   };
-  std::fprintf(stderr, "slave on %s, scheme %s%s, %.0f Hz, %s%s\n",
+  std::fprintf(stderr, "slave on %s, scheme %s%s, %.0f Hz, %s%s%s\n",
                sock.local_endpoint().to_string().c_str(), scheme_name(o.scheme),
                o.adopt ? " (or the master's)" : "", o.rate, sched.c_str(),
-               emulating(o) ? ", emulating impairments" : "");
+               cfg.psk ? ", key required" : "", emulating(o) ? ", emulating impairments" : "");
   teleop::run_slave_node(sock, device, cfg, hooks, &g_stop);
   return 0;
 }
@@ -324,6 +394,7 @@ int main(int argc, char** argv) {
       else if (a == "--watchdog") o.watchdog_ms = parse_double(next(), "watchdog");
       else if (a == "--ipv6") o.ipv6 = true;
       else if (a == "--log") o.log = next();
+      else if (a == "--key-file") o.key_file = next();
       else if (a == "--duration") o.duration = parse_double(next(), "duration");
       else if (a == "--max-force") o.max_force = parse_double(next(), "max-force");
       else if (a == "--bind") o.bind = next();
@@ -339,7 +410,8 @@ int main(int argc, char** argv) {
       else if (a == "--emulate-loss") o.loss = parse_double(next(), "emulate-loss");
       else if (a == "--emulate-trace") o.trace = next();
       else if (a == "-h" || a == "--help") { usage(); return 0; }
-      else if (o.mode == "master" && !a.empty() && a[0] != '-' && o.host.empty()) o.host = a;
+      else if ((o.mode == "master" || o.mode == "keygen") && !a.empty() && a[0] != '-' &&
+               o.host.empty()) o.host = a;
       else throw std::runtime_error("unknown option " + a);
     }
     if (o.mode == "master") {
@@ -347,6 +419,10 @@ int main(int argc, char** argv) {
       return run_master(o);
     }
     if (o.mode == "slave") return run_slave(o);
+    if (o.mode == "keygen") {
+      if (o.host.empty()) throw std::runtime_error("keygen needs a FILE");
+      return run_keygen(o.host);
+    }
     usage();
     return 1;
   } catch (const std::exception& e) {
