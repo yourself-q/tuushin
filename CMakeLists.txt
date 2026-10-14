@@ -26,6 +26,7 @@ add_library(tuushin
   src/net/clock_sync.cpp
   src/net/probe.cpp
   src/net/rendezvous.cpp
+  src/net/stun.cpp
   src/net/trace.cpp
   src/net/udp.cpp
   src/rt/thread.cpp
