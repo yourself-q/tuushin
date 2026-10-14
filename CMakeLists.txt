@@ -21,8 +21,11 @@ add_library(tuushin
   src/control/reflection.cpp
   src/control/tdpa.cpp
   src/net/channel.cpp
+  src/net/clock_sync.cpp
   src/net/trace.cpp
+  src/net/udp.cpp
   src/sim/teleop1d.cpp
+  src/wire/packet.cpp
 )
 target_include_directories(tuushin PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

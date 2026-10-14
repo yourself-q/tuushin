@@ -5,6 +5,9 @@ add_executable(tuushin_tests
   test_channel.cpp
   test_reflection.cpp
   test_teleop1d.cpp
+  test_wire.cpp
+  test_udp.cpp
+  test_clock_sync.cpp
 )
 target_link_libraries(tuushin_tests PRIVATE tuushin)
 add_test(NAME tuushin_tests COMMAND tuushin_tests)
