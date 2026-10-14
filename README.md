@@ -14,8 +14,8 @@ that case: the passivity control that keeps the loop stable, the transport
 that carries it, and tools that measure real paths and replay them.
 
 **Status: early.** One degree of freedom, simulated devices, measured on
-loopback so far. Developed and tested on macOS; the code is POSIX C++17 and
-Linux is intended but has not been tested yet. MIT licensed.
+loopback and in a lab of Linux NATs so far. POSIX C++17, developed on macOS
+and also tested on Linux (Ubuntu 24.04, GCC 13.3). MIT licensed.
 
 ## What is in it
 
@@ -24,11 +24,11 @@ Linux is intended but has not been tested yet. MIT licensed.
 | `control/` | Time Domain Passivity Approach (TDPA): passivity observers and controllers in the conventional two-channel form, and the variant that books energy reflection at a slave-side position coupling in one store (Panzirsch, Ryu and Ferre 2019, "Approach 3"). The passivity controllers predict the work a zero-order-held force will do on a light device instead of assuming constant velocity. |
 | `codec/` | Perceptual deadband data reduction (Weber's law, Hinterseer et al. 2008). |
 | `teleop/` | Master and slave controllers, the device interface (`Device1D`) with simulated devices, `HapticLink` (one end of a session over UDP), and real-time master and slave nodes. |
-| `net/` | UDP sockets with kernel receive timestamps, clock-skew estimation from four-timestamp exchanges, channel models (fixed delay, jitter, Gilbert-Elliott loss, bottleneck queue, recorded traces), and path measurement with probes and a reflector. |
+| `net/` | UDP sockets with kernel receive timestamps and hop-limited sends, clock-skew estimation from four-timestamp exchanges, channel models (fixed delay, jitter, Gilbert-Elliott loss, bottleneck queue, recorded traces), path measurement with probes and a reflector, and a rendezvous server and client for ends behind NATs (see NAT traversal below). |
 | `wire/` | The datagram format: a 32-byte header whose echo fields let each end measure the round trip from ordinary traffic, as RTCP does. |
 | `crypto/` | A Noise_NNpsk0 handshake and ChaCha20-Poly1305 on libsodium: a pre-shared key becomes fresh keys for every session, and every datagram is authenticated and encrypted (see Authentication below). |
 | `sim/` | A deterministic 1-DoF teleoperation simulator built on the same controllers and devices. |
-| `tools/` | `tuushin-sim`, `tuushin-teleop` (master and slave as two processes), `tuushin-probe` (measure a path, write replayable traces). |
+| `tools/` | `tuushin-sim`, `tuushin-teleop` (master, slave and rendezvous server as separate processes), `tuushin-probe` (measure a path, write replayable traces), `nat_lab.sh` (master and slave behind Linux NATs in network namespaces). |
 
 ## Build and test
 
@@ -72,6 +72,15 @@ it to both ends:
 ./build/tools/tuushin-teleop keygen haptic.key       # mode 0600, never overwrites
 ./build/tools/tuushin-teleop slave --port 47100 --key-file haptic.key
 ./build/tools/tuushin-teleop master HOST --port 47100 --key-file haptic.key
+```
+
+When both ends are behind NATs, they meet through a rendezvous server on
+a host both can reach, and need no forwarded port:
+
+```sh
+./build/tools/tuushin-teleop rendezvous --port 47200          # reachable host
+./build/tools/tuushin-teleop slave --key-file haptic.key --rendezvous SERVER
+./build/tools/tuushin-teleop master --key-file haptic.key --rendezvous SERVER
 ```
 
 Measure a real path and replay it:
@@ -269,6 +278,96 @@ to 0.047 ms open, five sessions each). The hello reply (80 bytes) is
 smaller than the hello (88 bytes), so the slave cannot be used to amplify
 traffic.
 
+## NAT traversal
+
+A NAT forwards a datagram from outside only to an inside socket that has
+recently sent to that sender, so two ends behind NATs cannot reach each
+other by address alone. With `--rendezvous`, both register at a server
+that both can reach, from the socket they will use for the session. The
+server sees the outside address each NAT gave that socket and tells each
+end the other's, and then both send to each other: the first datagram of
+each end opens its own NAT for the other's address, so the other end's
+next one gets through. This is UDP hole punching (Ford, Srisuresh and
+Kegel 2005; RFC 5128) and the core of ICE (RFC 8445), simplified:
+
+- The candidates are the address the server saw and the host's own
+  addresses (for two ends on one LAN, whose router may not hairpin). There
+  are no relayed candidates (TURN).
+- The connectivity check is the haptic handshake. The master sends its
+  hello to every candidate of the slave and takes the first reply that
+  authenticates; the slave sends small punch datagrams to the master's
+  candidates only to open its own NAT. This is why `--rendezvous` needs
+  `--key-file`: authentication is what tells the slave's reply from
+  anything else at a candidate address.
+- The server learns an identifier both ends derive from their key (not the
+  key), their addresses and when they meet, and carries no haptic traffic.
+  Its replies are never larger than the registrations, so a forged source
+  address cannot make it amplify.
+
+**Sending at the same time is not enough; the first datagrams must be
+ordered.** When a datagram from the other end reaches a NAT before the
+inside socket has sent to that address, the NAT may keep a state of its own
+for the pair: Linux's conntrack does when the NAT host accepts datagrams
+addressed to itself, as it does without a firewall of its own. When the
+inside socket then sends to the same address, the NAT finds the pair taken
+and gives the socket another outside port. The address the server
+announced is then not the one the datagrams come from, and the other NAT
+drops them. In the lab below this broke every meeting in which one end was
+100 ms behind a NAT that accepts datagrams to itself (a Wi-Fi client in
+power save can be that far behind): the other end's datagrams came first.
+Trautwein et al. (2025), who measured 4.4 million hole-punching attempts in
+the IPFS network and found 70 % of them succeed, propose sending low-TTL
+packets first (section 7.2). tuushin does two things:
+
+- **Priming.** On learning the other end's candidates, each end first sends
+  them datagrams with a small hop limit (`--prime-hops`, 3 by default).
+  They open its own NAT and expire on the way, before they reach the other
+  NAT.
+- **Ready.** Each end then tells the server it is ready, and sends
+  datagrams that go the whole way (hellos, punches) only once the server
+  has passed on the other end's ready, or after 2 s without it. The server
+  forgets an end's ready when the other end moves or registers anew, and
+  tells the end so.
+
+Choosing `--prime-hops`: a datagram sent with a hop limit of t is
+forwarded by the first t − 1 routers and dropped by the t-th. It has to
+pass this end's NATs and must not reach the other end's, which takes a
+datagram addressed to itself whatever hop limit it has left. 3 passes a
+home router and the next hop (often a carrier-grade NAT) and stops before
+the other end's NAT wherever that is more than 3 hops away, as it nearly
+always is for two homes (traceroute shows the count). Two ends close
+together on one network may need 2. With 0, or on a system that cannot
+limit the hop count, nothing is primed: the master still waits for the
+slave's ready, but the slave, which must then go first, punches at once.
+
+`tools/nat_lab.sh` builds a master and a slave behind Linux NATs that
+filter by address and port, a rendezvous server and a chain of routers
+between the NATs, in network namespaces (in a privileged container on
+other systems; the script says how). Three routers, 20 ms round trip
+between the NATs; *time* is from the master's start to the end of a 2 s
+session:
+
+| scenario | result | time |
+|---|---|---|
+| cone NATs (endpoint-independent mapping) | connects | 2.15 s |
+| the master starts 0.5 s before the slave | connects | 2.65 s |
+| both behind one NAT | connects, over the LAN | 2.09 s |
+| the slave 100 ms behind its NAT | connects | 2.76 s |
+| the master 100 ms behind its NAT | connects | 2.97 s |
+| both NATs accept datagrams to themselves | connects | 2.14 s |
+| the slave 100 ms behind a NAT that accepts them | connects (failed without priming and ready) | 2.75 s |
+| the master 100 ms behind a NAT that accepts them | connects (failed without priming and ready) | 2.98 s |
+| both 100 ms behind NATs that accept them | connects | 3.58 s |
+| the slave 100 ms behind a NAT that accepts them, `--prime-hops 0` | connects: ready alone orders it | 2.76 s |
+| the master 100 ms behind a NAT that accepts them, `--prime-hops 0` | fails: the NAT moved the master to another port | — |
+| the same, primed, with one router between the NATs | fails: the primes reach the other NAT, with one hop to live | — |
+| the same with `--prime-hops 2` | connects | 2.96 s |
+| a symmetric NAT (a new port per destination) at either end or both | fails | — |
+
+The slave punches until its session starts, so with an end 100 ms behind
+its NAT the master counts the last few punches as `foreign` datagrams (5 to
+10 in the lab); they do no harm.
+
 ## Known issues
 
 - **Devices need a watchdog.** The stall handling above relies on the
@@ -295,9 +394,19 @@ traffic.
   input it predicted mostly never comes.
 - **Simulated devices only, one degree of freedom.** `teleop::Device1D` is
   the interface a real device will implement.
-- **The slave needs a reachable UDP port.** A master behind a NAT works (the
-  slave answers the address the session came from); NAT traversal for the
-  slave is not implemented.
+- **No relay.** Hole punching fails where a NAT gives every destination its
+  own port (a symmetric NAT, at either end, in the lab), and there is no
+  relayed path (TURN) to fall back to: the master reports that no
+  authenticated reply came. In the IPFS network, Trautwein et al. found
+  about 30 % of hole-punching attempts fail.
+- **`--prime-hops` is a guess about the path.** Two ends a few hops apart
+  need a smaller value, or the primes reach the other NAT (the lab's one-
+  router case); nothing measures the hop count yet.
+- **A session does not follow an end whose address changes.** If a NAT
+  moves an end to another port mid-session, or an end changes network, its
+  datagrams come from an address the other end ignores (counted as
+  `foreign`); the slave returns to idle after a second of silence, and
+  there is no reconnection.
 - One-way delays assume equal minimum delays in both directions, which no
   measurement between unsynchronized clocks can avoid.
 - Sequence numbers do not wrap (49 days at 1 kHz).
@@ -306,7 +415,9 @@ traffic.
 
 - Traces of real paths (fibre, 4G and 5G in Japan) recorded with
   `tuushin-probe`, published so that any simulator or testbed can replay them.
-- NAT traversal (STUN, hole punching), then QUIC datagrams as a transport.
+- A relay for ends behind symmetric NATs, a measured hop count for priming,
+  and sessions that survive an address change; then QUIC datagrams as a
+  transport.
 - Deadbands that adapt to the measured delay; more degrees of freedom; a real
   device behind `Device1D`.
 
@@ -335,6 +446,15 @@ The code cites its sources where it uses them. The main ones:
 - J. A. Donenfeld, "WireGuard: next generation kernel network tunnel", NDSS
   2017, for the timestamped first message (section 5.1) and the counter
   nonce with a replay window.
+- B. Ford, P. Srisuresh and D. Kegel, "Peer-to-peer communication across
+  network address translators", USENIX ATC 2005, and RFC 5128, for UDP hole
+  punching; A. Keranen, C. Holmberg and J. Rosenberg, RFC 8445 (ICE), for
+  candidates and connectivity checks; F. Audet and C. Jennings, RFC 4787,
+  for the terms of NAT behaviour.
+- D. Trautwein, C. Ihle, M. Schubotz and B. Gipp, "Challenging tribal
+  knowledge: large scale measurement campaign on decentralized NAT
+  traversal", arXiv:2510.27500, 2025, for priming with low-TTL datagrams
+  (section 7.2).
 
 ## License
 
