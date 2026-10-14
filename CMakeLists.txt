@@ -29,6 +29,8 @@ add_library(tuushin
   src/sim/teleop1d.cpp
   src/teleop/controller.cpp
   src/teleop/device.cpp
+  src/teleop/link.cpp
+  src/teleop/node.cpp
   src/wire/packet.cpp
 )
 target_include_directories(tuushin PUBLIC

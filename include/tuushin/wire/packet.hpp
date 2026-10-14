@@ -77,6 +77,16 @@ std::uint32_t hold_field(Nanos hold);
 constexpr std::uint16_t kFlagReceiptMap = 1;
 constexpr std::size_t kReceiptMapSize = 8;
 
+// Flags of kHaptic. kFlagFinal: the sender is ending the session; it is set
+// on every datagram from then on, so one loss does not hide it. The scheme
+// field names the passivity scheme the sender runs (teleop::Passivity:
+// 0 none, 1 channel, 2 reflective): the energies mean different things under
+// different schemes, so a receiver must refuse a session whose scheme it
+// does not run.
+constexpr std::uint16_t kFlagFinal = 1;
+constexpr int kSchemeShift = 1;
+constexpr std::uint16_t kSchemeMask = 0x3 << kSchemeShift;
+
 // Haptic sample, payload of kHaptic:
 //
 //   offset size field

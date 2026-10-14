@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <optional>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "tuushin/net/clock_sync.hpp"
@@ -108,6 +109,12 @@ struct DelayStats {
   // RFC 3550 interarrival jitter (smoothed |D|, gain 1/16), ns.
   double rfc3550_jitter = 0;
 };
+
+// Statistics of `delays` (ns, any order). `arrivals` pairs (arrival time,
+// transit) in any order for the RFC 3550 jitter, which runs in order of
+// arrival; leave it empty to skip the jitter.
+DelayStats delay_stats(std::vector<double> delays,
+                       std::vector<std::pair<Nanos, double>> arrivals = {});
 
 struct DirectionReport {
   std::size_t sent = 0;       // probes (forward) or echoes the reflector sent (backward)

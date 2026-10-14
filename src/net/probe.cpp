@@ -133,8 +133,23 @@ double quantile(const std::vector<double>& sorted, double p) {
   return sorted[std::min(idx, n - 1)];
 }
 
-// `delays` in any order; `arrivals` pairs (arrival time, transit) in any
-// order, for the RFC 3550 jitter, which runs in order of arrival.
+std::size_t longest_run(const std::vector<bool>& lost) {
+  std::size_t best = 0, run = 0;
+  for (bool l : lost) {
+    run = l ? run + 1 : 0;
+    best = std::max(best, run);
+  }
+  return best;
+}
+
+std::string format(const char* fmt, double a, double b = 0.0) {
+  char buf[160];
+  std::snprintf(buf, sizeof buf, fmt, a, b);
+  return buf;
+}
+
+}  // namespace
+
 DelayStats delay_stats(std::vector<double> delays, std::vector<std::pair<Nanos, double>> arrivals) {
   DelayStats s;
   s.count = delays.size();
@@ -155,23 +170,6 @@ DelayStats delay_stats(std::vector<double> delays, std::vector<std::pair<Nanos, 
   s.rfc3550_jitter = j;
   return s;
 }
-
-std::size_t longest_run(const std::vector<bool>& lost) {
-  std::size_t best = 0, run = 0;
-  for (bool l : lost) {
-    run = l ? run + 1 : 0;
-    best = std::max(best, run);
-  }
-  return best;
-}
-
-std::string format(const char* fmt, double a, double b = 0.0) {
-  char buf[160];
-  std::snprintf(buf, sizeof buf, fmt, a, b);
-  return buf;
-}
-
-}  // namespace
 
 ProbeReport analyze_probes(const ProbeClient& client, Nanos clock_window) {
   ProbeReport rep;
