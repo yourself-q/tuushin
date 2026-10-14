@@ -1,5 +1,14 @@
+// macOS declares the RFC 3542 options (IPV6_RECVHOPLIMIT) only on request.
+#define __APPLE_USE_RFC_3542 1
+
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+
 #include <cstdint>
 #include <cstring>
+#include <optional>
+#include <system_error>
 #include <vector>
 
 #include "test.hpp"
@@ -105,6 +114,91 @@ TEST_CASE(udp_dscp_range) {
   CHECK(s.set_dscp(0));
   CHECK(!s.set_dscp(-1));
   CHECK(!s.set_dscp(64));
+}
+
+namespace {
+
+// Asks `fd` to report the TTL (IPv4) or hop limit (IPv6) datagrams arrive
+// with.
+void report_hops(int fd, bool ipv6) {
+  const int one = 1;
+  if (!ipv6) {
+    ::setsockopt(fd, IPPROTO_IP, IP_RECVTTL, &one, sizeof one);
+    return;
+  }
+  ::setsockopt(fd, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, &one, sizeof one);
+}
+
+// The TTL or hop limit of the next datagram on `s` (see report_hops); -1
+// if none arrives within a second or it came without one.
+int received_hops(UdpSocket& s) {
+  if (!s.wait_readable(kNanosPerSecond)) return -1;
+  std::uint8_t buf[64];
+  alignas(cmsghdr) std::uint8_t control[256];
+  iovec iov{buf, sizeof buf};
+  msghdr mh{};
+  mh.msg_iov = &iov;
+  mh.msg_iovlen = 1;
+  mh.msg_control = control;
+  mh.msg_controllen = sizeof control;
+  if (::recvmsg(s.native_handle(), &mh, 0) < 0) return -1;
+  for (cmsghdr* c = CMSG_FIRSTHDR(&mh); c != nullptr; c = CMSG_NXTHDR(&mh, c)) {
+    int v = -1;
+    // Linux reports an int as IP_TTL, macOS a byte as IP_RECVTTL.
+    if (c->cmsg_level == IPPROTO_IP && (c->cmsg_type == IP_TTL || c->cmsg_type == IP_RECVTTL)) {
+      if (c->cmsg_len >= CMSG_LEN(sizeof v)) {
+        std::memcpy(&v, CMSG_DATA(c), sizeof v);
+      } else {
+        v = *CMSG_DATA(c);
+      }
+      return v;
+    }
+    if (c->cmsg_level == IPPROTO_IPV6 && c->cmsg_type == IPV6_HOPLIMIT) {
+      std::memcpy(&v, CMSG_DATA(c), sizeof v);
+      return v;
+    }
+  }
+  return -1;
+}
+
+}  // namespace
+
+TEST_CASE(udp_sends_hop_limited_datagrams_and_restores_the_limit) {
+  const std::uint8_t msg[1] = {7};
+  UdpSocket r4 = bind_loopback();
+  report_hops(r4.native_handle(), false);
+  const Endpoint to4 = loopback_peer(r4);
+
+  UdpSocket a = bind_loopback();
+  CHECK(!a.send_limited(to4, msg, 1, 0));
+  CHECK(!a.send_limited(to4, msg, 1, 256));
+  REQUIRE(a.send_limited(to4, msg, 1, 3));
+  CHECK(received_hops(r4) == 3);
+  REQUIRE(a.send_to(to4, msg, 1));
+  CHECK(received_hops(r4) > 3);
+
+  // A dual-stack socket sends to IPv4 peers in the mapped form, as IPv4.
+  UdpSocket d(*Endpoint::resolve("", 0));
+  const Endpoint mapped = *to4.for_family(d.is_ipv6());
+  REQUIRE(d.send_limited(mapped, msg, 1, 3));
+  CHECK(received_hops(r4) == 3);
+  REQUIRE(d.send_to(mapped, msg, 1));
+  CHECK(received_hops(r4) > 3);
+
+  // IPv6 proper, where the host has it.
+  if (!d.is_ipv6()) return;
+  std::optional<UdpSocket> r6;
+  try {
+    r6.emplace(*Endpoint::resolve("::1", 0));
+  } catch (const std::system_error&) {
+    return;
+  }
+  report_hops(r6->native_handle(), true);
+  const Endpoint to6 = *Endpoint::resolve("::1", r6->local_endpoint().port());
+  REQUIRE(d.send_limited(to6, msg, 1, 2));
+  CHECK(received_hops(*r6) == 2);
+  REQUIRE(d.send_to(to6, msg, 1));
+  CHECK(received_hops(*r6) > 2);
 }
 
 TEST_CASE(udp_socket_moves) {

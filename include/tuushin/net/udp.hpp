@@ -142,6 +142,16 @@ class UdpSocket {
   // kernel (buffer full, unreachable); the caller treats it as lost.
   bool send_to(const Endpoint& to, const std::uint8_t* data, std::size_t size);
 
+  // Sends one datagram that routers discard after `hops` hops (the IPv4
+  // TTL, the IPv6 hop limit; 1..255), and restores the socket's setting
+  // for the datagrams after it. A datagram that expires on the way still
+  // passes this host's own NAT, which then expects replies from `to`: this
+  // is how an end behind a NAT opens it without the datagram reaching the
+  // other end (rendezvous.hpp). Returns false, without sending, if the
+  // system does not let the limit be set; otherwise as send_to. The socket
+  // must not be sent on from another thread meanwhile.
+  bool send_limited(const Endpoint& to, const std::uint8_t* data, std::size_t size, int hops);
+
   // Asks the kernel to stamp each datagram on arrival (SO_TIMESTAMPNS on
   // Linux, SO_TIMESTAMP elsewhere). The stamp then no longer depends on when
   // the application gets round to reading, so a loop may sleep between

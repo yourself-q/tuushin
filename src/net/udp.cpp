@@ -329,6 +329,32 @@ bool UdpSocket::send_to(const Endpoint& to, const std::uint8_t* data, std::size_
   }
 }
 
+bool UdpSocket::send_limited(const Endpoint& to, const std::uint8_t* data, std::size_t size,
+                             int hops) {
+  if (!to.valid() || hops < 1 || hops > 255) return false;
+  // The option that limits a datagram to `to`. An IPv6 socket sends to an
+  // IPv4-mapped address as IPv4: Linux then takes the TTL from IP_TTL,
+  // macOS from IPV6_UNICAST_HOPS (and refuses IP_TTL on an IPv6 socket).
+  int level = IPPROTO_IP, name = IP_TTL;
+  if (ipv6_) {
+    level = IPPROTO_IPV6;
+    name = IPV6_UNICAST_HOPS;
+#if defined(__linux__)
+    if (to.address().size() == 4) {
+      level = IPPROTO_IP;
+      name = IP_TTL;
+    }
+#endif
+  }
+  int saved = 0;
+  socklen_t len = sizeof saved;
+  if (::getsockopt(fd_, level, name, &saved, &len) != 0 || len != sizeof saved) return false;
+  if (::setsockopt(fd_, level, name, &hops, sizeof hops) != 0) return false;
+  const bool sent = send_to(to, data, size);
+  const bool restored = ::setsockopt(fd_, level, name, &saved, sizeof saved) == 0;
+  return sent && restored;
+}
+
 bool UdpSocket::enable_rx_timestamps() {
   const int one = 1;
 #if defined(SO_TIMESTAMPNS)
