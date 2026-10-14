@@ -7,6 +7,7 @@
 #include <queue>
 #include <vector>
 
+#include "tuushin/crypto/noise.hpp"
 #include "tuushin/net/channel.hpp"
 #include "tuushin/net/clock_sync.hpp"
 #include "tuushin/net/udp.hpp"
@@ -46,6 +47,12 @@ class SeqWindow {
 // other end can measure the round trip from ordinary traffic, and collects
 // the four timestamps of every exchange for a clock fit afterwards.
 //
+// With session keys (set_keys) every datagram is sealed (wire::kFlagSealed)
+// and only datagrams that authenticate are accepted. The sequence window and
+// the echo then only ever see authenticated sequence numbers, so a forged
+// datagram can neither inject a sample nor, by claiming a sequence number
+// far ahead, make every genuine one look stale.
+//
 // An optional ChannelModel impairs outgoing datagrams in-process before they
 // reach the socket, so that a path with a given delay, jitter, loss or a
 // recorded trace can be tried on loopback or a LAN. The datagram keeps its
@@ -58,6 +65,13 @@ class HapticLink {
              Passivity scheme);
 
   void set_emulation(std::unique_ptr<net::ChannelModel> model) { emulation_ = std::move(model); }
+
+  // Seals every datagram sent from now on with keys.send and accepts only
+  // datagrams sealed with keys.recv. The sequence numbers are the nonces;
+  // they never repeat within a link, and keys from a handshake are never
+  // used by two links. Call it before the first send.
+  void set_keys(const crypto::SessionKeys& keys);
+  bool sealed() const { return sealed_; }
 
   // Sends a sample at `now`. `monitor` is the sender's net device-port energy
   // (J), carried for the other end's passivity bookkeeping across both
@@ -91,6 +105,8 @@ class HapticLink {
     std::uint64_t late = 0;           // arrived after a higher seq
     std::uint64_t duplicates = 0;
     std::uint64_t foreign = 0;        // malformed, other session or peer, wrong scheme
+    std::uint64_t unauthentic = 0;    // this session and peer, but not sealed or
+                                      // failing authentication (sealed links)
     std::uint64_t missing = 0;        // never arrived (so far)
   };
   Counters counters() const;
@@ -117,6 +133,9 @@ class HapticLink {
   Passivity scheme_;
   std::uint32_t next_seq_ = 1;
   std::vector<std::uint8_t> buf_;
+  bool sealed_ = false;
+  crypto::SessionKeys keys_;
+  std::vector<std::uint8_t> plain_;
   Counters counters_;
   SeqWindow window_;
   Nanos highest_rx_time_ = 0;  // arrival of the highest seq received

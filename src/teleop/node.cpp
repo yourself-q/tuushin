@@ -88,7 +88,78 @@ double transmitted_energy(const SlaveController& ctl, Passivity scheme) {
   return scheme == Passivity::kReflective ? ctl.store().granted() : ctl.channel_port().input_energy();
 }
 
+std::uint16_t scheme_flags(Passivity scheme) {
+  return static_cast<std::uint16_t>((static_cast<unsigned>(scheme) << wire::kSchemeShift) &
+                                    wire::kSchemeMask);
+}
+
+std::optional<Passivity> scheme_of(const wire::Header& h) {
+  const unsigned code = (h.flags & wire::kSchemeMask) >> wire::kSchemeShift;
+  if (code > static_cast<unsigned>(Passivity::kReflective)) return std::nullopt;
+  return static_cast<Passivity>(code);
+}
+
+// The empty payload of both handshake messages.
+const std::uint8_t kNoPayload = 0;
+
+// The master's side of the handshake: resends its hello every
+// hello_interval until a reply from the slave authenticates, keeping a
+// simulated device's physics current with the actuator off meanwhile.
+std::optional<crypto::SessionKeys> master_handshake(net::UdpSocket& socket,
+                                                    const net::Endpoint& slave,
+                                                    std::uint32_t session, Device1D& device,
+                                                    const MasterNodeConfig& cfg,
+                                                    const std::atomic<bool>* stop,
+                                                    std::vector<std::uint8_t>& buf) {
+  const Passivity scheme = cfg.control.passivity;
+  const auto prologue = handshake_prologue(session, scheme);
+  crypto::NoiseNNpsk0 hs(crypto::NoiseNNpsk0::Role::kInitiator, *cfg.psk, prologue.data(),
+                         prologue.size());
+  const auto msg1 = hs.write_message(&kNoPayload, 0);
+  wire::Header h;
+  h.type = wire::PacketType::kHello;
+  h.session = session;
+  h.flags = scheme_flags(scheme);
+  std::vector<std::uint8_t> out;
+  device.command_force(0.0);
+  const Nanos start = monotonic_now();
+  Nanos next_hello = start;
+  for (;;) {
+    const Nanos now = monotonic_now();
+    device.read_position(now);
+    if (now - start >= cfg.handshake_timeout || (stop && stop->load())) return std::nullopt;
+    if (now >= next_hello) {
+      ++h.seq;
+      h.send_time = now;
+      wire::encode_raw(h, msg1.data(), msg1.size(), out);
+      socket.send_to(slave, out.data(), out.size());
+      next_hello = now + cfg.hello_interval;
+    }
+    socket.wait_readable(std::min(next_hello - now, 10 * kNanosPerMilli));
+    for (;;) {
+      net::Endpoint from;
+      const auto n = socket.recv_from(buf.data(), buf.size(), &from);
+      if (!n) break;
+      if (*n > wire::kMaxDatagram || from != slave) continue;
+      const auto rh = wire::decode_header(buf.data(), *n);
+      if (!rh || rh->type != wire::PacketType::kHelloReply || rh->session != session ||
+          scheme_of(*rh) != scheme) {
+        continue;
+      }
+      if (hs.read_message(buf.data() + wire::kHeaderSize, rh->payload_len)) return hs.split();
+    }
+  }
+}
+
 }  // namespace
+
+std::vector<std::uint8_t> handshake_prologue(std::uint32_t session, Passivity scheme) {
+  static const char kLabel[] = "tuushin haptic session v1";
+  std::vector<std::uint8_t> p(kLabel, kLabel + sizeof kLabel - 1);
+  for (int i = 0; i < 4; ++i) p.push_back(static_cast<std::uint8_t>(session >> (8 * i)));
+  p.push_back(static_cast<std::uint8_t>(scheme));
+  return p;
+}
 
 // ---------------------------------------------------------------- master
 
@@ -99,7 +170,17 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
   MasterNodeReport rep;
   rep.session = cfg.session != 0 ? cfg.session : random_session();
   socket.enable_rx_timestamps();
+  std::vector<std::uint8_t> buf(wire::kMaxDatagram + 1);
   HapticLink link(socket, rep.session, slave, cfg.control.passivity);
+  if (cfg.psk) {
+    const auto keys = master_handshake(socket, slave, rep.session, device, cfg, stop, buf);
+    if (!keys) {
+      rep.handshake_failed = true;
+      return rep;
+    }
+    link.set_keys(*keys);
+    rep.authenticated = true;
+  }
   if (emulation) link.set_emulation(std::move(emulation));
   MasterController ctl(cfg.control);
   CsvLog log(cfg.log_path, "t,late_us,x_m,v_m,f_display,ein,eout,granted,pc,sent,rx,rtt_us\n");
@@ -108,7 +189,6 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
   std::vector<std::pair<Nanos, double>> remote;  // (slave time, slave net) per sample
   Nanos newest_remote = INT64_MIN;
   Nanos slave_final_at = -1;
-  std::vector<std::uint8_t> buf(wire::kMaxDatagram + 1);
   auto on_rx = [&](const std::uint8_t* data, std::size_t n, const net::Endpoint& from, Nanos rx) {
     const auto r = link.on_datagram(data, n, from, rx);
     if (!r) return;
@@ -231,6 +311,22 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
   auto stopped = [&] { return stop && stop->load(); };
   std::uint32_t last_refused = 0;
 
+  // Answered hellos waiting for the master's first sealed sample.
+  struct PendingHandshake {
+    net::Endpoint from;
+    std::uint32_t session;
+    crypto::SessionKeys keys;
+    std::vector<std::uint8_t> reply;  // resent if the hello comes again
+    Nanos answered;
+  };
+  constexpr std::size_t kMaxPending = 16;
+  std::vector<PendingHandshake> pending;
+  std::vector<std::uint8_t> scratch;
+  auto refuse = [&](std::uint32_t session, const std::string& why) {
+    if (hooks.on_refused && session != last_refused) hooks.on_refused(why);
+    last_refused = session;
+  };
+
   while (!stopped()) {
     // Idle: wait for the first datagram of a session, keeping a simulated
     // device's physics current with the actuator off.
@@ -241,11 +337,19 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
       std::vector<std::uint8_t> bytes;
       Nanos rx;
       Passivity scheme;
+      std::optional<crypto::SessionKeys> keys;
     };
     std::optional<First> first;
+    pending.clear();
     while (!stopped() && !first) {
       socket.wait_readable(100 * kNanosPerMilli);
-      device.read_position(monotonic_now());
+      const Nanos now = monotonic_now();
+      device.read_position(now);
+      pending.erase(std::remove_if(pending.begin(), pending.end(),
+                                   [&](const PendingHandshake& p) {
+                                     return now - p.answered > cfg.handshake_timeout;
+                                   }),
+                    pending.end());
       for (;;) {
         net::Endpoint from;
         Nanos rx = 0;
@@ -253,22 +357,78 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
         if (!n) break;
         if (*n > wire::kMaxDatagram) continue;
         const auto h = wire::decode_header(buf.data(), *n);
-        if (!h || h->type != wire::PacketType::kHaptic || (h->flags & wire::kFlagFinal) ||
-            !wire::decode_haptic(buf.data(), *n)) {
+        if (!h || (h->type != wire::PacketType::kHaptic && h->type != wire::PacketType::kHello)) {
           continue;
         }
-        const unsigned code = (h->flags & wire::kSchemeMask) >> wire::kSchemeShift;
-        if (code > static_cast<unsigned>(Passivity::kReflective)) continue;
-        const auto scheme = static_cast<Passivity>(code);
-        if (scheme != cfg.control.passivity && !cfg.adopt_scheme) {
-          if (hooks.on_refused && h->session != last_refused) {
-            hooks.on_refused("session from " + from.to_string() +
-                             " runs another passivity scheme; refused");
+        const auto scheme = scheme_of(*h);
+        if (!scheme) continue;
+        if (*scheme != cfg.control.passivity && !cfg.adopt_scheme) {
+          refuse(h->session,
+                 "session from " + from.to_string() + " runs another passivity scheme; refused");
+          continue;
+        }
+        auto match = std::find_if(pending.begin(), pending.end(), [&](const PendingHandshake& p) {
+          return p.from == from && p.session == h->session;
+        });
+
+        if (h->type == wire::PacketType::kHello) {
+          if (!cfg.psk) {
+            refuse(h->session, "session from " + from.to_string() +
+                                   " wants authentication, but this slave has no key; refused");
+            continue;
           }
-          last_refused = h->session;
+          if (match != pending.end()) {  // our reply was lost
+            socket.send_to(from, match->reply.data(), match->reply.size());
+            continue;
+          }
+          const auto prologue = handshake_prologue(h->session, *scheme);
+          crypto::NoiseNNpsk0 hs(crypto::NoiseNNpsk0::Role::kResponder, *cfg.psk,
+                                 prologue.data(), prologue.size());
+          if (!hs.read_message(buf.data() + wire::kHeaderSize, h->payload_len)) {
+            refuse(h->session, "handshake from " + from.to_string() +
+                                   " does not authenticate (another key?); refused");
+            continue;
+          }
+          const auto msg2 = hs.write_message(&kNoPayload, 0);
+          wire::Header rh;
+          rh.type = wire::PacketType::kHelloReply;
+          rh.session = h->session;
+          rh.seq = 1;
+          rh.flags = scheme_flags(*scheme);
+          rh.send_time = monotonic_now();
+          rh.echo_seq = h->seq;
+          rh.echo_hold = wire::hold_field(rh.send_time - rx);
+          PendingHandshake p{from, h->session, hs.split(), {}, rh.send_time};
+          wire::encode_raw(rh, msg2.data(), msg2.size(), p.reply);
+          socket.send_to(from, p.reply.data(), p.reply.size());
+          if (pending.size() == kMaxPending) pending.erase(pending.begin());
+          pending.push_back(std::move(p));
           continue;
         }
-        first = First{*h, from, std::vector<std::uint8_t>(buf.begin(), buf.begin() + *n), rx, scheme};
+
+        // kHaptic. With a key, only a datagram sealed with a pending
+        // handshake's keys starts a session: it proves the master knows the
+        // psk and holds the ephemeral key of that handshake.
+        if ((h->flags & wire::kFlagFinal)) continue;
+        std::optional<crypto::SessionKeys> keys;
+        if (cfg.psk) {
+          if (!(h->flags & wire::kFlagSealed)) {
+            refuse(h->session, "unauthenticated session from " + from.to_string() + " refused");
+            continue;
+          }
+          if (match == pending.end()) continue;
+          scratch.clear();
+          if (!crypto::open(match->keys.recv, h->seq, buf.data(), wire::kHeaderSize,
+                            buf.data() + wire::kHeaderSize, h->payload_len, scratch) ||
+              !wire::decode_haptic_payload(scratch.data(), scratch.size())) {
+            continue;
+          }
+          keys = match->keys;
+        } else if (!wire::decode_haptic(buf.data(), *n)) {
+          continue;
+        }
+        first = First{*h, from, std::vector<std::uint8_t>(buf.begin(), buf.begin() + *n), rx,
+                      *scheme, keys};
         break;  // the rest stays queued for the session
       }
     }
@@ -278,9 +438,11 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
     rep.session = first->h.session;
     rep.master = first->from;
     rep.scheme = first->scheme;
+    rep.authenticated = first->keys.has_value();
     SlaveConfig sc = cfg.control;
     sc.passivity = first->scheme;
     HapticLink link(socket, rep.session, first->from, sc.passivity);
+    if (first->keys) link.set_keys(*first->keys);
     const Nanos start = monotonic_now();
     if (hooks.emulation) link.set_emulation(hooks.emulation(start));
     SlaveController ctl(sc, device.read_position(start));

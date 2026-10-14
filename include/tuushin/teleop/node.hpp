@@ -4,9 +4,11 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include "tuushin/crypto/noise.hpp"
 #include "tuushin/net/channel.hpp"
 #include "tuushin/net/clock_sync.hpp"
 #include "tuushin/net/probe.hpp"
@@ -69,10 +71,16 @@ struct MasterNodeConfig {
   Nanos final_timeout = kNanosPerSecond;
   // Per-tick CSV log, empty for none.
   std::string log_path;
+  // Pre-shared key; without one the session is not authenticated.
+  std::optional<crypto::Key> psk;
+  Nanos hello_interval = 200 * kNanosPerMilli;
+  Nanos handshake_timeout = 5 * kNanosPerSecond;
 };
 
 struct MasterNodeReport {
   std::uint32_t session = 0;
+  bool authenticated = false;     // the handshake completed; datagrams sealed
+  bool handshake_failed = false;  // no reply authenticated in time; no session ran
   std::uint64_t ticks = 0, skipped = 0;
   net::DelayStats lateness;  // ns
   HapticLink::Counters link;
@@ -94,6 +102,10 @@ struct MasterNodeReport {
   double master_pc_active = 0.0;
 };
 
+// The handshake's prologue: what both ends must agree on, taken from the
+// hello's header, so that a header changed on the way fails the handshake.
+std::vector<std::uint8_t> handshake_prologue(std::uint32_t session, Passivity scheme);
+
 // Runs a session against the slave at `slave` until cfg.duration elapses or
 // `stop` becomes true. `device` is sampled every tick; `emulation`, if set,
 // impairs the master-to-slave datagrams in-process.
@@ -114,12 +126,17 @@ struct SlaveNodeConfig {
   // Per-tick CSV log for each session: the session id (hex) and ".csv" are
   // appended to this prefix. Empty for none.
   std::string log_prefix;
+  // Pre-shared key: only sessions that complete the handshake run.
+  std::optional<crypto::Key> psk;
+  // How long an answered hello waits for the master's first sealed sample.
+  Nanos handshake_timeout = 5 * kNanosPerSecond;
 };
 
 struct SlaveSessionReport {
   std::uint32_t session = 0;
   net::Endpoint master;
   Passivity scheme = Passivity::kNone;
+  bool authenticated = false;
   std::uint64_t ticks = 0, skipped = 0;
   net::DelayStats lateness;
   HapticLink::Counters link;
@@ -136,7 +153,8 @@ struct SlaveNodeHooks {
   std::function<std::unique_ptr<net::ChannelModel>(Nanos start)> emulation;
   // Called when a session ends.
   std::function<void(const SlaveSessionReport&)> on_session_end;
-  // Called when a session is refused (scheme mismatch), with a reason.
+  // Called when a session or a handshake is refused (scheme mismatch, a key
+  // on one end only, a hello that does not authenticate), with a reason.
   std::function<void(const std::string&)> on_refused;
 };
 

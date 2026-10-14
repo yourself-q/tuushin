@@ -85,6 +85,18 @@ std::uint32_t hold_field(Nanos hold) {
   return static_cast<std::uint32_t>(hold < kMax ? hold : kMax);
 }
 
+void append_haptic_payload(const HapticPayload& p, std::vector<std::uint8_t>& out) {
+  if (p.dof > kMaxDof || p.energies > kMaxEnergies) {
+    throw std::invalid_argument("wire: too many axes or energies");
+  }
+  out.push_back(p.dof);
+  out.push_back(p.energies);
+  put_u16(out, 0);
+  for (std::size_t i = 0; i < p.dof; ++i) put_f64(out, p.value[i]);
+  for (std::size_t i = 0; i < p.dof; ++i) put_f64(out, p.aux[i]);
+  for (std::size_t i = 0; i < p.energies; ++i) put_f64(out, p.energy[i]);
+}
+
 std::size_t encode_haptic(const Header& h, const HapticPayload& p, std::vector<std::uint8_t>& out) {
   if (p.dof > kMaxDof || p.energies > kMaxEnergies) {
     throw std::invalid_argument("wire: too many axes or energies");
@@ -92,12 +104,19 @@ std::size_t encode_haptic(const Header& h, const HapticPayload& p, std::vector<s
   Header hh = h;
   hh.type = PacketType::kHaptic;
   put_header(hh, p.encoded_size(), out);
-  out.push_back(p.dof);
-  out.push_back(p.energies);
-  put_u16(out, 0);
-  for (std::size_t i = 0; i < p.dof; ++i) put_f64(out, p.value[i]);
-  for (std::size_t i = 0; i < p.dof; ++i) put_f64(out, p.aux[i]);
-  for (std::size_t i = 0; i < p.energies; ++i) put_f64(out, p.energy[i]);
+  append_haptic_payload(p, out);
+  return out.size();
+}
+
+std::size_t encode_header(const Header& h, std::size_t payload_len, std::vector<std::uint8_t>& out) {
+  put_header(h, payload_len, out);
+  return out.size();
+}
+
+std::size_t encode_raw(const Header& h, const std::uint8_t* payload, std::size_t len,
+                       std::vector<std::uint8_t>& out) {
+  put_header(h, len, out);
+  if (len) out.insert(out.end(), payload, payload + len);
   return out.size();
 }
 
@@ -123,7 +142,7 @@ std::optional<Header> decode_header(const std::uint8_t* data, std::size_t size) 
   if (data == nullptr || size < kHeaderSize || size > kMaxDatagram) return std::nullopt;
   if (data[0] != kMagic0 || data[1] != kMagic1 || data[2] != kVersion) return std::nullopt;
   const std::uint8_t type = data[3];
-  if (type < 1 || type > 3) return std::nullopt;
+  if (type < 1 || type > 5) return std::nullopt;
   Header h;
   h.type = static_cast<PacketType>(type);
   h.session = get_u32(data + 4);
@@ -139,13 +158,17 @@ std::optional<Header> decode_header(const std::uint8_t* data, std::size_t size) 
 
 std::optional<HapticPayload> decode_haptic(const std::uint8_t* data, std::size_t size) {
   const auto h = decode_header(data, size);
-  if (!h || h->type != PacketType::kHaptic || h->payload_len < 4) return std::nullopt;
-  const std::uint8_t* p = data + kHeaderSize;
+  if (!h || h->type != PacketType::kHaptic || (h->flags & kFlagSealed)) return std::nullopt;
+  return decode_haptic_payload(data + kHeaderSize, h->payload_len);
+}
+
+std::optional<HapticPayload> decode_haptic_payload(const std::uint8_t* p, std::size_t len) {
+  if (p == nullptr || len < 4) return std::nullopt;
   HapticPayload out;
   out.dof = p[0];
   out.energies = p[1];
   if (out.dof > kMaxDof || out.energies > kMaxEnergies) return std::nullopt;
-  if (out.encoded_size() != h->payload_len) return std::nullopt;
+  if (out.encoded_size() != len) return std::nullopt;
   const std::uint8_t* q = p + 4;
   for (std::size_t i = 0; i < out.dof; ++i, q += 8) out.value[i] = get_f64(q);
   for (std::size_t i = 0; i < out.dof; ++i, q += 8) out.aux[i] = get_f64(q);

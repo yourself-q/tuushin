@@ -62,7 +62,8 @@ std::optional<Key> key_from_hex(const std::string& text);
 //
 // seal appends ciphertext || tag (pt_len + kTagSize bytes) to `out`; open
 // appends the plaintext and returns false, appending nothing, if the
-// ciphertext, the tag or the associated data were altered.
+// ciphertext, the tag or the associated data were altered. The inputs must
+// not point into `out`, which may reallocate.
 void seal(const Key& k, std::uint64_t n, const std::uint8_t* ad, std::size_t ad_len,
           const std::uint8_t* pt, std::size_t pt_len, std::vector<std::uint8_t>& out);
 bool open(const Key& k, std::uint64_t n, const std::uint8_t* ad, std::size_t ad_len,

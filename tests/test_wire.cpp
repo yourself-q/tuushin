@@ -145,8 +145,13 @@ TEST_CASE(wire_decoder_rejects_malformed) {
   CHECK(!decode_header(b.data(), b.size()).has_value());
   b = mutated(3, 0);  // type
   CHECK(!decode_header(b.data(), b.size()).has_value());
-  b = mutated(3, 4);
+  b = mutated(3, 6);
   CHECK(!decode_header(b.data(), b.size()).has_value());
+  b = mutated(3, static_cast<std::uint8_t>(PacketType::kHello));  // a header, but not haptic
+  CHECK(decode_header(b.data(), b.size()).has_value());
+  CHECK(!decode_haptic(b.data(), b.size()).has_value());
+  b = mutated(12, static_cast<std::uint8_t>(good[12] | kFlagSealed));  // sealed: not plain
+  CHECK(!decode_haptic(b.data(), b.size()).has_value());
   b = mutated(14, static_cast<std::uint8_t>(good[14] + 8));  // payload_len
   CHECK(!decode_header(b.data(), b.size()).has_value());
   b = mutated(kHeaderSize, kMaxDof + 1);  // dof
@@ -166,6 +171,30 @@ TEST_CASE(wire_decoder_rejects_malformed) {
       CHECK(!decode_haptic(c.data(), c.size()).has_value());
     }
   }
+}
+
+TEST_CASE(wire_split_codecs_match_the_whole_datagram) {
+  std::vector<std::uint8_t> whole;
+  encode_haptic(sample_header(), sample_payload(), whole);
+  std::vector<std::uint8_t> parts;
+  encode_header(sample_header(), sample_payload().encoded_size(), parts);
+  CHECK(parts.size() == kHeaderSize);
+  append_haptic_payload(sample_payload(), parts);
+  CHECK(parts == whole);
+  const auto p = decode_haptic_payload(whole.data() + kHeaderSize, whole.size() - kHeaderSize);
+  REQUIRE(p);
+  CHECK(p->dof == sample_payload().dof && p->value[0] == sample_payload().value[0]);
+  CHECK(!decode_haptic_payload(whole.data() + kHeaderSize, whole.size() - kHeaderSize - 1));
+
+  const std::uint8_t msg[] = {1, 2, 3, 4, 5};
+  Header h = sample_header();
+  h.type = PacketType::kHelloReply;
+  std::vector<std::uint8_t> raw;
+  CHECK(encode_raw(h, msg, sizeof msg, raw) == kHeaderSize + sizeof msg);
+  const auto hh = decode_header(raw.data(), raw.size());
+  REQUIRE(hh);
+  CHECK(hh->type == PacketType::kHelloReply && hh->payload_len == sizeof msg);
+  CHECK(std::memcmp(raw.data() + kHeaderSize, msg, sizeof msg) == 0);
 }
 
 TEST_CASE(wire_decoder_survives_random_input) {

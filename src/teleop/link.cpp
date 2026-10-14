@@ -1,6 +1,8 @@
 #include "tuushin/teleop/link.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cstring>
 
 #include "tuushin/wire/packet.hpp"
 
@@ -48,7 +50,18 @@ HapticLink::HapticLink(net::UdpSocket& socket, std::uint32_t session, const net:
                        Passivity scheme)
     : socket_(socket), session_(session), peer_(peer), scheme_(scheme) {}
 
+void HapticLink::set_keys(const crypto::SessionKeys& keys) {
+  keys_ = keys;
+  sealed_ = true;
+}
+
 void HapticLink::send(Nanos now, const Sample& s, double monitor, bool final) {
+  if (sealed_ && next_seq_ == 0) {
+    // The sequence numbers, and with them the nonces, are used up (after
+    // 49 days at 1 kHz); a repeated nonce would expose the key.
+    ++counters_.send_failed;
+    return;
+  }
   wire::Header h;
   h.type = wire::PacketType::kHaptic;
   h.session = session_;
@@ -66,7 +79,17 @@ void HapticLink::send(Nanos now, const Sample& s, double monitor, bool final) {
   p.aux[0] = s.aux;
   p.energy[0] = s.energy;
   p.energy[1] = monitor;
-  wire::encode_haptic(h, p, buf_);
+  if (sealed_) {
+    h.flags |= wire::kFlagSealed;
+    wire::encode_header(h, p.encoded_size() + crypto::kTagSize, buf_);
+    std::array<std::uint8_t, wire::kHeaderSize> ad;
+    std::memcpy(ad.data(), buf_.data(), ad.size());
+    plain_.clear();
+    wire::append_haptic_payload(p, plain_);
+    crypto::seal(keys_.send, h.seq, ad.data(), ad.size(), plain_.data(), plain_.size(), buf_);
+  } else {
+    wire::encode_haptic(h, p, buf_);
+  }
   history_[h.seq % kHistory] = Sent{h.seq, now, false};
   ++counters_.sent;
 
@@ -108,7 +131,21 @@ std::optional<HapticLink::Received> HapticLink::on_datagram(const std::uint8_t* 
     ++counters_.foreign;
     return std::nullopt;
   }
-  const auto p = wire::decode_haptic(data, size);
+  std::optional<wire::HapticPayload> p;
+  if (sealed_) {
+    // Authenticate before anything else looks at the datagram, the
+    // sequence window included.
+    plain_.clear();
+    if ((h->flags & wire::kFlagSealed) == 0 ||
+        !crypto::open(keys_.recv, h->seq, data, wire::kHeaderSize, data + wire::kHeaderSize,
+                      h->payload_len, plain_)) {
+      ++counters_.unauthentic;
+      return std::nullopt;
+    }
+    p = wire::decode_haptic_payload(plain_.data(), plain_.size());
+  } else {
+    p = wire::decode_haptic(data, size);
+  }
   if (!p || p->dof != 1 || p->energies < 2) {
     ++counters_.foreign;
     return std::nullopt;

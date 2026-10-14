@@ -47,9 +47,11 @@ constexpr std::size_t kHeaderSize = 32;
 constexpr std::size_t kMaxDatagram = 1200;
 
 enum class PacketType : std::uint8_t {
-  kHaptic = 1,     // HapticPayload
-  kProbe = 2,      // measurement probe; payload is padding
-  kProbeEcho = 3,  // reflector's answer to a probe; payload is padding
+  kHaptic = 1,      // HapticPayload, or its sealed form (kFlagSealed)
+  kProbe = 2,       // measurement probe; payload is padding
+  kProbeEcho = 3,   // reflector's answer to a probe; payload is padding
+  kHello = 4,       // handshake message 1 (crypto::NoiseNNpsk0), initiator
+  kHelloReply = 5,  // handshake message 2, responder; echo_seq = the hello's seq
 };
 
 struct Header {
@@ -86,6 +88,15 @@ constexpr std::size_t kReceiptMapSize = 8;
 constexpr std::uint16_t kFlagFinal = 1;
 constexpr int kSchemeShift = 1;
 constexpr std::uint16_t kSchemeMask = 0x3 << kSchemeShift;
+// Flag of kHaptic: the payload is sealed with the session's key
+// (crypto::seal, nonce = seq, associated data = the 32-byte header as sent),
+// so it is ciphertext || tag, kTagSize bytes longer than the HapticPayload
+// inside. The header stays readable, and any change to it fails the tag. The
+// flag only says what the sender did: a receiver with a key refuses
+// datagrams without it. kHello and kHelloReply carry the scheme field too,
+// and their payload is the handshake message.
+constexpr std::uint16_t kFlagSealed = 1 << 3;
+constexpr std::size_t kTagSize = 16;
 
 // Haptic sample, payload of kHaptic:
 //
@@ -116,6 +127,14 @@ struct HapticPayload {
 // Encoders append to `out` (which is cleared first) and return the datagram
 // size. They throw std::invalid_argument for payloads that do not fit.
 std::size_t encode_haptic(const Header& h, const HapticPayload& p, std::vector<std::uint8_t>& out);
+// The header alone, with payload_len set to `payload_len` (h.payload_len is
+// ignored), for a payload the caller appends, e.g. a sealed one.
+std::size_t encode_header(const Header& h, std::size_t payload_len, std::vector<std::uint8_t>& out);
+// A HapticPayload's bytes, appended to `out` as they follow the header.
+void append_haptic_payload(const HapticPayload& p, std::vector<std::uint8_t>& out);
+// A datagram whose payload is `len` given bytes (kHello, kHelloReply).
+std::size_t encode_raw(const Header& h, const std::uint8_t* payload, std::size_t len,
+                       std::vector<std::uint8_t>& out);
 // Probe and echo datagrams carry `padding` zero bytes so that probes can be
 // sized like the traffic they stand in for.
 std::size_t encode_padded(const Header& h, std::size_t padding, std::vector<std::uint8_t>& out);
@@ -129,6 +148,8 @@ std::size_t encode_probe_echo(const Header& h, std::uint64_t receipts, std::size
 // They never throw, since datagrams come from the network.
 std::optional<Header> decode_header(const std::uint8_t* data, std::size_t size);
 std::optional<HapticPayload> decode_haptic(const std::uint8_t* data, std::size_t size);
+// A HapticPayload from its `len` bytes alone (e.g. once unsealed).
+std::optional<HapticPayload> decode_haptic_payload(const std::uint8_t* payload, std::size_t len);
 // The receipt map of a kProbeEcho, if it carries one.
 std::optional<std::uint64_t> decode_receipts(const std::uint8_t* data, std::size_t size);
 
