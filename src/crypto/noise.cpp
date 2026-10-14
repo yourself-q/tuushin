@@ -133,12 +133,14 @@ NoiseNNpsk0::NoiseNNpsk0(Role role, const Key& psk, const std::uint8_t* prologue
                      name_len);
   st_.ck = st_.h;
   mix_hash(st_, prologue, prologue_len);
+  // The public key is derived when this end writes its message: a responder
+  // that rejects a forged message 1 then has spent no scalar multiplication
+  // on it.
   if (ephemeral) {
     st_.e = *ephemeral;
   } else {
     randombytes_buf(st_.e.data(), st_.e.size());
   }
-  crypto_scalarmult_base(st_.e_pub.data(), st_.e.data());
 }
 
 NoiseNNpsk0::~NoiseNNpsk0() {
@@ -214,6 +216,7 @@ std::vector<std::uint8_t> NoiseNNpsk0::write_message(const std::uint8_t* payload
   }
   // e (in a psk handshake the ephemeral key is also mixed into the key,
   // section 9.2, since the payload is encrypted before any DH)
+  crypto_scalarmult_base(st_.e_pub.data(), st_.e.data());
   out.insert(out.end(), st_.e_pub.begin(), st_.e_pub.end());
   mix_hash(st_, st_.e_pub.data(), st_.e_pub.size());
   mix_key(st_, st_.e_pub.data(), st_.e_pub.size());
