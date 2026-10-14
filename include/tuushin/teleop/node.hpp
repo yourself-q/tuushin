@@ -106,6 +106,17 @@ struct MasterNodeReport {
 // hello's header, so that a header changed on the way fails the handshake.
 std::vector<std::uint8_t> handshake_prologue(std::uint32_t session, Passivity scheme);
 
+// The payload of the hello (handshake message 1, which encrypts and
+// authenticates it): the master's wall-clock time in ns since the Unix
+// epoch, little-endian. A slave answers only a hello newer than the newest
+// it has answered, so a recorded hello is useless once a newer one has
+// arrived; WireGuard's initiation carries a TAI64N timestamp for the same
+// reason (Donenfeld, NDSS 2017, section 5.1). A master whose clock is set
+// back is refused until it passes the newest time the slave has seen.
+constexpr std::size_t kHelloPayloadSize = 8;
+std::vector<std::uint8_t> hello_payload(std::uint64_t wall_ns);
+std::optional<std::uint64_t> hello_time(const std::vector<std::uint8_t>& payload);
+
 // Runs a session against the slave at `slave` until cfg.duration elapses or
 // `stop` becomes true. `device` is sampled every tick; `emulation`, if set,
 // impairs the master-to-slave datagrams in-process.
@@ -130,6 +141,9 @@ struct SlaveNodeConfig {
   std::optional<crypto::Key> psk;
   // How long an answered hello waits for the master's first sealed sample.
   Nanos handshake_timeout = 5 * kNanosPerSecond;
+  // Hellos at or before this wall-clock time (ns, as in hello_payload) are
+  // not answered; the newest answered one raises it as the node runs.
+  std::uint64_t newest_hello = 0;
 };
 
 struct SlaveSessionReport {

@@ -1,8 +1,10 @@
 #include "tuushin/teleop/node.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <optional>
 #include <random>
 #include <stdexcept>
@@ -99,8 +101,14 @@ std::optional<Passivity> scheme_of(const wire::Header& h) {
   return static_cast<Passivity>(code);
 }
 
-// The empty payload of both handshake messages.
+// The empty payload of the hello reply.
 const std::uint8_t kNoPayload = 0;
+
+std::uint64_t wall_clock_ns() {
+  return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::system_clock::now().time_since_epoch())
+                                        .count());
+}
 
 // The master's side of the handshake: resends its hello every
 // hello_interval until a reply from the slave authenticates, keeping a
@@ -115,7 +123,8 @@ std::optional<crypto::SessionKeys> master_handshake(net::UdpSocket& socket,
   const auto prologue = handshake_prologue(session, scheme);
   crypto::NoiseNNpsk0 hs(crypto::NoiseNNpsk0::Role::kInitiator, *cfg.psk, prologue.data(),
                          prologue.size());
-  const auto msg1 = hs.write_message(&kNoPayload, 0);
+  const auto stamp = hello_payload(wall_clock_ns());
+  const auto msg1 = hs.write_message(stamp.data(), stamp.size());
   wire::Header h;
   h.type = wire::PacketType::kHello;
   h.session = session;
@@ -159,6 +168,23 @@ std::vector<std::uint8_t> handshake_prologue(std::uint32_t session, Passivity sc
   for (int i = 0; i < 4; ++i) p.push_back(static_cast<std::uint8_t>(session >> (8 * i)));
   p.push_back(static_cast<std::uint8_t>(scheme));
   return p;
+}
+
+std::vector<std::uint8_t> hello_payload(std::uint64_t wall_ns) {
+  std::vector<std::uint8_t> p(kHelloPayloadSize);
+  for (std::size_t i = 0; i < kHelloPayloadSize; ++i) {
+    p[i] = static_cast<std::uint8_t>(wall_ns >> (8 * i));
+  }
+  return p;
+}
+
+std::optional<std::uint64_t> hello_time(const std::vector<std::uint8_t>& payload) {
+  if (payload.size() != kHelloPayloadSize) return std::nullopt;
+  std::uint64_t t = 0;
+  for (std::size_t i = 0; i < kHelloPayloadSize; ++i) {
+    t |= static_cast<std::uint64_t>(payload[i]) << (8 * i);
+  }
+  return t;
 }
 
 // ---------------------------------------------------------------- master
@@ -311,17 +337,21 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
   auto stopped = [&] { return stop && stop->load(); };
   std::uint32_t last_refused = 0;
 
-  // Answered hellos waiting for the master's first sealed sample.
+  // Answered hellos waiting for the master's first sealed sample. A hello is
+  // recognized by its bytes, not by where it came from: a copy that an
+  // attacker forwards ahead of the genuine one gets the same reply, which
+  // only the master can use, instead of a slot of its own.
   struct PendingHandshake {
-    net::Endpoint from;
     std::uint32_t session;
+    std::vector<std::uint8_t> hello;  // handshake message 1 as received
     crypto::SessionKeys keys;
-    std::vector<std::uint8_t> reply;  // resent if the hello comes again
+    std::vector<std::uint8_t> reply;  // sent again for every copy of the hello
     Nanos answered;
   };
   constexpr std::size_t kMaxPending = 16;
   std::vector<PendingHandshake> pending;
   std::vector<std::uint8_t> scratch;
+  std::uint64_t newest_hello = cfg.newest_hello;
   auto refuse = [&](std::uint32_t session, const std::string& why) {
     if (hooks.on_refused && session != last_refused) hooks.on_refused(why);
     last_refused = session;
@@ -367,9 +397,7 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
                  "session from " + from.to_string() + " runs another passivity scheme; refused");
           continue;
         }
-        auto match = std::find_if(pending.begin(), pending.end(), [&](const PendingHandshake& p) {
-          return p.from == from && p.session == h->session;
-        });
+        const std::uint8_t* const payload = buf.data() + wire::kHeaderSize;
 
         if (h->type == wire::PacketType::kHello) {
           if (!cfg.psk) {
@@ -377,18 +405,38 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
                                    " wants authentication, but this slave has no key; refused");
             continue;
           }
-          if (match != pending.end()) {  // our reply was lost
-            socket.send_to(from, match->reply.data(), match->reply.size());
+          const auto same = std::find_if(pending.begin(), pending.end(),
+                                         [&](const PendingHandshake& p) {
+                                           return p.session == h->session &&
+                                                  p.hello.size() == h->payload_len &&
+                                                  std::memcmp(p.hello.data(), payload,
+                                                              h->payload_len) == 0;
+                                         });
+          if (same != pending.end()) {  // resent because our reply was lost, or a copy
+            socket.send_to(from, same->reply.data(), same->reply.size());
             continue;
           }
           const auto prologue = handshake_prologue(h->session, *scheme);
           crypto::NoiseNNpsk0 hs(crypto::NoiseNNpsk0::Role::kResponder, *cfg.psk,
                                  prologue.data(), prologue.size());
-          if (!hs.read_message(buf.data() + wire::kHeaderSize, h->payload_len)) {
+          const auto hello = hs.read_message(payload, h->payload_len);
+          if (!hello) {
             refuse(h->session, "handshake from " + from.to_string() +
                                    " does not authenticate (another key?); refused");
             continue;
           }
+          const auto stamp = hello_time(*hello);
+          if (!stamp) {
+            refuse(h->session, "handshake from " + from.to_string() +
+                                   " carries no time (another version?); refused");
+            continue;
+          }
+          if (*stamp <= newest_hello) {
+            refuse(h->session, "handshake from " + from.to_string() +
+                                   " is not newer than the last one answered (replayed?); refused");
+            continue;
+          }
+          newest_hello = *stamp;
           const auto msg2 = hs.write_message(&kNoPayload, 0);
           wire::Header rh;
           rh.type = wire::PacketType::kHelloReply;
@@ -398,7 +446,8 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
           rh.send_time = monotonic_now();
           rh.echo_seq = h->seq;
           rh.echo_hold = wire::hold_field(rh.send_time - rx);
-          PendingHandshake p{from, h->session, hs.split(), {}, rh.send_time};
+          PendingHandshake p{h->session, std::vector<std::uint8_t>(payload, payload + h->payload_len),
+                             hs.split(), {}, rh.send_time};
           wire::encode_raw(rh, msg2.data(), msg2.size(), p.reply);
           socket.send_to(from, p.reply.data(), p.reply.size());
           if (pending.size() == kMaxPending) pending.erase(pending.begin());
@@ -408,7 +457,8 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
 
         // kHaptic. With a key, only a datagram sealed with a pending
         // handshake's keys starts a session: it proves the master knows the
-        // psk and holds the ephemeral key of that handshake.
+        // psk and holds the ephemeral key of that handshake, wherever it
+        // comes from (a NAT may have moved the master since its hello).
         if ((h->flags & wire::kFlagFinal)) continue;
         std::optional<crypto::SessionKeys> keys;
         if (cfg.psk) {
@@ -416,14 +466,17 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
             refuse(h->session, "unauthenticated session from " + from.to_string() + " refused");
             continue;
           }
-          if (match == pending.end()) continue;
-          scratch.clear();
-          if (!crypto::open(match->keys.recv, h->seq, buf.data(), wire::kHeaderSize,
-                            buf.data() + wire::kHeaderSize, h->payload_len, scratch) ||
-              !wire::decode_haptic_payload(scratch.data(), scratch.size())) {
-            continue;
+          for (const auto& p : pending) {
+            if (p.session != h->session) continue;
+            scratch.clear();
+            if (crypto::open(p.keys.recv, h->seq, buf.data(), wire::kHeaderSize, payload,
+                             h->payload_len, scratch) &&
+                wire::decode_haptic_payload(scratch.data(), scratch.size())) {
+              keys = p.keys;
+              break;
+            }
           }
-          keys = match->keys;
+          if (!keys) continue;
         } else if (!wire::decode_haptic(buf.data(), *n)) {
           continue;
         }

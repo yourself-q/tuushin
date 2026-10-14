@@ -35,7 +35,10 @@ namespace tuushin::crypto {
 // responder then answers a handshake nobody can finish, and must not treat
 // a session as established before a datagram authenticates under the new
 // keys (teleop::run_slave_node). Message 2 proves the responder knows the
-// psk, and a datagram under the new keys proves the initiator does.
+// psk, and a datagram under the new keys proves the initiator does. To keep
+// recorded first messages from costing the responder a key exchange each,
+// the teleop layer puts the initiator's time in the payload and answers
+// only newer ones (teleop::hello_payload).
 
 constexpr std::size_t kKeySize = 32;
 constexpr std::size_t kTagSize = 16;  // Poly1305

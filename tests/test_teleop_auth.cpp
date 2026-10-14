@@ -1,6 +1,8 @@
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -205,12 +207,13 @@ struct NodePair {
 
 // A short session over loopback between a master and a slave with the given
 // keys. `before` runs once the slave is up, before the master starts.
+// `via`, if set, is where the master sends instead of the slave's socket.
 template <class Before>
 NodePair run_pair(std::optional<crypto::Key> master_psk, std::optional<crypto::Key> slave_psk,
                   Nanos duration, Nanos handshake_timeout, net::UdpSocket& slave_sock,
-                  Before&& before) {
+                  Before&& before, const net::Endpoint* via = nullptr) {
   net::UdpSocket master_sock = bind_loopback();
-  const net::Endpoint slave_ep = peer_of(slave_sock);
+  const net::Endpoint slave_ep = via ? *via : peer_of(slave_sock);
   const Nanos period = kNanosPerMilli;
   WallParams wall;
   SimulatedSlave slave_dev(1.0, 2.0, wall, period, 10, monotonic_now(), 0.0);
@@ -255,6 +258,30 @@ bool any_contains(const std::vector<std::string>& v, const char* what) {
     if (s.find(what) != std::string::npos) return true;
   }
   return false;
+}
+
+// A hello as a master with `psk` would send it, with the given payload.
+std::vector<std::uint8_t> make_hello(const crypto::Key& psk, std::uint32_t session,
+                                     const std::vector<std::uint8_t>& payload) {
+  const auto prologue = handshake_prologue(session, Passivity::kReflective);
+  crypto::NoiseNNpsk0 hs(crypto::NoiseNNpsk0::Role::kInitiator, psk, prologue.data(),
+                         prologue.size());
+  const auto msg1 = hs.write_message(payload.data(), payload.size());
+  wire::Header h;
+  h.type = wire::PacketType::kHello;
+  h.session = session;
+  h.seq = 1;
+  h.flags = static_cast<std::uint16_t>(static_cast<unsigned>(Passivity::kReflective)
+                                       << wire::kSchemeShift);
+  std::vector<std::uint8_t> out;
+  wire::encode_raw(h, msg1.data(), msg1.size(), out);
+  return out;
+}
+
+bool is_reply(const std::optional<Datagram>& d) {
+  if (!d) return false;
+  const auto h = wire::decode_header(d->bytes.data(), d->bytes.size());
+  return h && h->type == wire::PacketType::kHelloReply;
 }
 
 }  // namespace
@@ -324,25 +351,13 @@ TEST_CASE(replayed_hello_does_not_start_a_session) {
   const auto r = run_pair(psk, psk, 300 * kNanosPerMilli, kNanosPerSecond, slave_sock, [&] {
     net::UdpSocket attacker = bind_loopback();
     const net::Endpoint slave_ep = peer_of(slave_sock);
-    // The "recording": a hello made by someone who knew the psk.
+    // The "recording": a hello made by someone who knew the psk, older than
+    // anything the master will send, but the slave has just started and has
+    // not seen a newer one.
     const std::uint32_t session = 0x5eed;
-    const auto prologue = handshake_prologue(session, Passivity::kReflective);
-    crypto::NoiseNNpsk0 hs(crypto::NoiseNNpsk0::Role::kInitiator, psk, prologue.data(),
-                           prologue.size());
-    const std::uint8_t none = 0;
-    const auto msg1 = hs.write_message(&none, 0);
-    wire::Header h;
-    h.type = wire::PacketType::kHello;
-    h.session = session;
-    h.seq = 1;
-    h.flags = static_cast<std::uint16_t>(static_cast<unsigned>(Passivity::kReflective)
-                                         << wire::kSchemeShift);
-    std::vector<std::uint8_t> out;
-    wire::encode_raw(h, msg1.data(), msg1.size(), out);
+    const auto out = make_hello(psk, session, hello_payload(1000));
     attacker.send_to(slave_ep, out.data(), out.size());
-    const auto reply = receive(attacker);
-    answered = reply && wire::decode_header(reply->bytes.data(), reply->bytes.size())->type ==
-                            wire::PacketType::kHelloReply;
+    answered = is_reply(receive(attacker));
     // Samples for that session: one unsealed, one "sealed" without the keys,
     // which only the recorded master's ephemeral key could have given.
     HapticLink open_link(attacker, session, slave_ep, Passivity::kReflective);
@@ -359,4 +374,103 @@ TEST_CASE(replayed_hello_does_not_start_a_session) {
   REQUIRE(r.slave.size() == 1);
   CHECK(r.slave[0].session == r.master.session);
   CHECK(r.slave[0].authenticated);
+}
+
+TEST_CASE(hellos_must_be_newer_and_copies_share_one_reply) {
+  net::UdpSocket slave_sock = bind_loopback();
+  const crypto::Key psk = crypto::random_key();
+  bool copy_same = false, older = true, equal = true, newer = false, timeless = true;
+  const auto r = run_pair(psk, psk, 300 * kNanosPerMilli, kNanosPerSecond, slave_sock, [&] {
+    net::UdpSocket a = bind_loopback(), b = bind_loopback();
+    const net::Endpoint slave_ep = peer_of(slave_sock);
+    const Nanos quiet = 100 * kNanosPerMilli;
+    // A hello, and a copy of it from elsewhere: the copy gets the very same
+    // reply (the same ephemeral key, so no second key exchange was made).
+    const auto h1 = make_hello(psk, 0x101, hello_payload(2000));
+    a.send_to(slave_ep, h1.data(), h1.size());
+    const auto r1 = receive(a);
+    b.send_to(slave_ep, h1.data(), h1.size());
+    const auto r2 = receive(b);
+    copy_same = is_reply(r1) && is_reply(r2) && r1->bytes == r2->bytes;
+    // Fresh hellos at an older and at the same time are not answered, a
+    // newer one is.
+    const auto h2 = make_hello(psk, 0x102, hello_payload(1000));
+    a.send_to(slave_ep, h2.data(), h2.size());
+    older = is_reply(receive(a, quiet));
+    const auto h3 = make_hello(psk, 0x103, hello_payload(2000));
+    a.send_to(slave_ep, h3.data(), h3.size());
+    equal = is_reply(receive(a, quiet));
+    const auto h4 = make_hello(psk, 0x104, hello_payload(3000));
+    a.send_to(slave_ep, h4.data(), h4.size());
+    newer = is_reply(receive(a));
+    // A hello that authenticates but carries no time is refused.
+    const auto h5 = make_hello(psk, 0x105, {});
+    a.send_to(slave_ep, h5.data(), h5.size());
+    timeless = is_reply(receive(a, quiet));
+  });
+  CHECK(copy_same);
+  CHECK(!older);
+  CHECK(!equal);
+  CHECK(newer);
+  CHECK(!timeless);
+  CHECK(any_contains(r.refusals, "not newer"));
+  CHECK(any_contains(r.refusals, "carries no time"));
+  // The master's clock is far ahead of these times, so its session runs.
+  CHECK(r.master.authenticated);
+  REQUIRE(r.slave.size() == 1);
+  CHECK(r.slave[0].authenticated);
+}
+
+TEST_CASE(a_copied_hello_ahead_of_the_master_does_not_take_its_place) {
+  // An attacker on the path copies the master's hello and gets copies to
+  // the slave first, from 20 addresses. Were a hello tied to the address it
+  // came from, the copies would take the slots and the genuine hello would
+  // then be refused as not newer; the session must run regardless.
+  net::UdpSocket slave_sock = bind_loopback();
+  net::UdpSocket relay = bind_loopback();
+  const net::Endpoint slave_ep = peer_of(slave_sock), relay_ep = peer_of(relay);
+  std::vector<net::UdpSocket> attackers;
+  for (int i = 0; i < 20; ++i) attackers.push_back(bind_loopback());
+  std::atomic<bool> stop{false};
+  std::atomic<int> copies_answered{0};
+  std::thread tap([&] {
+    std::optional<net::Endpoint> master;
+    bool copied = false;
+    std::vector<std::uint8_t> buf(wire::kMaxDatagram + 1);
+    while (!stop.load()) {
+      relay.wait_readable(10 * kNanosPerMilli);
+      for (;;) {
+        net::Endpoint from;
+        const auto n = relay.recv_from(buf.data(), buf.size(), &from);
+        if (!n) break;
+        if (from == slave_ep) {
+          if (master) relay.send_to(*master, buf.data(), *n);
+          continue;
+        }
+        master = from;
+        const auto h = wire::decode_header(buf.data(), *n);
+        if (h && h->type == wire::PacketType::kHello && !copied) {
+          copied = true;
+          for (auto& a : attackers) a.send_to(slave_ep, buf.data(), *n);
+          // Let the copies arrive first.
+          std::this_thread::sleep_for(std::chrono::milliseconds(20));
+          for (auto& a : attackers) copies_answered += is_reply(receive(a, kNanosPerMilli));
+        }
+        relay.send_to(slave_ep, buf.data(), *n);
+      }
+    }
+  });
+  const crypto::Key psk = crypto::random_key();
+  const auto r =
+      run_pair(psk, psk, 400 * kNanosPerMilli, kNanosPerSecond, slave_sock, [] {}, &relay_ep);
+  stop.store(true);
+  tap.join();
+  CHECK(copies_answered.load() == 20);  // the slave cannot tell a copy
+  CHECK(r.master.authenticated);
+  CHECK(!r.master.handshake_failed);
+  CHECK(r.master.slave_answered);
+  REQUIRE(r.slave.size() == 1);
+  CHECK(r.slave[0].authenticated);
+  CHECK(r.slave[0].session == r.master.session);
+  CHECK(r.slave[0].master == relay_ep);
 }
