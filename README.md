@@ -28,7 +28,7 @@ and also tested on Linux (Ubuntu 24.04, GCC 13.3). MIT licensed.
 | `wire/` | The datagram format: a 32-byte header whose echo fields let each end measure the round trip from ordinary traffic, as RTCP does. |
 | `crypto/` | A Noise_NNpsk0 handshake and ChaCha20-Poly1305 on libsodium: a pre-shared key becomes fresh keys for every session, and every datagram is authenticated and encrypted (see Authentication below). |
 | `sim/` | A deterministic 1-DoF teleoperation simulator built on the same controllers and devices. |
-| `tools/` | `tuushin-sim`, `tuushin-teleop` (master, slave and rendezvous server as separate processes), `tuushin-probe` (measure a path, write replayable traces), `nat_lab.sh` (master and slave behind Linux NATs in network namespaces). |
+| `tools/` | `tuushin-sim`, `tuushin-teleop` (master, slave and rendezvous server as separate processes), `tuushin-probe` (measure a path, write replayable traces), `nat_lab.sh` (master and slave behind Linux NATs in network namespaces). `tests/sim_nat.hpp` is a NAT in user space for tests on any system. |
 
 ## Build and test
 
@@ -364,9 +364,57 @@ session:
 | the same with `--prime-hops 2` | connects | 2.96 s |
 | a symmetric NAT (a new port per destination) at either end or both | fails | — |
 
-The slave punches until its session starts, so with an end 100 ms behind
-its NAT the master counts the last few punches as `foreign` datagrams (5 to
-10 in the lab); they do no harm.
+The slave punches until its session starts, so an end 100 ms behind its
+NAT still receives the last few punches during the session; they are
+dropped before the link and not counted as `foreign`.
+
+### When an end moves
+
+A session can lose its path without either end doing anything: a NAT
+drops a mapping (a reboot, a timeout, a carrier-grade NAT under load) or an
+end gets a new address (a new DHCP lease, Wi-Fi to mobile). The moved end
+keeps sending to the right address from a wrong one, and the other end
+keeps sending to an address that no longer leads anywhere. Two mechanisms
+repair this:
+
+- **The link follows an authentic peer** (`HapticLink`, as WireGuard does,
+  section 2.1 of its paper). A sealed sample that authenticates and is
+  newer than any before it moves the link's peer to the address it came
+  from; a replayed, late or forged one does not. Open links never move,
+  since anyone could redirect them. Reports count the moves.
+- **Both ends rejoin when they fall silent.** Behind a NAT that filters by
+  address and port, the link cannot follow: the other end's NAT drops the
+  moved end's datagrams, as it has never sent to the new address. Neither
+  end can tell which of them moved, since both just hear nothing; so after
+  100 ms without an authentic sample each registers with the rendezvous
+  server again (then every 0.5 s while the silence lasts). The server sees
+  the moved end at its new address and announces it to the other end, which
+  punches towards it (for a second, and while the silence lasts); its NAT
+  now lets the moved end's datagrams in, and its link follows them. This
+  needs the rendezvous server; between two fixed addresses the link alone
+  follows.
+
+`tests/sim_nat.hpp` is a NAT in user space for loopback tests (with RFC
+4787's mapping and filtering behaviours): when the slave's NAT forgets its
+mappings mid-session, the master loses about 100 samples and the session
+goes on; without the rejoin it is lost. In the lab, `--rebind-at 1.5`
+moves the slave behind natB to a second outside address, 203.0.113.3, and
+flushes natB's mappings 1.5 s after the master starts (a 4.5 s session):
+
+| scenario | result | samples lost, master / slave |
+|---|---|---|
+| cone NATs | the master's link follows, the master ends the session | 111 / 132 |
+| the slave 100 ms behind its NAT | the same | 309 / 330 |
+| the master 100 ms behind its NAT | the same | 309 / 525 |
+| the slave's NAT accepts datagrams to itself | the same | 110 / 131 |
+| both NATs reject them (port unreachable from the firewall, as OpenWrt's WAN zone does) | the same | 107 / 129 |
+| the master's NAT accepts them | lost: the moved slave's datagrams take the master's port first | — |
+
+The last row is the collision above, and nothing an end does can order it
+away: the moved end's first datagrams reach the other NAT before anyone
+knows it moved, and conntrack keeps their flow while they keep coming.
+A firewall that drops or rejects them, as nearly every router has, keeps
+conntrack from recording them.
 
 ## Known issues
 
@@ -402,11 +450,14 @@ its NAT the master counts the last few punches as `foreign` datagrams (5 to
 - **`--prime-hops` is a guess about the path.** Two ends a few hops apart
   need a smaller value, or the primes reach the other NAT (the lab's one-
   router case); nothing measures the hop count yet.
-- **A session does not follow an end whose address changes.** If a NAT
-  moves an end to another port mid-session, or an end changes network, its
-  datagrams come from an address the other end ignores (counted as
-  `foreign`); the slave returns to idle after a second of silence, and
-  there is no reconnection.
+- **A move costs about 100 ms plus a round trip to the server** (When an end
+  moves, above), during which the ends hear nothing from each other, as in
+  any outage. Behind a NAT that
+  accepts datagrams addressed to itself, the end that did not move cannot
+  take the moved one back at all; its session ends.
+- **Host candidates are taken once.** An end that changes network keeps
+  announcing the LAN addresses it started with; only the address the
+  server sees follows it.
 - One-way delays assume equal minimum delays in both directions, which no
   measurement between unsynchronized clocks can avoid.
 - Sequence numbers do not wrap (49 days at 1 kHz).
@@ -415,9 +466,8 @@ its NAT the master counts the last few punches as `foreign` datagrams (5 to
 
 - Traces of real paths (fibre, 4G and 5G in Japan) recorded with
   `tuushin-probe`, published so that any simulator or testbed can replay them.
-- A relay for ends behind symmetric NATs, a measured hop count for priming,
-  and sessions that survive an address change; then QUIC datagrams as a
-  transport.
+- A relay for ends behind symmetric NATs and a measured hop count for
+  priming; then QUIC datagrams as a transport.
 - Deadbands that adapt to the measured delay; more degrees of freedom; a real
   device behind `Device1D`.
 
