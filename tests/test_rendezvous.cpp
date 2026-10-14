@@ -714,6 +714,8 @@ TEST_CASE(session_survives_a_nat_that_rebinds) {
   CHECK(r.slave[0].ended_by_final);
   CHECK(r.slave[0].rejoins == 0);  // the master did not move
   CHECK(r.slave[0].link.moved == 0);
+  // The master's punches towards the slave's new address are not foreign.
+  CHECK(r.slave[0].link.foreign == 0 && r.master.link.foreign == 0);
 }
 
 TEST_CASE(session_is_lost_to_a_rebinding_nat_without_the_rejoin) {

@@ -120,6 +120,14 @@ std::vector<std::uint8_t> punch_datagram() {
   return out;
 }
 
+// Punches carry nothing; during a session they are expected (the other
+// end's last ones before its session started, or a rejoin's), so they are
+// not counted as the link's foreign datagrams.
+bool is_punch(const std::uint8_t* data, std::size_t n) {
+  const auto h = wire::decode_header(data, n);
+  return h && h->type == wire::PacketType::kPunch;
+}
+
 // Opens this end's NAT towards `to` with punches that expire on the way
 // (RendezvousConfig::prime_hops). False if none could be sent so, which is
 // what a system that cannot limit the hop count gives.
@@ -159,7 +167,8 @@ class SessionRejoin {
 
   // Every tick; `last_rx` is when the last authentic sample arrived.
   void tick(Nanos now, Nanos last_rx) {
-    if (now - last_rx > cfg_.rejoin_after) {
+    const bool silent = now - last_rx > cfg_.rejoin_after;
+    if (silent) {
       if (now >= next_rejoin_) {
         rv_.refresh_now();
         next_rejoin_ = now + net::RendezvousClient::kRetryInterval;
@@ -168,7 +177,9 @@ class SessionRejoin {
       next_rejoin_ = 0;
     }
     if (const auto reg = rv_.poll(now)) socket_.send_to(server_, reg->data(), reg->size());
-    if (now < punch_until_ && now >= next_punch_) {
+    // Also while the silence lasts: the server announces a move only once,
+    // and a punch towards it that was lost would otherwise not be repeated.
+    if ((now < punch_until_ || silent) && now >= next_punch_) {
       for (const auto& t : to_) socket_.send_to(t, punch_.data(), punch_.size());
       next_punch_ = now + cfg_.punch_interval;
     }
@@ -393,6 +404,7 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
   Nanos last_rx = monotonic_now();
   auto on_rx = [&](const std::uint8_t* data, std::size_t n, const net::Endpoint& from, Nanos rx) {
     if (rejoin && rejoin->on_datagram(data, n, from, monotonic_now())) return;
+    if (is_punch(data, n)) return;
     const auto r = link.on_datagram(data, n, from, rx);
     if (!r) return;
     last_rx = std::max(last_rx, rx);
@@ -769,6 +781,7 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
     if (rv && rv_server) rejoin.emplace(*rv, *rv_server, *cfg.rendezvous, socket);
     auto on_rx = [&](const std::uint8_t* data, std::size_t n, const net::Endpoint& from, Nanos rx) {
       if (rejoin && rejoin->on_datagram(data, n, from, monotonic_now())) return;
+      if (is_punch(data, n)) return;
       const auto r = link.on_datagram(data, n, from, rx);
       if (!r) return;
       ctl.receive(r->seq, r->sample);
