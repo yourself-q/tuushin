@@ -75,6 +75,35 @@ namespace tuushin::control {
 // H + m * v / dt, the force that stops the device within one sample: contact
 // without stored energy becomes perfectly inelastic instead of bouncing, and
 // at rest the force follows the operator's push. Larger n only soften it.
+//
+// Samples of unequal length. A real-time loop that is a fraction of a period
+// late shortens the next sample by as much, and the recursion above, which
+// assumes every sample lasts dt, then misreads the velocity in proportion:
+// a 0.68 ms sample read as 1 ms underestimates it by a third, and so the
+// output a large force will draw from a device moving into it. With the
+// actual lengths h_1 (last sample) and h_2 (the one before) the same model,
+// solved for the two unknowns, gives
+//
+//   H = (2 m (dx_1 / h_1 - dx_2 / h_2) + phi_1 h_1 + phi_2 h_2) / (h_1 + h_2),
+//   v = dx_1 / h_1 + (H - phi_1) h_1 / (2 m),
+//
+// which reduce to the expressions above when h_1 = h_2 = dt. The coming
+// sample is predicted at the nominal length; if it turns out longer, the
+// device's watchdog bounds how long the force acts (teleop::Device1D).
+//
+// Irregular samples. The model takes everything except the port force to be
+// constant over the history; that fails for a sample much longer than dt
+// (the loop was descheduled: after a 50 ms stall dx_1 is fifty samples'
+// worth of motion under a hand that has moved on), and the recursion fails
+// for a sample during which the device's watchdog cut the force. Samples
+// further than half a period from dt, and samples observed as irregular, put
+// the predictor out of ready() until two regular samples have refilled the
+// history; until then limit_force_predictive applies no force, which does
+// exactly zero work whatever the device does. At 1 kHz that is 2 ms without
+// force after a stall of tens of milliseconds. Samples much shorter than dt
+// count as irregular too: on a real encoder dx_1 / h_1 amplifies the
+// quantization by dt / h_1.
+//
 // Sign convention: power into the controlled two-port is phi * dx, and the
 // device accelerates by -phi / m. At a haptic master phi is the displayed
 // force when it pushes against the positive direction; at a slave robot phi
@@ -83,9 +112,17 @@ class DevicePredictor {
  public:
   DevicePredictor(double mass, double dt);
 
-  // Call once per sample with the displacement realized over the last sample
-  // and the port force that was held during it.
-  void observe(double dx, double phi_held);
+  // Call once per sample with the displacement realized over the last sample,
+  // the port force that was held throughout it, and its length h in seconds
+  // (dt if omitted). A sample further than dt / 2 from dt is irregular.
+  void observe(double dx, double phi_held) { observe(dx, phi_held, dt_); }
+  void observe(double dx, double phi_held, double h);
+  // A sample during which the port force was not held throughout, e.g. the
+  // device's watchdog cut it.
+  void observe_irregular(double dx, double phi_held);
+  // True when the last two samples were regular. A new predictor is ready:
+  // its history is that of a device at rest.
+  bool ready() const { return regular_ >= 2; }
 
   // Coefficients of the predicted displacement dx = base() - compliance() * phi.
   double base() const;
@@ -94,11 +131,14 @@ class DevicePredictor {
   double work(double phi) const { return phi * displacement(phi); }
 
   // The same over n samples with phi held: D_n = hold_base(n) - n^2 c phi.
-  // hold_base(1) equals base().
-  double hold_base(int n) const;
-  double hold_compliance(int n) const { return n * n * c_; }
-  double hold_displacement(double phi, int n) const { return hold_base(n) - hold_compliance(n) * phi; }
-  double hold_work(double phi, int n) const { return phi * hold_displacement(phi, n); }
+  // hold_base(1) equals base(). n need not be an integer: the model is a
+  // mass under a constant net force, so it predicts any horizon.
+  double hold_base(double n) const;
+  double hold_compliance(double n) const { return n * n * c_; }
+  double hold_displacement(double phi, double n) const {
+    return hold_base(n) - hold_compliance(n) * phi;
+  }
+  double hold_work(double phi, double n) const { return phi * hold_displacement(phi, n); }
 
   // Estimates recovered from the history: everything acting on the device
   // except the port force (the operator's hand, gravity, friction) in N, and
@@ -107,15 +147,21 @@ class DevicePredictor {
   double velocity_dt() const;
 
  private:
+  void push(double dx, double phi_held, double r, bool regular);
+
+  double dt_;
   double c_;
   double dx1_ = 0.0, dx2_ = 0.0;      // last two realized displacements
   double phi1_ = 0.0, phi2_ = 0.0;    // forces held during them
+  double r1_ = 1.0, r2_ = 1.0;        // their lengths in units of dt
+  int regular_ = 2;                   // regular samples since an irregular one, up to 2
 };
 
 // Scales `phi` towards zero so that the predicted work over the coming
 // sample, and over `hold_samples` samples if that is larger than one, stays
 // above -budget (budget in J; negative values count as zero). The result's
 // gain is the fraction of the requested force that was removed, 1 - lambda.
+// While the device is not ready() the result is zero force.
 PcResult limit_force_predictive(double budget, double phi, const DevicePredictor& device,
                                 int hold_samples = 2);
 

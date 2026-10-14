@@ -14,11 +14,13 @@ struct HeldMass {
   double m, dt, H;
   double x = 0.0, v = 0.0;
   // Applies phi over one sample and returns the displacement.
-  double step(double phi) {
+  double step(double phi) { return step_for(phi, dt); }
+  // The same over a sample of length h.
+  double step_for(double phi, double h) {
     const double a = (H - phi) / m;
-    const double dx = v * dt + 0.5 * a * dt * dt;
+    const double dx = v * h + 0.5 * a * h * h;
     x += dx;
-    v += a * dt;
+    v += a * h;
     return dx;
   }
 };
@@ -40,6 +42,68 @@ TEST_CASE(predictor_is_exact_for_a_mass_under_held_force) {
     CHECK_NEAR(predicted, realized, 1e-15);
     CHECK_NEAR(pred.work(phi), phi * realized, 1e-15);
     pred.observe(realized, phi);
+  }
+}
+
+TEST_CASE(predictor_is_exact_after_samples_of_unequal_length) {
+  // A loop that is 0.4 ms late makes one sample 1.4 ms and the next 0.6 ms.
+  // Read as two 1 ms samples, the history would put the velocity 40 % low.
+  const double m = 0.2, dt = 1e-3;
+  HeldMass dev{m, dt, -1.5};
+  dev.v = -0.15;
+  DevicePredictor pred(m, dt);
+  pred.observe(dev.step(0.0), 0.0);
+  pred.observe(dev.step(2.0), 2.0);
+  const double lengths[] = {1.4e-3, 0.6e-3, 1.0e-3, 0.55e-3, 1.45e-3, 1.2e-3};
+  const double phis[] = {-3.0, -15.0, 4.0, 0.0, -8.0, 6.0};
+  for (int i = 0; i < 6; ++i) {
+    pred.observe(dev.step_for(phis[i], lengths[i]), phis[i], lengths[i]);
+    CHECK(pred.ready());
+    CHECK_NEAR(pred.external_force(), dev.H, 1e-7);
+    CHECK_NEAR(pred.velocity_dt(), dev.v * dt, 1e-15);
+    // The coming sample is predicted at the nominal length, held or not.
+    HeldMass copy = dev;
+    const double phi = -12.0;
+    const double one = copy.step(phi);
+    CHECK_NEAR(pred.displacement(phi), one, 1e-15);
+    CHECK_NEAR(pred.hold_displacement(phi, 2), one + copy.step(phi), 1e-15);
+  }
+  // Equal lengths reproduce the recursion of the class comment,
+  // dx_k = 2 dx_{k-1} - dx_{k-2} + c phi_{k-2} - c phi_k.
+  DevicePredictor a(m, dt), b(m, dt);
+  const double c = dt * dt / (2.0 * m);
+  const double dx2 = dev.step(-2.0), dx1 = dev.step(3.0);
+  a.observe(dx2, -2.0);
+  a.observe(dx1, 3.0);
+  b.observe(dx2, -2.0, dt);
+  b.observe(dx1, 3.0, dt);
+  CHECK(a.base() == b.base());
+  CHECK_NEAR(a.base(), 2.0 * dx1 - dx2 + c * -2.0, 1e-18);
+}
+
+TEST_CASE(predictor_waits_two_samples_after_an_irregular_one) {
+  const double m = 0.2, dt = 1e-3;
+  HeldMass dev{m, dt, 3.0};
+  dev.v = 0.05;
+  for (int kind = 0; kind < 3; ++kind) {
+    DevicePredictor pred(m, dt);
+    CHECK(pred.ready());  // a new predictor: a device at rest
+    pred.observe(dev.step(0.0), 0.0);
+    pred.observe(dev.step(0.0), 0.0);
+    if (kind == 0) pred.observe(dev.step_for(0.0, 50e-3), 0.0, 50e-3);  // a stall
+    if (kind == 1) pred.observe(dev.step_for(0.0, 0.3e-3), 0.0, 0.3e-3);  // too short
+    if (kind == 2) pred.observe_irregular(dev.step(0.0), 0.0);  // the force was cut
+    CHECK(!pred.ready());
+    // Not ready: no force at all, whatever the budget.
+    const auto r = limit_force_predictive(1.0, 5.0, pred);
+    CHECK(r.active);
+    CHECK(r.value == 0.0);
+    CHECK(r.gain == 1.0);
+    pred.observe(dev.step(0.0), 0.0);
+    CHECK(!pred.ready());
+    pred.observe(dev.step(0.0), 0.0);
+    REQUIRE(pred.ready());
+    CHECK_NEAR(pred.displacement(2.0), HeldMass(dev).step(2.0), 1e-15);
   }
 }
 

@@ -38,18 +38,17 @@ class Ticker {
   Ticker(Nanos period, Nanos first) : period_(period), next_(first) {}
   Nanos due() const { return next_; }
   Nanos period() const { return period_; }
-  // Records a tick taken at `now` and schedules the next one. A loop that
-  // fell more than max_behind periods behind (the process was descheduled)
+  // Records a tick taken at `now` and schedules the next one on the grid. A
+  // loop that fell a period or more behind (the process was descheduled)
   // drops the ticks it missed instead of running them back to back: a
-  // control sample is about the present, and a burst of them would only send
-  // the same state several times.
+  // control sample is about the present, a burst of them would only send
+  // the same state several times, and samples microseconds apart would
+  // look to the controllers like a device that stopped.
   void taken(Nanos now);
   std::uint64_t ticks() const { return ticks_; }
   std::uint64_t skipped() const { return skipped_; }
   // Lateness of each tick (ns), for statistics; capped at about 4 M entries.
   const std::vector<double>& lateness() const { return lateness_; }
-
-  static constexpr int kMaxBehind = 10;
 
  private:
   Nanos period_;

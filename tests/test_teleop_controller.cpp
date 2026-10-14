@@ -37,6 +37,66 @@ TEST_CASE(device_integrates_irregular_reads_like_regular_ones) {
   CHECK(irregular.read_position(t) == x0);
 }
 
+TEST_CASE(device_watchdog_cuts_a_stale_force_and_reports_it) {
+  // A force commanded at 0 with a 2 ms watchdog, then no command until
+  // 10 ms: the device behaves as if the host had commanded zero at 2 ms.
+  WallParams far;
+  far.position = 10.0;
+  SimulatedSlave dog(1.0, 2.0, far, kNanosPerMilli, 10);
+  SimulatedSlave host(1.0, 2.0, far, kNanosPerMilli, 10);
+  dog.set_watchdog(2 * kNanosPerMilli);
+  dog.read_position(0);
+  dog.command_force(1.5);
+  dog.read_position(kNanosPerMilli);
+  CHECK(dog.force() == 1.5);
+  CHECK(dog.force_cut_after() == 0);
+  dog.read_position(10 * kNanosPerMilli);
+  CHECK(dog.force() == 0.0);
+  CHECK(dog.force_cut_after() == 2 * kNanosPerMilli);
+  host.read_position(0);
+  host.command_force(1.5);
+  host.read_position(2 * kNanosPerMilli);
+  host.command_force(0.0);
+  host.read_position(10 * kNanosPerMilli);
+  CHECK_NEAR(dog.position(), host.position(), 1e-15);
+  CHECK_NEAR(dog.velocity(), host.velocity(), 1e-12);
+  CHECK_NEAR(dog.actuator_work(), host.actuator_work(), 1e-18);
+  CHECK(dog.actuator_work() > 0.0);
+  // The next command clears the report.
+  dog.command_force(1.0);
+  CHECK(dog.force_cut_after() == 0);
+}
+
+TEST_CASE(master_books_a_cut_force_as_predicted_output_only) {
+  // The master displays 5 N, then its loop stalls for 10 ms and the device's
+  // watchdog cuts the force after 2 ms. The encoder shows the hand pushed
+  // 1 mm into the force over the whole stall, but the force did not act for
+  // most of it: crediting 5 N * 1 mm = 5 mJ of input would let the PC pay
+  // out energy that never entered.
+  for (const bool cut : {false, true}) {
+    MasterController m(MasterConfig{});
+    m.receive(1, Sample{5.0, 0.0, 1.0});  // plenty of granted energy
+    CHECK(m.step(0, 0.0).display_force == 5.0);
+    const Nanos now = cut ? 10 * kNanosPerMilli : kNanosPerMilli;
+    const double x = cut ? 1e-3 : 1e-4;
+    const auto s = m.step(now, x, cut ? 2 * kNanosPerMilli : 0);
+    CHECK_NEAR(s.sample.value, 0.1, 1e-12);  // dx over the time that passed
+    if (!cut) {
+      CHECK_NEAR(m.port().input_energy(), 5.0 * 1e-4, 1e-15);
+      CHECK(m.port().output_energy() == 0.0);
+      continue;
+    }
+    // From rest, 5 N held for 2 ms moves the 0.2 kg model by
+    // -5 * (2 ms)^2 / (2 * 0.2 kg) = -50 um: an output of 0.25 mJ.
+    CHECK(m.port().input_energy() == 0.0);
+    CHECK_NEAR(m.port().output_energy(), 5.0 * 50e-6, 1e-12);
+    // The model has to see two regular samples before it trusts itself again.
+    CHECK(s.display_force == 0.0);
+    CHECK(m.step(11 * kNanosPerMilli, x).display_force == 0.0);
+    CHECK(m.step(12 * kNanosPerMilli, x).display_force > 0.0);
+  }
+}
+
 TEST_CASE(wall_only_pushes) {
   WallParams w;
   SimulatedSlave s(1.0, 2.0, w, kNanosPerMilli, 10, 0, w.position + 0.001);

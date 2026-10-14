@@ -58,6 +58,10 @@ network had caused it:
 ./build/tools/tuushin-teleop master 127.0.0.1 --port 47100 --duration 10 --emulate-delay 25
 ```
 
+Each simulated device cuts its force when no command has come for two
+periods, as haptic devices do (`--watchdog MS` changes it, 0 disables it;
+see Loop stalls below).
+
 Measure a real path and replay it:
 
 ```sh
@@ -84,11 +88,11 @@ series give about 1430 N/m.
 | one-way delay | no passivity control: margin | conventional TDPA: stiffness / margin | TDPA with energy reflection: stiffness / margin |
 |---|---|---|---|
 | 0 ms | 0 J | 1318 N/m / 0 J | 1470 N/m / 0 J |
-| 5 ms | −19 J | 498 / −1.3e−4 J | 1358 / 0 J |
-| 10 ms | −66 J | 116 / −1.2e−3 J | 1133 / 0 J |
-| 25 ms | −410 J | 43 / −0.052 J | 438 / −3.9e−5 J |
+| 5 ms | −19 J | 501 / −1.3e−4 J | 1358 / 0 J |
+| 10 ms | −66 J | 112 / −1.2e−3 J | 1133 / 0 J |
+| 25 ms | −410 J | 43 / −0.051 J | 438 / −3.9e−5 J |
 | 50 ms | −140 J | 43 / −0.19 J | 202 / −3.7e−5 J |
-| 100 ms | −461 J | 53 / −0.19 J | 109 / −8.9e−5 J |
+| 100 ms | −461 J | 53 / −0.19 J | 110 / −8.9e−5 J |
 | 200 ms | −322 J | 84 / −0.17 J | 90 / −1.8e−4 J |
 
 Without passivity control the loop generates hundreds of joules and runs
@@ -108,28 +112,69 @@ scheme, 10 s sessions on macOS with the Mach time-constraint policy:
 
 | | no emulated delay | 25 ms each way (emulated) | simulator, 25 ms |
 |---|---|---|---|
-| round trip, p50 / p99.9 | 0.039 / 0.099 ms | 50.04 / 50.10 ms | — |
-| master tick lateness, p50 / max | 6 / 19 µs | 6 / 28 µs | — |
+| round trip, p50 / p99.9 | 0.041 / 0.107 ms | 50.04 / 50.11 ms | — |
+| master tick lateness, p50 / max | 7 / 23 µs | 7 / 27 µs | — |
 | samples lost | 0 | 0 | — |
 | max master position | 0.0233 m | 0.0288 m | 0.0286 m |
-| max displayed force | 5.017 N (simulator: 5.017 N) | 5.348 N | 5.398 N |
-| master / slave PC active | 3 % / 72 % | 88 % / 76 % | 89 % / 75 % |
-| min margin | 0 J | −5.1e−5 J | −3.9e−5 J |
+| max displayed force | 5.017 N (simulator: 5.017 N) | 5.288 N | 5.398 N |
+| master / slave PC active | 3 % / 72 % | 89 % / 75 % | 89 % / 75 % |
+| min margin | 0 J | −3.6e−5 J | −3.9e−5 J |
 
-With the same delay the real-time loop and the simulator agree to about 1 %
-in position, force and how often the passivity controllers act, and their
-residual margins are of the same order. The one-way delays come from the echo fields and a clock fit,
-with no clock synchronization between the ends.
+With the same delay the real-time loop and the simulator agree to within
+2 % in position, force and how often the passivity controllers act, and
+their residual margins are of the same order. The one-way delays come from
+the echo fields and a clock fit, with no clock synchronization between the
+ends.
+
+### Loop stalls
+
+A control loop that is descheduled leaves its last force on the actuator
+for the whole stall, and that force does work no passivity controller
+checks. tuushin handles this in three parts:
+
+- The device cuts a force that has not been renewed within two periods,
+  the horizon the predictive PC already plans over (`--watchdog`). The
+  servo loops of haptic devices have such a watchdog (Force Dimension's
+  `dhdSetWatchdog`, for one); `Device1D::force_cut_after()` reports it.
+- A force that was cut is booked as the output the controller's device
+  model predicts for the time it acted, never as input.
+- After a sample further than half a period from nominal, or one in which
+  the force was cut, the PC applies no force until two regular samples have
+  refilled the device model (2 ms at 1 kHz). Samples within half a period
+  are modelled with their actual length: a loop 0.3 ms late makes the next
+  sample 0.7 ms, and read as 1 ms it understates the device's velocity by
+  30 %, and with it the energy a large force will draw.
+
+A watchdog alone is not enough: with the force cut but the books not told,
+they credited the operator's push during the stall as input and the
+controller paid it out: after 50 to 100 ms stalls the margin fell to between
+−74 and −82 mJ, worse than without a watchdog.
+
+Worst physical margin (minus the work both actuators did on their devices)
+in a virtual-time replica of the two nodes (`tests/test_teleop_stall.cpp`;
+5 ms each way, energy-reflection scheme, 3 s), over 40 stall start times at
+the master, the slave or both:
+
+| | 25 ms stall | 50 ms | 100 ms | random stalls at both ends |
+|---|---|---|---|---|
+| no watchdog | 0 J | −0.019 J | −0.025 J | −0.019 J |
+| watchdog, two periods | −5e−5 J | −6e−5 J | −4e−5 J | 0 J |
+
+Random stalls: 30 per second at each end, 0.2 to 12 ms long, 200 runs; with
+the watchdog the energy books, which are the more conservative of the two,
+stay above −2e−5 J. In real time, with both nodes as threads of one process
+without real-time priority on a laptop loaded with 10 busy processes (the
+setup of the test `nodes_run_a_session_over_loopback`), 2 of 48 sessions
+without the watchdog fell below −1 mJ (the worst to −6 mJ); with it the
+worst of 48 sessions was −1e−5 J, and of 60 under 24 busy processes
+−2e−5 J.
 
 ## Known issues
 
-- **Loop stalls.** The controllers assume a fixed sample interval. When a
-  process is descheduled for tens of milliseconds, the last force stays on
-  the actuator for the whole stall and the energy books can go negative. In
-  3 of about 60 runs of the two-node test (both ends as threads of one
-  process, no real-time priority) the margin fell below −1 mJ; in the run
-  examined, stalls of 37 and 57 ms took it to −8 mJ. Being worked on: a device watchdog, as haptic devices' servo loops
-  have, and accounting for the actual interval.
+- **Devices need a watchdog.** The stall handling above relies on the
+  device cutting a stale force by itself; a host process cannot do it while
+  it is descheduled. Behind a device without one, a stalled loop leaves the
+  last force on (the first row of the table above).
 - **No authentication or encryption.** Anyone who can send datagrams from
   the peer's address with the session id can inject samples. Do not drive
   real hardware over an untrusted network with this yet.

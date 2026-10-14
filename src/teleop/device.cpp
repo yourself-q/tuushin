@@ -33,6 +33,7 @@ double SimulatedDevice::read_position(Nanos now) {
   if (watchdog_ > 0 && f_ != 0.0 && now > command_time_ + watchdog_) {
     advance(std::max(t_, command_time_ + watchdog_));
     f_ = 0.0;
+    cut_after_ = watchdog_;
   }
   advance(now);
   return x_;

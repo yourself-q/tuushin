@@ -21,6 +21,14 @@ class Device1D {
   // Interaction force with the environment at the last read (N), 0 without a
   // force sensor.
   virtual double contact_force() const { return 0.0; }
+  // If the device's watchdog cut the force commanded last because no new
+  // command came in time, how long after that command it did (ns); 0 while
+  // the force is applied. The servo loops of haptic devices do this when the
+  // host stops sending (Force Dimension's dhdSetWatchdog, for one), and
+  // report it in their status. The controllers need to know: a force that
+  // was cut did no work for the rest of the sample, and booking it as if it
+  // had credits energy that never entered.
+  virtual Nanos force_cut_after() const { return 0; }
 };
 
 struct OperatorParams {
@@ -60,7 +68,9 @@ class SimulatedDevice : public Device1D {
   void command_force(double f) override {
     f_ = f;
     command_time_ = t_;
+    cut_after_ = 0;
   }
+  Nanos force_cut_after() const override { return cut_after_; }
 
   double position() const { return x_; }
   // The force the actuator applies now: the last command, or 0 once the
@@ -75,6 +85,7 @@ class SimulatedDevice : public Device1D {
   // after the read it followed, as the watchdog of a haptic device's servo
   // loop does when the host stops sending. 0 disables it (the default).
   void set_watchdog(Nanos timeout) { watchdog_ = timeout; }
+  Nanos watchdog() const { return watchdog_; }
   // False once the state has left the plausible range (|x| < 1 m,
   // |v| < 10 m/s, finite), i.e. the loop went unstable.
   bool plausible() const;
@@ -99,6 +110,7 @@ class SimulatedDevice : public Device1D {
   double f_ = 0.0;
   Nanos command_time_;
   Nanos watchdog_ = 0;
+  Nanos cut_after_ = 0;
   double work_ = 0.0;
 };
 

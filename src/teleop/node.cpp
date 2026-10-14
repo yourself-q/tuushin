@@ -18,7 +18,7 @@ void Ticker::taken(Nanos now) {
   ++ticks_;
   if (lateness_.size() < (std::size_t{1} << 22)) lateness_.push_back(static_cast<double>(now - next_));
   next_ += period_;
-  if (now - next_ > kMaxBehind * period_) {
+  if (next_ <= now) {
     const Nanos missed = (now - next_) / period_ + 1;
     skipped_ += static_cast<std::uint64_t>(missed);
     next_ += missed * period_;
@@ -151,7 +151,7 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
     // sample carries the same, final, figures.
     MasterController::Step st;
     if (!final) {
-      st = ctl.step(now, x);
+      st = ctl.step(now, x, device.force_cut_after());
       device.command_force(-st.display_force);
     } else {
       device.command_force(0.0);
@@ -328,7 +328,7 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
       // whichever final sample reaches it.
       SlaveController::Step st;
       if (!final) {
-        st = ctl.step(now, x, device.velocity(), fc);
+        st = ctl.step(now, x, device.velocity(), fc, device.force_cut_after());
         device.command_force(st.force);
       } else {
         device.command_force(0.0);

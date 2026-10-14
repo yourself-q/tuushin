@@ -4,6 +4,34 @@
 
 namespace tuushin::teleop {
 
+namespace {
+
+// Work the port force phi, held since the last sample, did on the two-port
+// over that sample (positive = in), given the displacement dx the encoder
+// saw. If the watchdog cut the force `cut_after` after the command, the
+// displacement while it acted was not seen: the model the PC chose the force
+// with predicts it, and only an output is booked. Without a usable model the
+// whole sample's work is booked if it was an output.
+double held_work(const control::DevicePredictor& dev, double phi, double dx, Nanos cut_after,
+                 double dt) {
+  if (cut_after <= 0) return phi * dx;
+  const double predicted = dev.ready() ? dev.hold_work(phi, to_seconds(cut_after) / dt) : phi * dx;
+  return std::min(0.0, predicted);
+}
+
+// Feeds the last sample, of length h (s), to the device model. A sample far
+// from the nominal length is the model's to reject; one during which the
+// force was cut is not described by it at all.
+void observe(control::DevicePredictor& dev, double dx, double phi, double h, Nanos cut_after) {
+  if (cut_after > 0) {
+    dev.observe_irregular(dx, phi);
+  } else {
+    dev.observe(dx, phi, h);
+  }
+}
+
+}  // namespace
+
 MasterController::MasterController(const MasterConfig& cfg)
     : cfg_(cfg),
       dt_(to_seconds(cfg.dt)),
@@ -19,16 +47,18 @@ void MasterController::receive(std::uint32_t seq, const Sample& s) {
   }
 }
 
-MasterController::Step MasterController::step(Nanos now, double position) {
+MasterController::Step MasterController::step(Nanos now, double position, Nanos cut_after) {
   // Book the work the force held over the last sample actually did, then
   // display the reflected force through the PC. The velocity is the backward
   // difference of the encoder position, as on a real device.
   if (first_) x_sampled_ = position;
+  const double h = first_ || now <= last_now_ ? dt_ : to_seconds(now - last_now_);
   const double dx = position - x_sampled_;
-  v_meas_ = first_ ? 0.0 : dx / dt_;
+  v_meas_ = first_ ? 0.0 : dx / h;
   first_ = false;
-  port_.account_energy(f_display_ * dx);
-  dev_.observe(dx, f_display_);
+  last_now_ = now;
+  port_.account_energy(held_work(dev_, f_display_, dx, cut_after, dt_));
+  observe(dev_, dx, f_display_, h, cut_after);
   x_sampled_ = position;
 
   Step out;
@@ -82,21 +112,24 @@ void SlaveController::receive(std::uint32_t seq, const Sample& s) {
 }
 
 SlaveController::Step SlaveController::step(Nanos now, double position, double velocity,
-                                            double contact_force) {
+                                            double contact_force, Nanos cut_after) {
   const bool fresh = fresh_;
   fresh_ = false;
-  steps_since_fresh_ = fresh ? 0 : steps_since_fresh_ + 1;
+  if (fresh) fresh_at_ = now;
+  const double h = stepped_ && now > last_now_ ? to_seconds(now - last_now_) : dt_;
+  stepped_ = true;
+  last_now_ = now;
 
   // Book the work the applied force did on the slave over the last sample;
   // this is the true slave terminal for every scheme, and the energy source
   // or sink of the reflective store.
   const double dx = position - x_sampled_;
-  const double work_in = -f_ctrl_ * dx;
+  const double work_in = held_work(dev_, -f_ctrl_, dx, cut_after, dt_);
   terminal_net_ += work_in;
-  dev_.observe(dx, -f_ctrl_);
+  observe(dev_, dx, -f_ctrl_, h, cut_after);
   x_sampled_ = position;
 
-  const bool live = has_value_ && (cfg_.hold_after <= 0 || steps_since_fresh_ * cfg_.dt <= cfg_.hold_after);
+  const bool live = has_value_ && (cfg_.hold_after <= 0 || now - fresh_at_ <= cfg_.hold_after);
   const double v_received = live ? last_.value : 0.0;
   if (fresh) x_master_est_ = last_.aux;
   v_requested_ = v_received;
@@ -124,8 +157,11 @@ SlaveController::Step SlaveController::step(Nanos now, double position, double v
     // convention is power *into* the two-port, which at the slave is the
     // slave pushing against the coupling: phi = -f.
     const double phi = -f_coupling;
-    const double want_slave =
-        cfg_.predictive_pc ? -dev_.work(phi) : f_coupling * velocity * dt_;
+    // A predictor that is not ready lets no force through (see step()), so
+    // nothing will leave towards the slave.
+    const double want_slave = !cfg_.predictive_pc ? f_coupling * velocity * dt_
+                              : dev_.ready()      ? -dev_.work(phi)
+                                                  : 0.0;
     const double want_master = -f_slave_ * v_c_ * dt_;
     const auto grant = store_.allocate(want_slave, want_master);
     const auto pc = cfg_.predictive_pc

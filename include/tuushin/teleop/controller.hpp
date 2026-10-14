@@ -79,8 +79,18 @@ class MasterController {
   };
 
   // One sample at time `now` with the encoder at `position`. Books the work
-  // the previously applied force did since the last call.
-  Step step(Nanos now, double position);
+  // the previously applied force did since the last call; `cut_after` is the
+  // device's Device1D::force_cut_after() (0 when the force stayed on).
+  //
+  // Samples need not come at exactly dt: the velocity and the device model
+  // use the time that really passed, and a sample far from dt (the loop was
+  // descheduled) or one during which the watchdog cut the force makes the
+  // predictive PC apply no force for two samples (control::DevicePredictor).
+  // A force that was cut did work only until the cut, over a displacement
+  // no encoder read; the device model that chose the force predicts it, and
+  // only an output is booked, since entering energy is credited only when
+  // measured.
+  Step step(Nanos now, double position, Nanos cut_after = 0);
 
   // The velocity sent with the last step (backward difference).
   double velocity() const { return v_meas_; }
@@ -96,6 +106,7 @@ class MasterController {
   control::DevicePredictor dev_;
   codec::DeadbandEncoder<1> enc_;
   bool first_ = true;
+  Nanos last_now_ = 0;
   double x_sampled_ = 0.0;
   double v_meas_ = 0.0;
   double f_display_ = 0.0;
@@ -152,8 +163,10 @@ class SlaveController {
   // One sample at time `now` with the encoder at `position`, the device's
   // velocity estimate `velocity` (the damping term of the coupling acts on
   // it) and the force sensor (if any) at `contact_force`, which is only used
-  // when the slave reports it.
-  Step step(Nanos now, double position, double velocity, double contact_force);
+  // when the slave reports it. Irregular samples and `cut_after` are handled
+  // as in MasterController::step.
+  Step step(Nanos now, double position, double velocity, double contact_force,
+            Nanos cut_after = 0);
 
   // Diagnostics of the last step.
   double command() const { return x_cmd_; }            // coupling target (m)
@@ -163,7 +176,8 @@ class SlaveController {
   double reported_force() const { return f_slave_; }
   bool has_master_sample() const { return has_value_; }
   // Net energy that entered through the slave device port, booked from the
-  // realized work of the applied force.
+  // realized work of the applied force (predicted, for a sample in which
+  // the watchdog cut it).
   double terminal_net() const { return terminal_net_; }
   // kReflective: the store. kNone and kChannel: the channel end at the slave.
   const control::ReflectiveStore& store() const { return store_; }
@@ -189,7 +203,9 @@ class SlaveController {
   bool fresh_ = false;
   std::uint32_t last_seq_ = 0;
   Sample last_;
-  std::int64_t steps_since_fresh_ = 0;
+  Nanos fresh_at_ = 0;  // when the newest sample was first used
+  bool stepped_ = false;
+  Nanos last_now_ = 0;
   std::uint64_t sent_ = 0;
 };
 

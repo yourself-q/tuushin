@@ -193,13 +193,15 @@ TEST_CASE(ticker_skips_after_a_long_stall) {
   CHECK(t.due() == kNanosPerMilli);
   t.taken(kNanosPerMilli + 200'000);  // a little late: keeps the grid
   CHECK(t.due() == 2 * kNanosPerMilli);
-  t.taken(50 * kNanosPerMilli + 300'000);  // descheduled for ~48 ms
-  CHECK(t.skipped() > 0);
-  CHECK(t.due() > 50 * kNanosPerMilli);
-  CHECK(t.due() <= 51 * kNanosPerMilli);
-  CHECK(t.due() % kNanosPerMilli == 0);  // still on the grid
-  CHECK(t.ticks() == 3);
-  CHECK(t.lateness().size() == 3);
+  CHECK(t.skipped() == 0);
+  t.taken(3 * kNanosPerMilli + 500'000);  // a period and a half late: no catch-up tick
+  CHECK(t.skipped() == 1);
+  CHECK(t.due() == 4 * kNanosPerMilli);
+  t.taken(50 * kNanosPerMilli + 300'000);  // descheduled for ~46 ms
+  CHECK(t.skipped() == 47);
+  CHECK(t.due() == 51 * kNanosPerMilli);  // still on the grid
+  CHECK(t.ticks() == 4);
+  CHECK(t.lateness().size() == 4);
 }
 
 TEST_CASE(nodes_run_a_session_over_loopback) {
@@ -213,6 +215,7 @@ TEST_CASE(nodes_run_a_session_over_loopback) {
 
   WallParams wall;
   SimulatedSlave slave_dev(1.0, 2.0, wall, period, 10, monotonic_now(), 0.0);
+  slave_dev.set_watchdog(2 * period);
   SlaveNodeConfig scfg;
   scfg.control.dt = period;
   scfg.control.passivity = Passivity::kReflective;
@@ -228,6 +231,7 @@ TEST_CASE(nodes_run_a_session_over_loopback) {
   const Nanos start = monotonic_now();
   OperatorParams op;
   SimulatedMaster master_dev(0.2, 0.5, op, period, 10, start);
+  master_dev.set_watchdog(2 * period);
   MasterNodeConfig mcfg;
   mcfg.control.dt = period;
   mcfg.control.passivity = Passivity::kReflective;
@@ -253,14 +257,11 @@ TEST_CASE(nodes_run_a_session_over_loopback) {
   CHECK(std::fabs(rep.backward.p50 - static_cast<double>(delay)) < 2.0 * kNanosPerMilli);
   REQUIRE(slave_reports.size() == 1);
   const auto& s = slave_reports[0];
-  // The teleoperator stays passive and moves. A loop that stalled long
-  // enough to skip ticks held its last force through the stall, which the
-  // controllers' fixed-interval books do not cover yet (README, known
-  // issues), so passivity is only checked on runs without one.
-  if (rep.skipped == 0 && s.skipped == 0) {
-    CHECK(rep.min_margin > -1e-3);
-    CHECK(rep.master_net + rep.slave_net > -1e-3);
-  }
+  // The teleoperator stays passive and moves, also when a thread was
+  // descheduled long enough to skip ticks (no real-time priority here): the
+  // devices' watchdogs cut the force a stalled loop would otherwise hold.
+  CHECK(rep.min_margin > -1e-3);
+  CHECK(rep.master_net + rep.slave_net > -1e-3);
   CHECK(rep.max_position > 0.005);
 
   CHECK(s.session == rep.session);

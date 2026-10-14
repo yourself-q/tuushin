@@ -10,6 +10,7 @@
 // loopback: --emulate-delay 25 on each end gives a 50 ms round trip, and
 // --emulate-trace replays a path recorded with tuushin-probe.
 
+#include <algorithm>
 #include <atomic>
 #include <csignal>
 #include <cstdio>
@@ -59,6 +60,8 @@ void usage() {
                "      --deadband K         perceptual deadband with Weber fraction K\n"
                "      --dscp D             DSCP of outgoing datagrams (46)\n"
                "      --no-rt              do not ask for low-latency scheduling\n"
+               "      --watchdog MS        the simulated device cuts its force after MS\n"
+               "                           without a command (two periods; 0 disables)\n"
                "      --emulate-delay MS   add this one-way delay to outgoing datagrams\n"
                "      --emulate-jitter MS  mean exponential jitter on top (FIFO)\n"
                "      --emulate-reorder    let the jitter reorder datagrams\n"
@@ -82,6 +85,7 @@ struct Options {
   double deadband = 0.0;
   int dscp = 46;
   bool rt = true;
+  double watchdog_ms = -1.0;  // negative: the PC's holding horizon
   bool ipv6 = false;
   std::string log;
   // master
@@ -121,6 +125,15 @@ std::unique_ptr<net::ChannelModel> make_emulation(const Options& o, Nanos start,
     ch = std::make_unique<net::GilbertElliottLoss>(std::move(ch), iid, seed + 100);
   }
   return ch;
+}
+
+// The predictive PCs choose a force they can afford to hold for
+// pc_hold_samples periods. A device watchdog at that horizon keeps a stalled
+// loop from holding it longer, which is what makes stalls safe: without one
+// the last force acts for the whole stall and no controller can stop it.
+Nanos watchdog_of(const Options& o, Nanos period, int pc_hold_samples) {
+  if (o.watchdog_ms < 0.0) return std::max(1, pc_hold_samples) * period;
+  return from_millis(o.watchdog_ms);
 }
 
 const char* scheme_name(teleop::Passivity p) {
@@ -192,6 +205,7 @@ int run_master(const Options& o) {
   const Nanos start = monotonic_now();
   teleop::OperatorParams op;
   teleop::SimulatedMaster device(0.2, 0.5, op, period, 10, start);
+  device.set_watchdog(watchdog_of(o, period, cfg.control.pc_hold_samples));
   cfg.control.model_mass = 0.2;
   std::fprintf(stderr, "master -> %s, scheme %s, %.0f Hz, %s%s\n", peer->to_string().c_str(),
                scheme_name(o.scheme), o.rate, sched.c_str(),
@@ -244,6 +258,7 @@ int run_slave(const Options& o) {
   teleop::WallParams wall;
   wall.k = o.wall_k;
   teleop::SimulatedSlave device(1.0, 2.0, wall, period, 10, monotonic_now(), 0.0);
+  device.set_watchdog(watchdog_of(o, period, cfg.control.pc_hold_samples));
 
   teleop::SlaveNodeHooks hooks;
   std::uint64_t seed = 2;
@@ -306,6 +321,7 @@ int main(int argc, char** argv) {
       else if (a == "--deadband") o.deadband = parse_double(next(), "deadband");
       else if (a == "--dscp") o.dscp = static_cast<int>(parse_double(next(), "dscp"));
       else if (a == "--no-rt") o.rt = false;
+      else if (a == "--watchdog") o.watchdog_ms = parse_double(next(), "watchdog");
       else if (a == "--ipv6") o.ipv6 = true;
       else if (a == "--log") o.log = next();
       else if (a == "--duration") o.duration = parse_double(next(), "duration");

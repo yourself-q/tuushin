@@ -145,14 +145,14 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
     const double v_s = slave_dev.velocity();
 
     // 3. Master step.
-    const auto ms = master.step(now, x_m);
+    const auto ms = master.step(now, x_m, master_dev.force_cut_after());
     master_dev.command_force(-ms.display_force);
     const double f_display = ms.display_force;
     if (ms.send) fwd_sender.send(forward, fwd_queue, now, cfg.packet_bytes, ms.sample);
 
     // 4. Slave step.
     const double f_contact = slave_dev.contact_force();
-    const auto ss = slave.step(now, x_s, v_s, f_contact);
+    const auto ss = slave.step(now, x_s, v_s, f_contact, slave_dev.force_cut_after());
     slave_dev.command_force(ss.force);
     if (ss.send) bwd_sender.send(backward, bwd_queue, now, cfg.packet_bytes, ss.sample);
 
