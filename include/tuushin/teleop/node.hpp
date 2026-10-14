@@ -26,10 +26,11 @@ namespace tuushin::teleop {
 // Session: the master picks a random session id and starts sending; the
 // slave adopts the first session that reaches it while idle and answers the
 // address it came from, which also works behind a NAT on the master's side.
-// The master ends a session by setting wire::kFlagFinal; the slave answers
-// with its own final samples, which carry its final energy books, and
-// returns to idle. A slave that hears nothing for idle_timeout also returns
-// to idle, with its actuator off.
+// Either end ends a session by setting wire::kFlagFinal; from then on both
+// ends switch their actuators off and stop their controllers, so that their
+// energy books no longer change, and keep sending final samples carrying
+// them for a short linger. A slave that hears nothing for idle_timeout also
+// returns to idle, with its actuator off.
 
 // Fixed-rate schedule of a control loop.
 class Ticker {
@@ -80,7 +81,8 @@ struct MasterNodeReport {
   net::ClockModel clock;     // slave clock - master clock
   net::DelayStats forward, backward;  // one-way delays after the clock fit, ns
   bool slave_answered = false;
-  bool slave_final = false;  // the slave's final books arrived
+  bool slave_final = false;     // the slave's final books arrived
+  bool ended_by_slave = false;  // the slave ended the session (it was stopped)
   double master_net = 0.0;   // J into the teleoperator at the master port
   double slave_net = 0.0;    // J at the slave port, last reported
   // Minimum over time of master_net + slave_net with the slave's reports

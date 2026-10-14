@@ -57,11 +57,24 @@ class SimulatedDevice : public Device1D {
  public:
   double read_position(Nanos now) override;
   double velocity() const override { return v_; }
-  void command_force(double f) override { f_ = f; }
+  void command_force(double f) override {
+    f_ = f;
+    command_time_ = t_;
+  }
 
   double position() const { return x_; }
+  // The force the actuator applies now: the last command, or 0 once the
+  // watchdog has cut it.
   double force() const { return f_; }
   Nanos time() const { return t_; }
+  // Work done on the device by its actuator so far (J): the integral of the
+  // applied force over the displacement, exact under zero-order hold. The
+  // physical counterpart of a controller's energy books.
+  double actuator_work() const { return work_; }
+  // Cuts the actuator force to 0 once no command has come for `timeout`
+  // after the read it followed, as the watchdog of a haptic device's servo
+  // loop does when the host stops sending. 0 disables it (the default).
+  void set_watchdog(Nanos timeout) { watchdog_ = timeout; }
   // False once the state has left the plausible range (|x| < 1 m,
   // |v| < 10 m/s, finite), i.e. the loop went unstable.
   bool plausible() const;
@@ -75,6 +88,8 @@ class SimulatedDevice : public Device1D {
   Nanos start() const { return start_; }
 
  private:
+  void advance(Nanos to);
+
   double mass_, damping_;
   Nanos nominal_dt_;
   int substeps_;
@@ -82,6 +97,9 @@ class SimulatedDevice : public Device1D {
   Nanos t_;
   double x_, v_ = 0.0;
   double f_ = 0.0;
+  Nanos command_time_;
+  Nanos watchdog_ = 0;
+  double work_ = 0.0;
 };
 
 // A desktop haptic device held by a simulated operator.

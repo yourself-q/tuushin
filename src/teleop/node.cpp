@@ -132,7 +132,10 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
   std::uint64_t pc_count = 0;
   for (;;) {
     const Nanos now = serve_until(socket, &link, ticker.due(), buf, on_rx);
-    if (ending_since < 0 && (now >= end || (stop && stop->load()))) ending_since = now;
+    if (ending_since < 0 && (now >= end || (stop && stop->load()) || slave_final_at >= 0)) {
+      ending_since = now;
+      rep.ended_by_slave = slave_final_at >= 0;
+    }
     if (ending_since >= 0) {
       if (slave_final_at >= 0 && now >= slave_final_at + cfg.final_linger) break;
       if (now >= ending_since + cfg.final_timeout) break;
@@ -141,11 +144,19 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
     ticker.taken(now);
 
     const double x = device.read_position(now);
-    const auto st = ctl.step(now, x);
-    device.command_force(-st.display_force);
     const auto& port = ctl.port();
-    const double net = port.input_energy() - port.output_energy();
     const bool final = ending_since >= 0;
+    // While the session ends the actuator is off and the controller no
+    // longer steps, so the port's books stay as they are and every final
+    // sample carries the same, final, figures.
+    MasterController::Step st;
+    if (!final) {
+      st = ctl.step(now, x);
+      device.command_force(-st.display_force);
+    } else {
+      device.command_force(0.0);
+    }
+    const double net = port.input_energy() - port.output_energy();
     if (st.send || final) {
       const Sample s = st.send ? st.sample : Sample{ctl.velocity(), x, port.input_energy()};
       link.send(now, s, net, final);
@@ -311,12 +322,21 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
 
       const double x = device.read_position(now);
       const double fc = device.contact_force();
-      const auto st = ctl.step(now, x, device.velocity(), fc);
-      device.command_force(st.force);
       const bool final = master_final_at >= 0 || stop_since >= 0;
+      // As at the master: once the session ends the actuator is off and the
+      // books are frozen, so the master gets the same final figures from
+      // whichever final sample reaches it.
+      SlaveController::Step st;
+      if (!final) {
+        st = ctl.step(now, x, device.velocity(), fc);
+        device.command_force(st.force);
+      } else {
+        device.command_force(0.0);
+      }
       if (st.send || final) {
         Sample s = st.send ? st.sample
-                           : Sample{ctl.reported_force(), 0.0, transmitted_energy(ctl, sc.passivity)};
+                           : Sample{final ? 0.0 : ctl.reported_force(), 0.0,
+                                    transmitted_energy(ctl, sc.passivity)};
         s.aux = x;  // for monitoring at the master
         link.send(now, s, ctl.terminal_net(), final);
       }

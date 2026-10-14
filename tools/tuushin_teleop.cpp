@@ -202,6 +202,7 @@ int run_master(const Options& o) {
   std::printf("session %08x, %llu ticks (%llu skipped), master PC active %.1f %%\n", rep.session,
               static_cast<unsigned long long>(rep.ticks),
               static_cast<unsigned long long>(rep.skipped), 100.0 * rep.master_pc_active);
+  if (rep.ended_by_slave) std::printf("the slave ended the session\n");
   print_stats("tick late", rep.lateness, 1e3, "us");
   print_link(rep.link, "from the slave");
   if (!rep.slave_answered) {

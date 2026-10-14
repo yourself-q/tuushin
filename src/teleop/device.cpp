@@ -25,10 +25,21 @@ SimulatedDevice::SimulatedDevice(double mass, double damping, Nanos nominal_dt, 
       substeps_(substeps > 0 ? substeps : 1),
       start_(start),
       t_(start),
-      x_(position) {}
+      x_(position),
+      command_time_(start) {}
 
 double SimulatedDevice::read_position(Nanos now) {
   if (now <= t_) return x_;
+  if (watchdog_ > 0 && f_ != 0.0 && now > command_time_ + watchdog_) {
+    advance(std::max(t_, command_time_ + watchdog_));
+    f_ = 0.0;
+  }
+  advance(now);
+  return x_;
+}
+
+void SimulatedDevice::advance(Nanos now) {
+  if (now <= t_) return;
   const Nanos elapsed = now - t_;
   const std::int64_t n = std::max<std::int64_t>(
       1, (elapsed * substeps_ + nominal_dt_ - 1) / nominal_dt_);
@@ -46,10 +57,10 @@ double SimulatedDevice::read_position(Nanos now) {
     const State k4 = deriv(ti + h, p.plus(k3, h));
     p = p.plus(k1, h / 6.0).plus(k2, h / 3.0).plus(k3, h / 3.0).plus(k4, h / 6.0);
   }
+  work_ += f_ * (p.x - x_);
   x_ = p.x;
   v_ = p.v;
   t_ = now;
-  return x_;
 }
 
 bool SimulatedDevice::plausible() const {
