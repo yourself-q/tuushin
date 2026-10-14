@@ -203,6 +203,9 @@ class RendezvousClient {
 
   // The registration to send at `now`, if one is due.
   std::optional<std::vector<std::uint8_t>> poll(Nanos now);
+  // Makes the next poll() due at once: the server then sees where this
+  // end's NAT maps it now.
+  void refresh_now() { next_ = 0; }
   // When poll() will next return a registration.
   Nanos next_due() const { return next_; }
 

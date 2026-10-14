@@ -89,6 +89,16 @@ struct RendezvousConfig {
   // through at the latest.
   Nanos punch_interval = 50 * kNanosPerMilli;
   Nanos punch_duration = 5 * kNanosPerSecond;
+  // Both, during a session: after rejoin_after without an authentic sample
+  // from the other end, register again at once, and every retry interval
+  // while the silence lasts. If a NAT or a new network has moved an end,
+  // the server sees its new address and announces it to the other end,
+  // which punches towards it for rejoin_punch, so that its own NAT lets the
+  // moved end's datagrams in; the link then follows the moved end
+  // (HapticLink). Both ends look for a move because neither can tell which
+  // one moved: each only hears nothing.
+  Nanos rejoin_after = 100 * kNanosPerMilli;
+  Nanos rejoin_punch = kNanosPerSecond;
 };
 
 struct MasterNodeConfig {
@@ -120,6 +130,7 @@ struct MasterNodeReport {
   bool rendezvous_failed = false;  // the server announced no slave in time
   net::Endpoint observed;          // this end's address as the server saw it
   std::vector<net::Endpoint> candidates;  // the slave's, as the server announced them
+  std::uint64_t rejoins = 0;  // the slave announced anew during the session
   std::uint64_t ticks = 0, skipped = 0;
   net::DelayStats lateness;  // ns
   HapticLink::Counters link;
@@ -204,6 +215,7 @@ struct SlaveSessionReport {
   double max_position = 0.0;
   double max_force = 0.0;
   double slave_pc_active = 0.0;
+  std::uint64_t rejoins = 0;  // the master announced anew during the session
 };
 
 struct SlaveNodeHooks {

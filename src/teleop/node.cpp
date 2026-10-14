@@ -130,6 +130,64 @@ bool prime(net::UdpSocket& socket, const std::vector<net::Endpoint>& to, int hop
   return any;
 }
 
+// The rendezvous during a session (RendezvousConfig::rejoin_after): looks
+// for an end that has moved when the other end falls silent, and punches
+// towards the other end's new address when the server announces one.
+class SessionRejoin {
+ public:
+  SessionRejoin(net::RendezvousClient& rv, const net::Endpoint& server,
+                const RendezvousConfig& cfg, net::UdpSocket& socket)
+      : rv_(rv), server_(server), cfg_(cfg), socket_(socket), changes_(rv.peer_changes()),
+        punch_(punch_datagram()) {}
+
+  // True for the server's datagrams, which are taken here.
+  bool on_datagram(const std::uint8_t* data, std::size_t n, const net::Endpoint& from,
+                   Nanos now) {
+    if (!rv_.on_datagram(data, n, from, now)) return false;
+    if (rv_.peer_changes() != changes_) {
+      changes_ = rv_.peer_changes();
+      ++rejoins_;
+      to_ = net::sendable(rv_.peer(), socket_);
+      punch_until_ = now + cfg_.rejoin_punch;
+      next_punch_ = now;
+      // The moved end is sending already, so there is nothing to order:
+      // this end is ready as soon as it punches.
+      rv_.set_ready(true);
+    }
+    return true;
+  }
+
+  // Every tick; `last_rx` is when the last authentic sample arrived.
+  void tick(Nanos now, Nanos last_rx) {
+    if (now - last_rx > cfg_.rejoin_after) {
+      if (now >= next_rejoin_) {
+        rv_.refresh_now();
+        next_rejoin_ = now + net::RendezvousClient::kRetryInterval;
+      }
+    } else {
+      next_rejoin_ = 0;
+    }
+    if (const auto reg = rv_.poll(now)) socket_.send_to(server_, reg->data(), reg->size());
+    if (now < punch_until_ && now >= next_punch_) {
+      for (const auto& t : to_) socket_.send_to(t, punch_.data(), punch_.size());
+      next_punch_ = now + cfg_.punch_interval;
+    }
+  }
+
+  std::uint64_t rejoins() const { return rejoins_; }
+
+ private:
+  net::RendezvousClient& rv_;
+  net::Endpoint server_;
+  const RendezvousConfig& cfg_;
+  net::UdpSocket& socket_;
+  std::uint64_t changes_;
+  std::uint64_t rejoins_ = 0;
+  std::vector<net::Endpoint> to_;
+  Nanos punch_until_ = -1, next_punch_ = 0, next_rejoin_ = 0;
+  std::vector<std::uint8_t> punch_;
+};
+
 // The master's side of the handshake: resends its hello every
 // hello_interval to every candidate address of the slave until a reply
 // authenticates, keeping a simulated device's physics current with the
@@ -149,7 +207,8 @@ std::optional<Handshake> master_handshake(net::UdpSocket& socket, const net::End
                                           std::uint32_t session, Device1D& device,
                                           const MasterNodeConfig& cfg,
                                           const std::atomic<bool>* stop,
-                                          std::vector<std::uint8_t>& buf, MasterNodeReport& rep) {
+                                          std::vector<std::uint8_t>& buf, MasterNodeReport& rep,
+                                          std::optional<net::RendezvousClient>& rv) {
   const Passivity scheme = cfg.control.passivity;
   const auto prologue = handshake_prologue(session, scheme);
   crypto::NoiseNNpsk0 hs(crypto::NoiseNNpsk0::Role::kInitiator, *cfg.psk, prologue.data(),
@@ -163,13 +222,8 @@ std::optional<Handshake> master_handshake(net::UdpSocket& socket, const net::End
   std::vector<std::uint8_t> out;
   device.command_force(0.0);
 
-  std::optional<net::RendezvousClient> rv;
   std::optional<net::Endpoint> server;
-  if (cfg.rendezvous) {
-    rv.emplace(cfg.rendezvous->server, cfg.rendezvous->id, net::RendezvousRole::kMaster,
-               net::host_addresses(socket));
-    server = cfg.rendezvous->server.for_family(socket.is_ipv6());
-  }
+  if (cfg.rendezvous) server = cfg.rendezvous->server.for_family(socket.is_ipv6());
   // A slave address given directly, in the form this socket sends to.
   std::optional<net::Endpoint> direct;
   if (slave.valid()) direct = slave.for_family(socket.is_ipv6());
@@ -305,8 +359,13 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
   socket.enable_rx_timestamps();
   std::vector<std::uint8_t> buf(wire::kMaxDatagram + 1);
   std::optional<crypto::SessionKeys> keys;
+  std::optional<net::RendezvousClient> rv;
+  if (cfg.rendezvous) {
+    rv.emplace(cfg.rendezvous->server, cfg.rendezvous->id, net::RendezvousRole::kMaster,
+               net::host_addresses(socket));
+  }
   if (cfg.psk) {
-    const auto hs = master_handshake(socket, slave, rep.session, device, cfg, stop, buf, rep);
+    const auto hs = master_handshake(socket, slave, rep.session, device, cfg, stop, buf, rep, rv);
     if (!hs) {
       rep.handshake_failed = true;
       return rep;
@@ -322,14 +381,21 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
   if (emulation) link.set_emulation(std::move(emulation));
   MasterController ctl(cfg.control);
   CsvLog log(cfg.log_path, "t,late_us,x_m,v_m,f_display,ein,eout,granted,pc,sent,rx,rtt_us\n");
+  std::optional<SessionRejoin> rejoin;
+  std::optional<net::Endpoint> server;
+  if (rv) server = cfg.rendezvous->server.for_family(socket.is_ipv6());
+  if (rv && server) rejoin.emplace(*rv, *server, *cfg.rendezvous, socket);
 
   std::vector<std::pair<Nanos, double>> own;     // (master time, master net) per tick
   std::vector<std::pair<Nanos, double>> remote;  // (slave time, slave net) per sample
   Nanos newest_remote = INT64_MIN;
   Nanos slave_final_at = -1;
+  Nanos last_rx = monotonic_now();
   auto on_rx = [&](const std::uint8_t* data, std::size_t n, const net::Endpoint& from, Nanos rx) {
+    if (rejoin && rejoin->on_datagram(data, n, from, monotonic_now())) return;
     const auto r = link.on_datagram(data, n, from, rx);
     if (!r) return;
+    last_rx = std::max(last_rx, rx);
     ctl.receive(r->seq, r->sample);
     rep.slave_answered = true;
     if (remote.size() < kSeriesLimit) remote.emplace_back(r->send_time, r->monitor);
@@ -360,6 +426,7 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
     }
     const Nanos late = now - ticker.due();
     ticker.taken(now);
+    if (rejoin) rejoin->tick(now, last_rx);
 
     const double x = device.read_position(now);
     const auto& port = ctl.port();
@@ -401,6 +468,7 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
   rep.skipped = ticker.skipped();
   rep.lateness = net::delay_stats(ticker.lateness());
   rep.link = link.counters();
+  if (rejoin) rep.rejoins = rejoin->rejoins();
   rep.master_pc_active =
       rep.ticks ? static_cast<double>(pc_count) / static_cast<double>(rep.ticks) : 0.0;
   rep.master_net = own.empty() ? 0.0 : own.back().second;
@@ -697,7 +765,10 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
 
     Nanos last_rx = first->rx;
     Nanos master_final_at = -1;
+    std::optional<SessionRejoin> rejoin;
+    if (rv && rv_server) rejoin.emplace(*rv, *rv_server, *cfg.rendezvous, socket);
     auto on_rx = [&](const std::uint8_t* data, std::size_t n, const net::Endpoint& from, Nanos rx) {
+      if (rejoin && rejoin->on_datagram(data, n, from, monotonic_now())) return;
       const auto r = link.on_datagram(data, n, from, rx);
       if (!r) return;
       ctl.receive(r->seq, r->sample);
@@ -720,6 +791,7 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
       if (stop_since >= 0 && now >= stop_since + cfg.final_linger) break;
       const Nanos late = now - ticker.due();
       ticker.taken(now);
+      if (rejoin) rejoin->tick(now, last_rx);
 
       const double x = device.read_position(now);
       const double fc = device.contact_force();
@@ -765,9 +837,12 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
     rep.skipped = ticker.skipped();
     rep.lateness = net::delay_stats(ticker.lateness());
     rep.link = link.counters();
+    if (rejoin) rep.rejoins = rejoin->rejoins();
     rep.slave_net = ctl.terminal_net();
     rep.slave_pc_active =
         rep.ticks ? static_cast<double>(pc_count) / static_cast<double>(rep.ticks) : 0.0;
+    // Announcements during the session were handled there.
+    if (rv) rv_changes = rv->peer_changes();
     if (hooks.on_session_end) hooks.on_session_end(rep);
     reports.push_back(rep);
     if (cfg.once) break;

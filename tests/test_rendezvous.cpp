@@ -8,6 +8,7 @@
 #include <thread>
 #include <vector>
 
+#include "sim_nat.hpp"
 #include "test.hpp"
 #include "tuushin/crypto/noise.hpp"
 #include "tuushin/net/rendezvous.hpp"
@@ -614,4 +615,116 @@ TEST_CASE(endpoints_convert_between_families) {
   CHECK(ep("127.0.0.1", 1).is_local_only() && ep("::1", 1).is_local_only());
   CHECK(ep("fe80::1", 1).is_local_only() && ep("169.254.1.1", 1).is_local_only());
   CHECK(!v4.is_local_only() && !ep("10.0.0.1", 1).is_local_only());
+}
+
+namespace {
+
+struct Rebound {
+  MasterNodeReport master;
+  std::vector<SlaveSessionReport> slave;
+  std::uint64_t filtered = 0;  // by the master's NAT, after the rebinding
+};
+
+// A master and a slave, each behind a NAT that maps independently of the
+// destination and filters by address and port (the common home router).
+// Once the session runs, the slave's NAT forgets its mappings, so the slave
+// sends from a new outside port that the master's NAT does not let in, and
+// the master keeps sending to the old one.
+Rebound rebound(Nanos rejoin_after) {
+  using test::SimNat;
+  UdpSocket server_sock(ep("127.0.0.1", 0));
+  const Endpoint server = ep("127.0.0.1", server_sock.local_endpoint().port());
+  std::atomic<bool> stop_server{false}, stop_slave{false};
+  std::thread srv([&] { run_rendezvous_server(server_sock, &stop_server); });
+
+  UdpSocket master_sock(ep("127.0.0.1", 0)), slave_sock(ep("127.0.0.1", 0));
+  SimNat master_nat(master_sock.local_endpoint(), server, SimNat::Mapping::kEndpointIndependent,
+                    SimNat::Filtering::kAddressPortDependent);
+  SimNat slave_nat(slave_sock.local_endpoint(), server, SimNat::Mapping::kEndpointIndependent,
+                   SimNat::Filtering::kAddressPortDependent);
+  const crypto::Key psk = crypto::random_key();
+  RendezvousConfig rc;
+  rc.id = crypto::rendezvous_id(psk);
+  rc.wait = 2 * kNanosPerSecond;
+  rc.rejoin_after = rejoin_after;
+  RendezvousConfig master_rc = rc, slave_rc = rc;
+  master_rc.server = master_nat.proxy(server);
+  slave_rc.server = slave_nat.proxy(server);
+  master_nat.start();
+  slave_nat.start();
+
+  const Nanos period = kNanosPerMilli;
+  SimulatedSlave slave_dev(1.0, 2.0, WallParams{}, period, 10, monotonic_now(), 0.0);
+  slave_dev.set_watchdog(2 * period);
+  SlaveNodeConfig scfg;
+  scfg.control.dt = period;
+  scfg.control.hold_after = 150 * kNanosPerMilli;
+  scfg.once = true;
+  scfg.psk = psk;
+  scfg.rendezvous = slave_rc;
+  Rebound out;
+  std::thread slave([&] { out.slave = run_slave_node(slave_sock, slave_dev, scfg, {}, &stop_slave); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+  // Rebind once the master's samples have run for a while.
+  std::atomic<bool> master_done{false};
+  std::uint64_t filtered_before = 0;
+  std::thread rebinder([&] {
+    while (!master_done.load() && slave_nat.delivered() < 300) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    filtered_before = master_nat.filtered();
+    slave_nat.rebind();
+  });
+
+  SimulatedMaster master_dev(0.2, 0.5, OperatorParams{}, period, 10, monotonic_now());
+  master_dev.set_watchdog(2 * period);
+  MasterNodeConfig mcfg;
+  mcfg.control.dt = period;
+  mcfg.control.model_mass = 0.2;
+  mcfg.duration = kNanosPerSecond;
+  mcfg.psk = psk;
+  mcfg.hello_interval = 50 * kNanosPerMilli;
+  mcfg.rendezvous = master_rc;
+  out.master = run_master_node(master_sock, Endpoint{}, master_dev, mcfg);
+  master_done.store(true);
+  rebinder.join();
+  out.filtered = master_nat.filtered() - filtered_before;
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  stop_slave.store(true);
+  slave.join();
+  stop_server.store(true);
+  srv.join();
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE(session_survives_a_nat_that_rebinds) {
+  // Both ends fall silent; both register anew; the server announces the
+  // slave's new address to the master, whose punch lets the slave's samples
+  // through its NAT, and the master's link follows them there.
+  const auto r = rebound(100 * kNanosPerMilli);
+  CHECK(r.master.authenticated && r.master.slave_answered);
+  CHECK(r.filtered > 0);
+  CHECK(r.master.rejoins >= 1);
+  CHECK(r.master.link.moved == 1);
+  CHECK(r.master.link.received > 700);
+  REQUIRE(r.slave.size() == 1);
+  CHECK(r.slave[0].ended_by_final);
+  CHECK(r.slave[0].rejoins == 0);  // the master did not move
+  CHECK(r.slave[0].link.moved == 0);
+}
+
+TEST_CASE(session_is_lost_to_a_rebinding_nat_without_the_rejoin) {
+  // The control: the same rebinding, with the ends waiting for their next
+  // refresh (10 s) to register again. The slave's samples stay filtered, so
+  // the session ends there.
+  const auto r = rebound(3600 * kNanosPerSecond);
+  CHECK(r.master.authenticated && r.master.slave_answered);
+  CHECK(r.filtered > 100);
+  CHECK(r.master.rejoins == 0 && r.master.link.moved == 0);
+  CHECK(r.master.link.received < 600);
+  REQUIRE(r.slave.size() == 1);
+  CHECK(!r.slave[0].ended_by_final);
 }

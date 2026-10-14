@@ -441,6 +441,10 @@ int run_master(const Options& o) {
               static_cast<unsigned long long>(rep.ticks),
               static_cast<unsigned long long>(rep.skipped), 100.0 * rep.master_pc_active);
   if (rep.ended_by_slave) std::printf("the slave ended the session\n");
+  if (rep.rejoins) {
+    std::printf("rendezvous: the slave announced anew %llu times during the session\n",
+                static_cast<unsigned long long>(rep.rejoins));
+  }
   print_stats("tick late", rep.lateness, 1e3, "us");
   print_link(rep.link, "from the slave");
   if (!rep.slave_answered) {
@@ -505,6 +509,10 @@ int run_slave(const Options& o) {
     std::printf("%llu ticks (%llu skipped), slave PC active %.1f %%\n",
                 static_cast<unsigned long long>(r.ticks), static_cast<unsigned long long>(r.skipped),
                 100.0 * r.slave_pc_active);
+    if (r.rejoins) {
+      std::printf("rendezvous: the master announced anew %llu times during the session\n",
+                  static_cast<unsigned long long>(r.rejoins));
+    }
     print_stats("tick late", r.lateness, 1e3, "us");
     print_link(r.link, "from the master");
     std::printf("max position %.4f m, max force %.3f N, slave energy %.6g J\n", r.max_position,
