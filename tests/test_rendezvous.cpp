@@ -14,6 +14,7 @@
 #include "tuushin/net/udp.hpp"
 #include "tuushin/teleop/device.hpp"
 #include "tuushin/teleop/node.hpp"
+#include "tuushin/wire/packet.hpp"
 
 using namespace tuushin;
 using namespace tuushin::net;
@@ -57,6 +58,7 @@ TEST_CASE(rendezvous_messages_round_trip_and_reject_malformed) {
   RendezvousMessage m;
   m.type = RendezvousMessage::Type::kPeer;
   m.role = RendezvousRole::kSlave;
+  m.ready = true;
   m.id = id_of(0xa5);
   m.txid = 0x0102030405060708ull;
   m.observed = ep("203.0.113.7", 40000);
@@ -66,6 +68,7 @@ TEST_CASE(rendezvous_messages_round_trip_and_reject_malformed) {
   const auto d = decode_rendezvous(b.data(), b.size());
   REQUIRE(d);
   CHECK(d->type == m.type && d->role == m.role && d->id == m.id && d->txid == m.txid);
+  CHECK(d->ready);
   CHECK(d->observed == m.observed);
   CHECK(d->candidates == m.candidates);
 
@@ -87,10 +90,16 @@ TEST_CASE(rendezvous_messages_round_trip_and_reject_malformed) {
   CHECK(!mutated(6, 3));              // role
   CHECK(!mutated(7, 9));              // count beyond the slots
   CHECK(!mutated(7, 4));              // a slot counted but empty
-  CHECK(!mutated(52, 5));             // address family
-  CHECK(!mutated(53, 1));             // reserved byte
-  CHECK(!mutated(52 + 4 + 4, 1));     // IPv4 address with a non-zero tail
+  CHECK(!mutated(8, 4));              // an undefined flag
+  CHECK(!mutated(9, 1) && !mutated(11, 1));  // reserved bytes
+  CHECK(!mutated(56, 5));             // address family
+  CHECK(!mutated(57, 1));             // reserved byte
+  CHECK(!mutated(56 + 4 + 4, 1));     // IPv4 address with a non-zero tail
   CHECK(mutated(7, 2));               // fewer candidates is still well-formed
+  auto unready = b;
+  unready[8] = 0;
+  const auto u = decode_rendezvous(unready.data(), unready.size());
+  CHECK(u && !u->ready);
   CHECK(!decode_rendezvous(nullptr, 0));
 }
 
@@ -166,6 +175,47 @@ TEST_CASE(rendezvous_server_makes_room_by_dropping_the_oldest_meeting) {
   CHECK(decoded(out[0]).type == RendezvousMessage::Type::kWaiting);
 }
 
+TEST_CASE(rendezvous_server_passes_the_ready_flag_on) {
+  RendezvousServer server(30 * kNanosPerSecond);
+  const auto id = id_of(1);
+  const Endpoint a = ep("203.0.113.1", 1111), b = ep("198.51.100.2", 2222);
+  feed(server, registration(id, RendezvousRole::kMaster, 11), a, 0);
+  auto out = feed(server, registration(id, RendezvousRole::kSlave, 22), b, 1);
+  REQUIRE(out.size() == 2);
+  CHECK(!decoded(out[0]).ready && !decoded(out[1]).ready);
+
+  // The slave becomes ready: the master is told at once.
+  auto ready = registration(id, RendezvousRole::kSlave, 22);
+  ready.ready = true;
+  out = feed(server, ready, b, 2);
+  REQUIRE(out.size() == 2);
+  CHECK(out[1].to == a && decoded(out[1]).ready && !decoded(out[1]).recipient_ready);
+  // The slave hears of the master's ready, and that its own is held.
+  CHECK(!decoded(out[0]).ready && decoded(out[0]).recipient_ready);
+  // A refresh that changes nothing reaches only the slave.
+  CHECK(feed(server, ready, b, 3).size() == 1);
+  CHECK(decoded(feed(server, registration(id, RendezvousRole::kMaster, 11), a, 4)[0]).ready);
+
+  // The master moves: the slave's ready was about the old address.
+  const Endpoint a2 = ep("203.0.113.1", 1112);
+  out = feed(server, registration(id, RendezvousRole::kMaster, 11), a2, 5);
+  REQUIRE(out.size() == 2);
+  CHECK(!decoded(out[0]).ready);
+  CHECK(out[1].to == b && decoded(out[1]).candidates.front() == a2);
+  CHECK(!decoded(out[1]).recipient_ready);
+  // Until the slave says it again.
+  out = feed(server, ready, b, 6);
+  REQUIRE(out.size() == 2);
+  CHECK(out[1].to == a2 && decoded(out[1]).ready);
+
+  // A master that registers anew from the same address (it restarted)
+  // clears the slave's ready too.
+  out = feed(server, registration(id, RendezvousRole::kMaster, 12), a2, 7);
+  REQUIRE(out.size() == 2);
+  CHECK(!decoded(out[0]).ready && decoded(out[0]).txid == 12);
+  CHECK(out[1].to == b && !decoded(out[1]).recipient_ready);
+}
+
 TEST_CASE(rendezvous_client_registers_retries_and_learns_the_peer) {
   const Endpoint server = ep("203.0.113.9", 47200);
   const Endpoint lan = ep("192.168.1.5", 47100);
@@ -209,6 +259,52 @@ TEST_CASE(rendezvous_client_registers_retries_and_learns_the_peer) {
   CHECK(c.peer() == slave && c.peer_changes() == 1);
   CHECK(c.on_datagram(p.data(), p.size(), server, t));
   CHECK(c.peer_changes() == 1);  // the same announcement again
+  CHECK(!c.peer_ready());
+
+  // Becoming ready registers again at once, with the flag, and keeps
+  // registering until the server confirms it.
+  CHECK(!c.poll(t + 1));
+  c.set_ready(true);
+  CHECK(c.ready());
+  const auto again = c.poll(t + 1);
+  REQUIRE(again);
+  CHECK(decode_rendezvous(again->data(), again->size())->ready);
+  CHECK(!c.poll(t + 2));
+  CHECK(c.next_due() == t + 1 + RendezvousClient::kRetryInterval);
+  // An announcement that crossed that registration does not hold this end
+  // ready yet; that is no reason to open the NAT again.
+  auto pr = *decode_rendezvous(p.data(), p.size());
+  auto bytes = encode_rendezvous(pr);
+  CHECK(c.on_datagram(bytes.data(), bytes.size(), server, t + 2));
+  CHECK(c.ready() && c.peer_changes() == 1);
+  CHECK(c.next_due() == t + 1 + RendezvousClient::kRetryInterval);
+  pr.ready = true;            // the peer is ready too
+  pr.recipient_ready = true;  // and the server holds this end ready
+  bytes = encode_rendezvous(pr);
+  CHECK(c.on_datagram(bytes.data(), bytes.size(), server, t + 3));
+  CHECK(c.peer_ready() && c.ready() && c.peer_changes() == 1);
+  CHECK(c.next_due() == t + 3 + RendezvousClient::kRefreshInterval);
+
+  // The peer registered anew: the server no longer holds this end ready,
+  // and this end has to open its NAT again.
+  pr.ready = false;
+  pr.recipient_ready = false;
+  bytes = encode_rendezvous(pr);
+  CHECK(c.on_datagram(bytes.data(), bytes.size(), server, t + 4));
+  CHECK(c.peer_changes() == 2 && !c.peer_ready() && !c.ready());
+  c.set_ready(true);
+  CHECK(c.poll(t + 5));
+  pr.recipient_ready = true;
+  bytes = encode_rendezvous(pr);
+  CHECK(c.on_datagram(bytes.data(), bytes.size(), server, t + 6));
+  CHECK(c.ready() && c.peer_changes() == 2);
+
+  // So does a peer at a new address.
+  pr.candidates = {ep("198.51.100.2", 7001)};
+  pr.recipient_ready = false;
+  bytes = encode_rendezvous(pr);
+  CHECK(c.on_datagram(bytes.data(), bytes.size(), server, t + 7));
+  CHECK(c.peer_changes() == 3 && !c.ready() && c.peer() == pr.candidates);
 }
 
 TEST_CASE(rendezvous_id_depends_only_on_the_key) {
@@ -370,6 +466,91 @@ TEST_CASE(master_gives_up_when_the_server_announces_no_slave) {
   CHECK(!r.master.slave_answered);
   CHECK(r.master.observed == ep("127.0.0.1", master_sock.local_endpoint().port()));
   CHECK(monotonic_now() - t0 < 2 * kNanosPerSecond);
+}
+
+namespace {
+
+struct Approach {
+  bool punch_first = false;  // the master's first datagram was a punch
+  Nanos first_hello = -1;    // after the announcement; -1 for none
+};
+
+// How a master approaches a slave that the server announced: the slave is
+// played by a bare socket that registers, ready at once or never.
+Approach approach(bool slave_ready, Nanos ready_wait) {
+  UdpSocket server_sock(ep("127.0.0.1", 0));
+  const Endpoint server = ep("127.0.0.1", server_sock.local_endpoint().port());
+  std::atomic<bool> stop_server{false};
+  std::thread srv([&] { run_rendezvous_server(server_sock, &stop_server); });
+  const crypto::Key psk = crypto::random_key();
+  RendezvousConfig rc;
+  rc.server = server;
+  rc.id = crypto::rendezvous_id(psk);
+  rc.ready_wait = ready_wait;
+
+  const Nanos period = kNanosPerMilli;
+  UdpSocket master_sock(ep("127.0.0.1", 0));
+  SimulatedMaster dev(0.2, 0.5, OperatorParams{}, period, 10, monotonic_now());
+  dev.set_watchdog(2 * period);
+  MasterNodeConfig mcfg;
+  mcfg.control.dt = period;
+  mcfg.psk = psk;
+  mcfg.hello_interval = 50 * kNanosPerMilli;
+  mcfg.handshake_timeout = ready_wait + 300 * kNanosPerMilli;
+  mcfg.rendezvous = rc;
+  std::atomic<bool> master_done{false};
+  std::thread master([&] {
+    run_master_node(master_sock, Endpoint{}, dev, mcfg);
+    master_done.store(true);
+  });
+
+  UdpSocket sock(ep("127.0.0.1", 0));
+  RendezvousClient rv(server, rc.id, RendezvousRole::kSlave, {});
+  Approach out;
+  Nanos announced = -1;
+  bool any = false;
+  std::uint8_t buf[wire::kMaxDatagram + 1];
+  while (!master_done.load()) {
+    if (const auto reg = rv.poll(monotonic_now())) sock.send_to(server, reg->data(), reg->size());
+    sock.wait_readable(5 * kNanosPerMilli);
+    Endpoint from;
+    while (const auto n = sock.recv_from(buf, sizeof buf, &from)) {
+      const Nanos now = monotonic_now();
+      if (rv.on_datagram(buf, *n, from, now)) {
+        if (announced < 0 && rv.peer_changes() > 0) {
+          announced = now;
+          rv.set_ready(slave_ready);
+        }
+        continue;
+      }
+      const auto h = wire::decode_header(buf, *n);
+      if (!h) continue;
+      if (!any) out.punch_first = h->type == wire::PacketType::kPunch;
+      any = true;
+      if (h->type == wire::PacketType::kHello && out.first_hello < 0 && announced >= 0) {
+        out.first_hello = now - announced;
+      }
+    }
+  }
+  master.join();
+  stop_server.store(true);
+  srv.join();
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE(master_primes_and_sends_hellos_once_the_slave_is_ready) {
+  // Ready at once: the hellos follow the slave's ready, a round trip to the
+  // server after the announcement.
+  const Nanos wait = 600 * kNanosPerMilli;
+  const auto ready = approach(true, wait);
+  CHECK(ready.punch_first);
+  CHECK(ready.first_hello >= 0 && ready.first_hello < wait / 2);
+  // Never ready: the hellos wait ready_wait.
+  const auto unready = approach(false, wait);
+  CHECK(unready.punch_first);
+  CHECK(unready.first_hello >= wait - 50 * kNanosPerMilli);
 }
 
 TEST_CASE(rendezvous_requires_a_key_and_a_master_needs_a_slave_or_a_server) {

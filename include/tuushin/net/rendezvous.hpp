@@ -70,21 +70,48 @@ namespace tuushin::net {
 //                           the registrant's echoed in kWaiting, the peer's
 //                           in kPeer
 //        7    1 count       candidates, 0..kRendezvousMaxCandidates
-//        8   16 id          the meeting's identifier
-//       24    8 txid        the registration's, echoed in the replies
-//       32   20 observed    replies: the address the registration came from
-//       52 20*8 candidates  registration: the sender's host addresses;
+//        8    1 flags       bit 0 ready: the sender's in a registration,
+//                           the peer's in kPeer, zero in kWaiting;
+//                           bit 1 in replies: the recipient's own ready
+//                           as the server holds it; the other bits zero
+//        9    3 reserved    zero
+//       12   16 id          the meeting's identifier
+//       28    8 txid        the registration's, echoed in the replies
+//       36   20 observed    replies: the address the registration came from
+//       56 20*8 candidates  registration: the sender's host addresses;
 //                           kPeer: the peer's, its observed address first
 //
 // An address is 20 bytes: family (0 none, 4, 6), a zero byte, the port,
 // and 16 address bytes (IPv4 in the first 4). Unused slots are zero.
+//
+// The ready flag orders the first datagrams. A NAT that sees a datagram
+// arrive for one of its outside ports before the inside socket has sent
+// to that sender may keep a state of its own for the pair: Linux's
+// conntrack does when the NAT host accepts datagrams to itself, which it
+// does without a firewall of its own. When the inside socket then sends to
+// the same address, the NAT finds the pair taken and gives the socket
+// another outside port; the address the server announced is no longer the
+// one the datagrams come from, and the other end's NAT drops them. Each
+// datagram that crosses the internet must therefore find the receiving NAT
+// already expecting it. So each end first opens its own NAT with datagrams
+// that expire on the way, before they reach the other end's NAT (a small
+// TTL, UdpSocket::send_limited), and then registers ready; it sends
+// datagrams that go the whole way (hellos, punches) only once the server
+// has passed the other end's ready on. This is the priming that M.
+// Trautwein et al. propose against the failures they measured
+// ("Challenging Tribal Knowledge: Large Scale Measurement Campaign on
+// Decentralized NAT Traversal", 2025, section 7.2).
+//
+// An end's ready is about the other end's current registration: the server
+// forgets it when the other end moves or registers anew (a new txid), and
+// says so to the end in the recipient-ready bit.
 
 using RendezvousId = std::array<std::uint8_t, 16>;
 
 enum class RendezvousRole : std::uint8_t { kMaster = 1, kSlave = 2 };
 
 constexpr std::size_t kRendezvousMaxCandidates = 8;
-constexpr std::size_t kRendezvousMessageSize = 52 + 20 * kRendezvousMaxCandidates;
+constexpr std::size_t kRendezvousMessageSize = 56 + 20 * kRendezvousMaxCandidates;
 
 struct RendezvousMessage {
   enum class Type : std::uint8_t {
@@ -94,6 +121,8 @@ struct RendezvousMessage {
   };
   Type type = Type::kRegister;
   RendezvousRole role = RendezvousRole::kMaster;
+  bool ready = false;
+  bool recipient_ready = false;
   RendezvousId id{};
   std::uint64_t txid = 0;
   Endpoint observed;
@@ -112,9 +141,11 @@ std::optional<RendezvousMessage> decode_rendezvous(const std::uint8_t* data, std
 // at once, with kPeer if the other role is registered and kWaiting
 // otherwise; when it is new or its addresses changed, the other end is
 // also sent kPeer, so that both start sending to each other within one
-// round trip of the later one. Registrations expire after `expiry`
-// without a refresh. When `capacity` meetings are held, the one seen
-// longest ago makes room.
+// round trip of the later one. A change of the ready flag is passed on to
+// the other end the same way; a new address of one end clears the other
+// end's ready, which was about the old address. Registrations expire after
+// `expiry` without a refresh. When `capacity` meetings are held, the one
+// seen longest ago makes room.
 class RendezvousServer {
  public:
   struct Out {
@@ -125,7 +156,8 @@ class RendezvousServer {
   explicit RendezvousServer(Nanos expiry = 30 * kNanosPerSecond, std::size_t capacity = 4096);
 
   // Handles one datagram from `from` at `now` and appends what to send.
-  // Returns true for a registration that was new or whose addresses changed.
+  // Returns true for a registration that was new or whose addresses or
+  // ready flag changed.
   bool on_datagram(const std::uint8_t* data, std::size_t size, const Endpoint& from, Nanos now,
                    std::vector<Out>& out);
 
@@ -137,6 +169,7 @@ class RendezvousServer {
     Endpoint from;  // canonical
     std::vector<Endpoint> host;
     std::uint64_t txid = 0;
+    bool ready = false;
     Nanos seen = 0;
   };
   struct Meeting {
@@ -173,6 +206,12 @@ class RendezvousClient {
   // When poll() will next return a registration.
   Nanos next_due() const { return next_; }
 
+  // Sets this end's ready flag; a change makes the next poll() due at once,
+  // and registrations are then retried until the server confirms it. An
+  // announcement that counts in peer_changes() clears it.
+  void set_ready(bool ready);
+  bool ready() const { return ready_; }
+
   // True if the datagram is the server's answer to this end's registration
   // (and was taken into account); false for anything else, which the caller
   // handles as without a rendezvous.
@@ -185,8 +224,13 @@ class RendezvousClient {
   // The peer's candidates, its server-reflexive address first; empty until
   // the server has announced a peer.
   const std::vector<Endpoint>& peer() const { return peer_; }
-  // Counts the announcements that changed peer().
+  // Counts the announcements after which this end should open its NAT
+  // towards the peer again: a changed peer(), or a peer that registered
+  // anew (the server then no longer holds this end ready, after it had
+  // confirmed it).
   std::uint64_t peer_changes() const { return peer_changes_; }
+  // The peer's ready flag, as last announced.
+  bool peer_ready() const { return peer_ready_; }
 
  private:
   Endpoint server_;  // canonical
@@ -197,9 +241,12 @@ class RendezvousClient {
   Nanos next_ = 0;
   bool started_ = false;
   bool answered_ = false;
+  bool ready_ = false;
+  bool confirmed_ = true;  // the server holds ready_ as it is
   Endpoint observed_;
   std::vector<Endpoint> peer_;
   std::uint64_t peer_changes_ = 0;
+  bool peer_ready_ = false;
 };
 
 // `candidates` in the form `socket` can send to (Endpoint::for_family),

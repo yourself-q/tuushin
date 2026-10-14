@@ -70,8 +70,21 @@ struct RendezvousConfig {
   net::RendezvousId id{};  // crypto::rendezvous_id(psk)
   // Master: how long to wait for the server to announce a slave.
   Nanos wait = 30 * kNanosPerSecond;
-  // Slave: how often, and for how long after the server announced a master,
-  // to send punches to all its candidates. The master's hellos come every
+  // Both: the hop limit of the datagrams that open this end's NAT towards
+  // the other end's candidates without reaching them (net/rendezvous.hpp).
+  // They pass the routers before the last one they reach: 3 passes a home
+  // router and the next hop (a carrier-grade NAT, often), and expires
+  // before the other end's NAT wherever the two are more than 3 hops apart,
+  // as two homes nearly always are. Where the system cannot limit the hop
+  // count, the first datagrams that go the whole way open the NAT instead,
+  // as without priming.
+  int prime_hops = 3;
+  // Both: how long to wait for the other end's ready before sending
+  // datagrams that go the whole way regardless.
+  Nanos ready_wait = 2 * kNanosPerSecond;
+  // Slave: how often, and for how long after the master is ready, to send
+  // punches to all its candidates: datagrams that go the whole way, for
+  // NATs further away than prime_hops. The master's hellos come every
   // hello_interval, so a punch interval well below it lets the second hello
   // through at the latest.
   Nanos punch_interval = 50 * kNanosPerMilli;

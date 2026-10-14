@@ -91,6 +91,9 @@ void usage() {
                "      --rendezvous HOST[:PORT]\n"
                "                           meet the other end through this rendezvous\n"
                "                           server (port 47200); needs --key-file\n"
+               "      --prime-hops N       with --rendezvous: hop limit of the datagrams that\n"
+               "                           open this end's NAT before the other end's\n"
+               "                           arrive (3; 0 does not limit them)\n"
                "      --port P             slave's UDP port (47100)\n"
                "      --scheme S           none, channel or reflect (reflect)\n"
                "      --rate HZ            control rate (1000)\n"
@@ -125,6 +128,7 @@ struct Options {
   double rate = 1000.0;
   double deadband = 0.0;
   int dscp = 46;
+  int prime_hops = 3;
   bool rt = true;
   double watchdog_ms = -1.0;  // negative: the PC's holding horizon
   bool ipv6 = false;
@@ -326,9 +330,13 @@ std::optional<teleop::RendezvousConfig> rendezvous_of(const Options& o,
     throw std::runtime_error("the rendezvous server " + server->to_string() +
                              " is IPv6, and this host has no IPv6 socket");
   }
+  if (o.prime_hops < 0 || o.prime_hops > 255) {
+    throw std::runtime_error("--prime-hops must be 0..255");
+  }
   teleop::RendezvousConfig rc;
   rc.server = *server;
   rc.id = crypto::rendezvous_id(*psk);
+  rc.prime_hops = o.prime_hops;
   return rc;
 }
 
@@ -417,8 +425,8 @@ int run_master(const Options& o) {
                 "with the same key?",
                 to_seconds(cfg.handshake_timeout));
     if (!rep.candidates.empty()) {
-      std::printf(" Or both ends are behind NATs that give every destination its own port, "
-                  "which hole punching cannot cross");
+      std::printf(" Or a NAT on the way gives every destination its own port, which hole "
+                  "punching cannot cross; see the README");
     }
     std::printf(")\n");
     return 2;
@@ -557,6 +565,7 @@ int main(int argc, char** argv) {
       else if (a == "--log") o.log = next();
       else if (a == "--key-file") o.key_file = next();
       else if (a == "--rendezvous") o.rendezvous = next();
+      else if (a == "--prime-hops") o.prime_hops = static_cast<int>(parse_double(next(), "hops"));
       else if (a == "--duration") o.duration = parse_double(next(), "duration");
       else if (a == "--max-force") o.max_force = parse_double(next(), "max-force");
       else if (a == "--bind") o.bind = next();

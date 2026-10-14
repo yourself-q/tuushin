@@ -12,8 +12,13 @@ namespace {
 constexpr std::uint8_t kMagic[4] = {'T', 'S', 'R', 'V'};
 constexpr std::uint8_t kVersion = 1;
 constexpr std::size_t kAddressSize = 20;
-constexpr std::size_t kObservedAt = 32;
-constexpr std::size_t kCandidatesAt = 52;
+constexpr std::size_t kFlagsAt = 8;
+constexpr std::size_t kIdAt = 12;
+constexpr std::size_t kTxidAt = 28;
+constexpr std::size_t kObservedAt = 36;
+constexpr std::size_t kCandidatesAt = 56;
+constexpr std::uint8_t kReadyFlag = 1;
+constexpr std::uint8_t kRecipientReadyFlag = 2;
 
 void put_address(std::uint8_t* p, const Endpoint& e) {
   std::memset(p, 0, kAddressSize);
@@ -67,8 +72,10 @@ std::vector<std::uint8_t> encode_rendezvous(const RendezvousMessage& m) {
     ++n;
   }
   out[7] = static_cast<std::uint8_t>(n);
-  std::memcpy(out.data() + 8, m.id.data(), m.id.size());
-  for (int i = 0; i < 8; ++i) out[24 + i] = static_cast<std::uint8_t>(m.txid >> (8 * i));
+  out[kFlagsAt] = static_cast<std::uint8_t>((m.ready ? kReadyFlag : 0) |
+                                            (m.recipient_ready ? kRecipientReadyFlag : 0));
+  std::memcpy(out.data() + kIdAt, m.id.data(), m.id.size());
+  for (int i = 0; i < 8; ++i) out[kTxidAt + i] = static_cast<std::uint8_t>(m.txid >> (8 * i));
   if (m.observed.valid()) put_address(out.data() + kObservedAt, m.observed);
   return out;
 }
@@ -82,8 +89,14 @@ std::optional<RendezvousMessage> decode_rendezvous(const std::uint8_t* data, std
   m.role = static_cast<RendezvousRole>(data[6]);
   const std::size_t n = data[7];
   if (n > kRendezvousMaxCandidates) return std::nullopt;
-  std::memcpy(m.id.data(), data + 8, m.id.size());
-  for (int i = 0; i < 8; ++i) m.txid |= static_cast<std::uint64_t>(data[24 + i]) << (8 * i);
+  if ((data[kFlagsAt] & ~(kReadyFlag | kRecipientReadyFlag)) != 0) return std::nullopt;
+  for (std::size_t i = kFlagsAt + 1; i < kIdAt; ++i) {
+    if (data[i] != 0) return std::nullopt;
+  }
+  m.ready = (data[kFlagsAt] & kReadyFlag) != 0;
+  m.recipient_ready = (data[kFlagsAt] & kRecipientReadyFlag) != 0;
+  std::memcpy(m.id.data(), data + kIdAt, m.id.size());
+  for (int i = 0; i < 8; ++i) m.txid |= static_cast<std::uint64_t>(data[kTxidAt + i]) << (8 * i);
   const auto observed = get_address(data + kObservedAt);
   if (!observed) return std::nullopt;
   m.observed = *observed;
@@ -105,6 +118,8 @@ RendezvousMessage RendezvousServer::peer_message(const RendezvousId& id, const E
   RendezvousMessage m;
   m.type = RendezvousMessage::Type::kPeer;
   m.role = peer_role;
+  m.ready = peer.ready;
+  m.recipient_ready = to.ready;
   m.id = id;
   m.txid = to.txid;
   m.observed = to.from;
@@ -143,11 +158,17 @@ bool RendezvousServer::on_datagram(const std::uint8_t* data, std::size_t size,
     const Endpoint h = c.canonical();
     if (std::find(host.begin(), host.end(), h) == host.end()) host.push_back(h);
   }
-  const bool changed = !me.present || me.from != source || me.host != host;
+  const bool moved =
+      !me.present || me.from != source || me.host != host || me.txid != m->txid;
+  const bool changed = moved || me.ready != m->ready;
+  // The peer's ready was about this end's previous addresses or
+  // registration.
+  if (moved) peer.ready = false;
   me.present = true;
   me.from = source;
   me.host = std::move(host);
   me.txid = m->txid;
+  me.ready = m->ready;
   me.seen = now;
 
   if (peer.present) {
@@ -161,6 +182,7 @@ bool RendezvousServer::on_datagram(const std::uint8_t* data, std::size_t size,
     w.role = m->role;
     w.id = m->id;
     w.txid = m->txid;
+    w.recipient_ready = me.ready;
     w.observed = source;
     out.push_back(Out{from, encode_rendezvous(w)});
   }
@@ -178,14 +200,22 @@ RendezvousClient::RendezvousClient(const Endpoint& server, const RendezvousId& i
 std::optional<std::vector<std::uint8_t>> RendezvousClient::poll(Nanos now) {
   if (started_ && now < next_) return std::nullopt;
   started_ = true;
-  next_ = now + (answered_ ? kRefreshInterval : kRetryInterval);
+  next_ = now + (answered_ && confirmed_ ? kRefreshInterval : kRetryInterval);
   RendezvousMessage m;
   m.type = RendezvousMessage::Type::kRegister;
   m.role = role_;
+  m.ready = ready_;
   m.id = id_;
   m.txid = txid_;
   m.candidates = host_;
   return encode_rendezvous(m);
+}
+
+void RendezvousClient::set_ready(bool ready) {
+  if (ready == ready_) return;
+  ready_ = ready;
+  confirmed_ = false;
+  next_ = 0;
 }
 
 bool RendezvousClient::on_datagram(const std::uint8_t* data, std::size_t size,
@@ -197,13 +227,27 @@ bool RendezvousClient::on_datagram(const std::uint8_t* data, std::size_t size,
   }
   if (m->type == RendezvousMessage::Type::kPeer && m->role == role_) return false;
   if (m->type == RendezvousMessage::Type::kWaiting && m->role != role_) return false;
-  if (!answered_) next_ = now + kRefreshInterval;
+  const bool settled = answered_ && confirmed_;
   answered_ = true;
   observed_ = m->observed;
-  if (m->type == RendezvousMessage::Type::kPeer && m->candidates != peer_) {
-    peer_ = m->candidates;
-    ++peer_changes_;
+  bool again = false;
+  if (m->type == RendezvousMessage::Type::kPeer) {
+    if (m->candidates != peer_) {
+      peer_ = m->candidates;
+      again = true;
+    }
+    peer_ready_ = m->ready;
   }
+  // The server forgot this end's ready, which it had confirmed: the peer
+  // registered anew. Before the confirmation, an announcement without it
+  // only crossed the registration that carries it.
+  if (ready_ && confirmed_ && !m->recipient_ready && !peer_.empty()) again = true;
+  if (again) {
+    ++peer_changes_;
+    ready_ = false;
+  }
+  confirmed_ = m->recipient_ready == ready_;
+  if (confirmed_ && !settled) next_ = now + kRefreshInterval;
   return true;
 }
 
@@ -236,7 +280,8 @@ void run_rendezvous_server(UdpSocket& socket, const std::atomic<bool>* stop,
         const bool met = reply && reply->type == RendezvousMessage::Type::kPeer;
         log(std::string(m->role == RendezvousRole::kMaster ? "master" : "slave") + " at " +
             from.canonical().to_string() + " with " + std::to_string(m->candidates.size()) +
-            " host addresses: " + (met ? "peer announced" : "waiting for its peer"));
+            " host addresses" + (m->ready ? ", ready" : "") + ": " +
+            (met ? "peer announced" : "waiting for its peer"));
       }
     }
   }

@@ -111,13 +111,35 @@ std::uint64_t wall_clock_ns() {
                                         .count());
 }
 
+// A datagram that only opens the sender's NAT.
+std::vector<std::uint8_t> punch_datagram() {
+  wire::Header h;
+  h.type = wire::PacketType::kPunch;
+  std::vector<std::uint8_t> out;
+  wire::encode_raw(h, nullptr, 0, out);
+  return out;
+}
+
+// Opens this end's NAT towards `to` with punches that expire on the way
+// (RendezvousConfig::prime_hops). False if none could be sent so, which is
+// what a system that cannot limit the hop count gives.
+bool prime(net::UdpSocket& socket, const std::vector<net::Endpoint>& to, int hops,
+           const std::vector<std::uint8_t>& punch) {
+  bool any = false;
+  for (const auto& t : to) any = socket.send_limited(t, punch.data(), punch.size(), hops) || any;
+  return any;
+}
+
 // The master's side of the handshake: resends its hello every
 // hello_interval to every candidate address of the slave until a reply
 // authenticates, keeping a simulated device's physics current with the
 // actuator off meanwhile. With a rendezvous the candidates come from the
 // server, and the reply may come from anywhere: a slave behind a NAT that
 // maps each destination to its own port answers from an address the server
-// never saw, and only the slave can make a reply that authenticates.
+// never saw, and only the slave can make a reply that authenticates. The
+// candidates get hellos only once the slave is ready (or ready_wait after
+// the announcement); the master primes its own NAT before it says it is
+// ready, or, where it cannot, says so after its first hellos.
 struct Handshake {
   crypto::SessionKeys keys;
   net::Endpoint slave;
@@ -151,12 +173,15 @@ std::optional<Handshake> master_handshake(net::UdpSocket& socket, const net::End
   // A slave address given directly, in the form this socket sends to.
   std::optional<net::Endpoint> direct;
   if (slave.valid()) direct = slave.for_family(socket.is_ipv6());
+  // The rendezvous candidates, apart from `direct`.
   std::vector<net::Endpoint> targets;
-  if (direct) targets.push_back(*direct);
   std::uint64_t peer_changes = 0;
+  Nanos announced = -1;  // when the server last announced the slave
+  bool primed = false, slave_ready = false;
+  const auto punch = punch_datagram();
 
   const Nanos start = monotonic_now();
-  Nanos known_since = targets.empty() ? -1 : start;  // when the first candidate was known
+  Nanos known_since = direct ? start : -1;  // when the first candidate was known
   Nanos next_hello = start;
   for (;;) {
     const Nanos now = monotonic_now();
@@ -172,12 +197,21 @@ std::optional<Handshake> master_handshake(net::UdpSocket& socket, const net::End
         socket.send_to(*server, reg->data(), reg->size());
       }
     }
+    // The candidates get hellos once the slave's NAT expects them.
+    const bool to_targets =
+        announced >= 0 && (slave_ready || now - announced >= cfg.rendezvous->ready_wait);
     if (known_since >= 0 && now >= next_hello) {
-      for (const auto& t : targets) {
+      auto send_hello = [&](const net::Endpoint& t) {
         ++h.seq;
         h.send_time = monotonic_now();
         wire::encode_raw(h, msg1.data(), msg1.size(), out);
         socket.send_to(t, out.data(), out.size());
+      };
+      if (direct) send_hello(*direct);
+      if (to_targets) {
+        for (const auto& t : targets) send_hello(t);
+        // Unprimed, this end's NAT expects the slave from now on.
+        if (!primed) rv->set_ready(true);
       }
       next_hello = now + cfg.hello_interval;
     }
@@ -191,19 +225,25 @@ std::optional<Handshake> master_handshake(net::UdpSocket& socket, const net::End
       if (!n) break;
       if (*n > wire::kMaxDatagram) continue;
       if (rv && rv->on_datagram(buf.data(), *n, from, monotonic_now())) {
+        const Nanos t = monotonic_now();
         rep.observed = rv->observed();
         if (rv->peer_changes() != peer_changes) {
           peer_changes = rv->peer_changes();
           rep.candidates = rv->peer();
           targets = net::sendable(rv->peer(), socket);
-          if (direct && std::find(targets.begin(), targets.end(), *direct) == targets.end()) {
-            targets.push_back(*direct);
-          }
+          if (direct) targets.erase(std::remove(targets.begin(), targets.end(), *direct),
+                                    targets.end());
+          announced = t;
+          primed = prime(socket, targets, cfg.rendezvous->prime_hops, punch);
+          if (primed) rv->set_ready(true);
           if (known_since < 0) {
-            known_since = monotonic_now();
-            next_hello = known_since;
+            known_since = t;
+            next_hello = t + cfg.rendezvous->ready_wait;
           }
         }
+        // The first hellos to the candidates go as soon as the slave is ready.
+        if (rv->peer_ready() && !slave_ready) next_hello = t;
+        slave_ready = rv->peer_ready();
         continue;
       }
       const auto rh = wire::decode_header(buf.data(), *n);
@@ -430,9 +470,10 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
     last_refused = session;
   };
 
-  // Rendezvous: registered while idle, it announces masters; each one
-  // announced is punched towards for a while, so that its hellos get
-  // through this end's NAT.
+  // Rendezvous: registered while idle, it announces masters. For each one
+  // announced this end primes its NAT and says it is ready, then punches
+  // towards the master for a while once that is ready too, so that its
+  // hellos get through NATs further away than the priming reaches.
   std::optional<net::RendezvousClient> rv;
   std::optional<net::Endpoint> rv_server;
   if (cfg.rendezvous) {
@@ -444,13 +485,9 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
   bool rv_answered = false;
   std::uint64_t rv_changes = 0;
   std::vector<net::Endpoint> punch_to;
+  Nanos announced = -1;  // when the master to punch towards was announced
   Nanos punch_until = -1, next_punch = 0;
-  std::vector<std::uint8_t> punch;
-  {
-    wire::Header ph;
-    ph.type = wire::PacketType::kPunch;
-    wire::encode_raw(ph, nullptr, 0, punch);
-  }
+  const auto punch = punch_datagram();
   auto tell = [&](const std::string& what) {
     if (hooks.on_rendezvous) hooks.on_rendezvous(what);
   };
@@ -473,6 +510,15 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
       {
         const Nanos t = monotonic_now();
         Nanos wake = t + 100 * kNanosPerMilli;
+        if (announced >= 0 && punch_until < 0) {
+          // Punches go the whole way once the master's NAT expects them.
+          if (rv->peer_ready() || t - announced >= cfg.rendezvous->ready_wait) {
+            punch_until = t + cfg.rendezvous->punch_duration;
+            next_punch = t;
+          } else {
+            wake = std::min(wake, announced + cfg.rendezvous->ready_wait);
+          }
+        }
         if (rv) wake = std::min(wake, rv->next_due());
         if (punch_until > t) wake = std::min(wake, next_punch);
         if (wake > t) socket.wait_readable(wake - t);
@@ -508,11 +554,18 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
           if (rv->peer_changes() != rv_changes) {
             rv_changes = rv->peer_changes();
             punch_to = net::sendable(rv->peer(), socket);
-            punch_until = now + cfg.rendezvous->punch_duration;
-            next_punch = now;
+            announced = now;
+            punch_until = -1;
+            if (!prime(socket, punch_to, cfg.rendezvous->prime_hops, punch)) {
+              // Unprimed: the punches open this end's NAT, at once.
+              punch_until = now + cfg.rendezvous->punch_duration;
+              next_punch = now;
+            }
+            rv->set_ready(true);
             std::string list;
             for (const auto& c : rv->peer()) list += (list.empty() ? "" : ", ") + c.to_string();
-            tell("master announced at " + list);
+            tell("master announced at " + list +
+                 (punch_until < 0 ? "" : " (cannot limit the hop count; punching at once)"));
           }
           continue;
         }
@@ -617,6 +670,7 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
       }
     }
     if (!first) break;
+    announced = -1;
     punch_until = -1;
 
     SlaveSessionReport rep;
