@@ -205,3 +205,67 @@ TEST_CASE(wire_hold_field_saturates) {
   CHECK(hold_field(1234) == 1234);
   CHECK(hold_field(Nanos{1} << 40) == std::numeric_limits<std::uint32_t>::max());
 }
+
+TEST_CASE(wire_probe_echo_carries_receipt_map) {
+  std::vector<std::uint8_t> buf;
+  const std::uint64_t map = 0x8000000000000101ull;  // bits 0, 8 and 63
+  CHECK(encode_probe_echo(sample_header(), map, 100, buf) == kHeaderSize + 100);
+  const auto hd = decode_header(buf.data(), buf.size());
+  REQUIRE(hd.has_value());
+  CHECK(hd->type == PacketType::kProbeEcho);
+  CHECK(hd->flags == kFlagReceiptMap);
+  CHECK(hd->payload_len == 100);
+  // Little-endian at the start of the payload, padding after it.
+  CHECK(buf[kHeaderSize] == 0x01 && buf[kHeaderSize + 1] == 0x01 &&
+        buf[kHeaderSize + 7] == 0x80);
+  CHECK(buf[kHeaderSize + kReceiptMapSize] == 0 && buf.back() == 0);
+  const auto r = decode_receipts(buf.data(), buf.size());
+  REQUIRE(r.has_value());
+  CHECK(*r == map);
+
+  // Exactly the map fits.
+  CHECK(encode_probe_echo(sample_header(), map, kReceiptMapSize, buf) ==
+        kHeaderSize + kReceiptMapSize);
+  CHECK(decode_receipts(buf.data(), buf.size()).value_or(0) == map);
+}
+
+TEST_CASE(wire_probe_echo_without_room_has_no_map) {
+  // An echo is never larger than its probe, so a probe smaller than the map
+  // gets an echo without one; the flag says so and the decoder agrees.
+  std::vector<std::uint8_t> buf;
+  for (std::size_t payload : {std::size_t{0}, kReceiptMapSize - 1}) {
+    CHECK(encode_probe_echo(sample_header(), ~0ull, payload, buf) == kHeaderSize + payload);
+    const auto hd = decode_header(buf.data(), buf.size());
+    REQUIRE(hd.has_value());
+    CHECK(hd->type == PacketType::kProbeEcho);
+    CHECK(hd->flags == 0);
+    CHECK(!decode_receipts(buf.data(), buf.size()).has_value());
+  }
+}
+
+TEST_CASE(wire_receipts_only_from_flagged_echoes) {
+  std::vector<std::uint8_t> buf;
+  // A probe with the same bytes is not an echo.
+  Header h = sample_header();
+  h.type = PacketType::kProbe;
+  h.flags = kFlagReceiptMap;
+  encode_padded(h, 16, buf);
+  CHECK(!decode_receipts(buf.data(), buf.size()).has_value());
+  // An echo without the flag carries padding, not a map.
+  h.type = PacketType::kProbeEcho;
+  h.flags = 0;
+  encode_padded(h, 16, buf);
+  CHECK(!decode_receipts(buf.data(), buf.size()).has_value());
+  // A flagged echo whose payload is too short for the map is malformed.
+  encode_probe_echo(sample_header(), 1, kReceiptMapSize, buf);
+  buf[12] = kFlagReceiptMap;
+  buf[14] = kReceiptMapSize - 1;
+  buf.pop_back();
+  CHECK(decode_header(buf.data(), buf.size()).has_value());
+  CHECK(!decode_receipts(buf.data(), buf.size()).has_value());
+  // Truncations never decode.
+  encode_probe_echo(sample_header(), 1, 64, buf);
+  for (std::size_t n = 0; n < buf.size(); ++n) {
+    CHECK(!decode_receipts(buf.data(), n).has_value());
+  }
+}
