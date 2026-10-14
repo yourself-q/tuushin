@@ -9,6 +9,7 @@ add_executable(tuushin_tests
   test_udp.cpp
   test_clock_sync.cpp
   test_probe.cpp
+  test_teleop_controller.cpp
 )
 target_link_libraries(tuushin_tests PRIVATE tuushin)
 add_test(NAME tuushin_tests COMMAND tuushin_tests)

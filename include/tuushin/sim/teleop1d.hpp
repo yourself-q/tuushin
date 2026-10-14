@@ -6,6 +6,8 @@
 
 #include "tuushin/codec/deadband.hpp"
 #include "tuushin/net/channel.hpp"
+#include "tuushin/teleop/controller.hpp"
+#include "tuushin/teleop/device.hpp"
 #include "tuushin/time.hpp"
 
 namespace tuushin::sim {
@@ -19,22 +21,14 @@ namespace tuushin::sim {
 // The slave tracks the integrated velocity command with a PD coupling and
 // reports the coupling force. The master displays that force. Each direction
 // can carry a perceptual deadband, and TDPA passivity controllers can sit at
-// both ends of the channel.
+// both ends of the channel. The two ends are teleop::MasterController and
+// teleop::SlaveController, the same code the networked nodes run.
 //
 // Units are SI: metres, seconds, newtons, joules.
 
-struct OperatorParams {
-  // The hand pulls the master toward a reference position through its own
-  // stiffness and damping, which is how human arm impedance is usually
-  // modelled in teleoperation studies.
-  double hand_k = 300.0;   // N/m
-  double hand_b = 5.0;     // N s/m
-  // Reference: offset + amplitude * (1 - cos(2 pi f t)) / 2, i.e. a smooth
-  // push from `offset` to `offset + amplitude` and back, repeated.
-  double ref_offset = 0.0;
-  double ref_amplitude = 0.04;  // m
-  double ref_freq = 0.5;        // Hz
-};
+// The operator model and the wall live with the simulated devices.
+using OperatorParams = teleop::OperatorParams;
+using WallParams = teleop::WallParams;
 
 struct MasterParams {
   double mass = 0.2;       // kg, apparent mass of a desktop haptic device
@@ -70,14 +64,8 @@ struct SlaveParams {
   // only returns what the passivity controller took away, as in the drift
   // signal of Artigas et al. (IROS 2010) and Chawda et al. (Haptics Symp.
   // 2014), but released gradually through the gain instead of at once.
-  enum class DriftReference { kSlavePosition, kCommand };
+  using DriftReference = teleop::SlaveConfig::DriftReference;
   DriftReference drift_reference = DriftReference::kCommand;
-};
-
-struct WallParams {
-  double position = 0.02;  // m
-  double k = 5000.0;       // N/m
-  double b = 10.0;         // N s/m, only while penetrating
 };
 
 struct Teleop1DConfig {
@@ -106,7 +94,7 @@ struct Teleop1DConfig {
   //              position itself, and impedance-type PCs at both device ports
   //              only scale forces, so there is no position drift and
   //              drift_gain is not used.
-  enum class Passivity { kNone, kChannel, kReflective };
+  using Passivity = teleop::Passivity;
   Passivity passivity = Passivity::kChannel;
   // kReflective: energy in the slave-side store before anything entered (J).
   // The teleoperator is then passive with respect to this initial storage;

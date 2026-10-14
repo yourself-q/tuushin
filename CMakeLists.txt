@@ -27,6 +27,8 @@ add_library(tuushin
   src/net/udp.cpp
   src/rt/thread.cpp
   src/sim/teleop1d.cpp
+  src/teleop/controller.cpp
+  src/teleop/device.cpp
   src/wire/packet.cpp
 )
 target_include_directories(tuushin PUBLIC
