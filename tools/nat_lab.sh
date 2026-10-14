@@ -41,11 +41,20 @@
 #                          a Wi-Fi client in power save can take 100 ms
 #   --master-lan-delay MS  the same between the master and its NAT (0)
 #   --nat-b-input POLICY   what natB does with unsolicited datagrams to itself:
-#                          drop (a firewall, the usual) or accept (no firewall:
-#                          the kernel answers port unreachable) (drop)
+#                          drop (a firewall, the usual), reject (a firewall
+#                          that answers port unreachable, OpenWrt's default
+#                          for its WAN zone) or accept (no firewall: the
+#                          kernel answers port unreachable, and conntrack
+#                          keeps the datagram's flow) (drop)
 #   --nat-a-input POLICY   the same for natA (drop)
 #   --master-first         start the master before the slave
 #   --prime-hops N         passed to both ends (their default, 3)
+#   --rebind-at S          S seconds after the master starts, natB moves the
+#                          slave to a new outside address (203.0.113.3, as
+#                          after a new DHCP lease or a carrier-grade NAT that
+#                          forgot it) and forgets its mappings; the session
+#                          must survive it (the master's link follows the
+#                          slave, and the slave is ended by the master)
 #   --keep DIR             keep the logs in DIR
 #
 # Prints one line: PASS or FAIL, the scenario, and the time from the master's
@@ -66,6 +75,7 @@ MASTER_LAN_DELAY=0
 NAT_A_INPUT=drop
 NAT_B_INPUT=drop
 MASTER_FIRST=0
+REBIND_AT=
 KEEP=
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -81,6 +91,7 @@ while [ $# -gt 0 ]; do
     --nat-b-input) NAT_B_INPUT=$2; shift ;;
     --nat-a-input) NAT_A_INPUT=$2; shift ;;
     --master-first) MASTER_FIRST=1 ;;
+    --rebind-at) REBIND_AT=$2; shift ;;
     --keep) KEEP=$2; shift ;;
     *) echo "unknown option $1" >&2; exit 1 ;;
   esac
@@ -92,6 +103,10 @@ TOOL=$(cd "$BUILD" && pwd)/tools/tuushin-teleop
 LOG=${KEEP:-$(mktemp -d)}
 mkdir -p "$LOG"
 [ "$WAN_HOPS" -ge 1 ] || { echo "--wan-hops must be at least 1" >&2; exit 1; }
+if [ -n "$REBIND_AT" ] && [ "$SAME_LAN" = 1 ]; then
+  echo "--rebind-at moves the slave behind natB; it has no meaning with --same-lan" >&2
+  exit 1
+fi
 ROUTERS=
 for i in $(seq 1 "$WAN_HOPS"); do ROUTERS="$ROUTERS r$i"; done
 NS="master slave natA natB server$ROUTERS"
@@ -172,13 +187,35 @@ nat() {
   nsx "$ns" iptables -t nat -A POSTROUTING -o "$wif" -j MASQUERADE $random
   nsx "$ns" iptables -A FORWARD -i "$wif" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
   nsx "$ns" iptables -A FORWARD -i "$wif" -j DROP
-  if [ "$input" = drop ]; then
-    nsx "$ns" iptables -A INPUT -i "$wif" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-    nsx "$ns" iptables -A INPUT -i "$wif" -j DROP
-  fi
+  case "$input" in
+    drop | reject)
+      nsx "$ns" iptables -A INPUT -i "$wif" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+      if [ "$input" = drop ]; then
+        nsx "$ns" iptables -A INPUT -i "$wif" -j DROP
+      else
+        nsx "$ns" iptables -A INPUT -i "$wif" -p udp -j REJECT --reject-with icmp-port-unreachable
+      fi
+      ;;
+    accept) ;;
+    *) echo "unknown input policy $input" >&2; exit 1 ;;
+  esac
 }
 nat natA a-w 198.51.100.2 198.51.100.1 "$NAT_A" "$NAT_A_INPUT"
 nat natB b-w 203.0.113.2 203.0.113.1 "$NAT_B" "$NAT_B_INPUT"
+[ -z "$REBIND_AT" ] || nsx natB ip addr add 203.0.113.3/24 dev b-w
+
+# The rebinding: new flows leave natB from its second address, and the old
+# mappings go, so the slave's next datagram to anyone opens a new one (the
+# rule first, so that no datagram in between maps to the old address again).
+rebind() {
+  local random=
+  [ "$NAT_B" = symmetric ] && random=--random-fully
+  sleep "$REBIND_AT"
+  # shellcheck disable=SC2086
+  nsx natB iptables -t nat -R POSTROUTING 1 -o b-w -j SNAT --to-source 203.0.113.3 $random
+  nsx natB conntrack -D -p udp >/dev/null 2>&1 || true
+  echo "rebound at $(date +%s%N)" >"$LOG/rebind.txt"
+}
 
 # host NS IF NAT NAT_IF ADDR
 host() {
@@ -214,9 +251,12 @@ start_slave() {
     >"$LOG/slave.out" 2>"$LOG/slave.err" &
 }
 DURATION=2
+# Enough session left after the rebinding whenever the meeting took.
+[ -z "$REBIND_AT" ] || DURATION=$(awk "BEGIN { print $REBIND_AT + 3 }")
 start_master() {
   local t0 t1 rc=0
   t0=$(date +%s%N)
+  [ -z "$REBIND_AT" ] || rebind &
   # shellcheck disable=SC2086
   nsx master "$TOOL" master --no-rt --key-file "$KEY" --rendezvous 192.0.2.10 $PRIME \
     --duration "$DURATION" >"$LOG/master.out" 2>"$LOG/master.err" || rc=$?
@@ -244,9 +284,26 @@ SCENARIO="nat-a=$NAT_A nat-b=$NAT_B same-lan=$SAME_LAN wan=${WAN_HOPS}x${WAN_DEL
 SCENARIO="$SCENARIO lan-delay=${MASTER_LAN_DELAY}/${SLAVE_LAN_DELAY}ms"
 SCENARIO="$SCENARIO input=$NAT_A_INPUT/$NAT_B_INPUT"
 SCENARIO="$SCENARIO master-first=$MASTER_FIRST prime-hops=${PRIME_HOPS:-default}"
+[ -z "$REBIND_AT" ] || SCENARIO="$SCENARIO rebind-at=${REBIND_AT}s"
+OK=0
 if [ "$RC" = 0 ] && grep -q "^authenticated" "$LOG/master.out"; then
+  OK=1
+  if [ -n "$REBIND_AT" ]; then
+    # Wait for the slave to report; it ends with the master's final samples.
+    for _ in $(seq 1 30); do
+      grep -q "^session " "$LOG/slave.out" 2>/dev/null && break
+      sleep 0.1
+    done
+    grep -q "the other end moved [1-9]" "$LOG/master.out" || OK=0
+    grep -q "ended by the master" "$LOG/slave.out" || OK=0
+  fi
+fi
+if [ "$OK" = 1 ]; then
   printf 'PASS %s  %d ms  %s\n' "$SCENARIO" "$ELAPSED_MS" \
     "$(grep -o 'reached the slave at .*' "$LOG/master.out")"
+elif [ "$RC" = 0 ] && grep -q "^authenticated" "$LOG/master.out"; then
+  printf 'FAIL %s  %d ms  %s\n' "$SCENARIO" "$ELAPSED_MS" \
+    "the session did not survive the rebinding: $(grep -o 'received [0-9]* from the slave' "$LOG/master.out")"
 else
   printf 'FAIL %s  %d ms  %s\n' "$SCENARIO" "$ELAPSED_MS" \
     "$(grep -E 'failed|announced no|no answer' "$LOG/master.out" | head -1)"
