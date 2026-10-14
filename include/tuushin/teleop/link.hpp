@@ -53,6 +53,16 @@ class SeqWindow {
 // datagram can neither inject a sample nor, by claiming a sequence number
 // far ahead, make every genuine one look stale.
 //
+// A sealed link also follows its peer to a new address, as WireGuard does
+// (Donenfeld, NDSS 2017, section 2.1): a datagram from elsewhere that
+// authenticates and is the newest yet makes its source the peer, so a
+// session survives a NAT that moves the other end to another port, or an
+// end that changes network. Being the newest keeps a replayed datagram
+// from moving the link; a party on the path that forwards a fresh copy
+// faster than the original moves it until the next genuine datagram, but
+// could drop the traffic anyway. An open link stays with the address it
+// was made with.
+//
 // An optional ChannelModel impairs outgoing datagrams in-process before they
 // reach the socket, so that a path with a given delay, jitter, loss or a
 // recorded trace can be tried on loopback or a LAN. The datagram keeps its
@@ -93,7 +103,8 @@ class HapticLink {
     SeqWindow::Verdict verdict = SeqWindow::Verdict::kNew;
   };
   // Parses a datagram from `from` received at `rx_time`. Returns the sample
-  // if it belongs to this session and peer and is not a duplicate.
+  // if it belongs to this session and peer and is not a duplicate; on a
+  // sealed link the peer may be at a new address (see above).
   std::optional<Received> on_datagram(const std::uint8_t* data, std::size_t size,
                                       const net::Endpoint& from, Nanos rx_time);
 
@@ -108,6 +119,7 @@ class HapticLink {
     std::uint64_t unauthentic = 0;    // this session and peer, but not sealed or
                                       // failing authentication (sealed links)
     std::uint64_t missing = 0;        // never arrived (so far)
+    std::uint64_t moved = 0;          // the peer came from a new address
   };
   Counters counters() const;
 

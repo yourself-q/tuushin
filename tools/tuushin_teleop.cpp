@@ -248,6 +248,9 @@ void print_link(const teleop::HapticLink::Counters& c, const char* rx_dir) {
   if (c.unauthentic) {
     std::printf(", not authentic %llu", static_cast<unsigned long long>(c.unauthentic));
   }
+  if (c.moved) {
+    std::printf(", the other end moved %llu times", static_cast<unsigned long long>(c.moved));
+  }
   std::printf("\n");
 }
 

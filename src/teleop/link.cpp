@@ -126,7 +126,10 @@ std::optional<HapticLink::Received> HapticLink::on_datagram(const std::uint8_t* 
                                                             const net::Endpoint& from,
                                                             Nanos rx_time) {
   const auto h = wire::decode_header(data, size);
-  if (!h || h->type != wire::PacketType::kHaptic || h->session != session_ || from != peer_ ||
+  // Only a sealed link may hear its peer at another address.
+  const bool elsewhere = from != peer_;
+  if (!h || h->type != wire::PacketType::kHaptic || h->session != session_ ||
+      (elsewhere && !sealed_) ||
       ((h->flags & wire::kSchemeMask) >> wire::kSchemeShift) != static_cast<unsigned>(scheme_)) {
     ++counters_.foreign;
     return std::nullopt;
@@ -139,7 +142,9 @@ std::optional<HapticLink::Received> HapticLink::on_datagram(const std::uint8_t* 
     if ((h->flags & wire::kFlagSealed) == 0 ||
         !crypto::open(keys_.recv, h->seq, data, wire::kHeaderSize, data + wire::kHeaderSize,
                       h->payload_len, plain_)) {
-      ++counters_.unauthentic;
+      // Elsewhere, it is just someone else's datagram.
+      if (elsewhere) ++counters_.foreign;
+      else ++counters_.unauthentic;
       return std::nullopt;
     }
     p = wire::decode_haptic_payload(plain_.data(), plain_.size());
@@ -155,7 +160,14 @@ std::optional<HapticLink::Received> HapticLink::on_datagram(const std::uint8_t* 
     ++counters_.duplicates;
     return std::nullopt;
   }
-  if (verdict == SeqWindow::Verdict::kNew) highest_rx_time_ = rx_time;
+  if (verdict == SeqWindow::Verdict::kNew) {
+    highest_rx_time_ = rx_time;
+    if (elsewhere) {
+      // The newest authentic datagram says where the peer is now.
+      peer_ = from;
+      ++counters_.moved;
+    }
+  }
   if (verdict == SeqWindow::Verdict::kLate) ++counters_.late;
 
   // The echo: the peer's newest sample from us when it sent this one, and

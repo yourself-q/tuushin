@@ -156,6 +156,89 @@ TEST_CASE(sealed_link_rejects_unsealed_altered_and_foreign_keyed_datagrams) {
   CHECK(b.counters().duplicates == 1);
 }
 
+TEST_CASE(sealed_link_follows_its_peer_to_a_new_address) {
+  // The master sends to `mid`, and the test forwards each datagram from one
+  // of three sockets: a NAT that moves the master to another port mid-
+  // session, as far as the slave can tell.
+  net::UdpSocket sa = bind_loopback(), mid = bind_loopback(), sb = bind_loopback();
+  net::UdpSocket n1 = bind_loopback(), n2 = bind_loopback(), n3 = bind_loopback();
+  const auto keys = handshake(crypto::random_key());
+  HapticLink a(sa, 55, peer_of(mid), Passivity::kReflective);
+  HapticLink b(sb, 55, peer_of(n1), Passivity::kReflective);
+  a.set_keys(keys.init);
+  b.set_keys(keys.resp);
+  std::vector<Datagram> sent;  // the master's datagrams, in order
+  auto next = [&] {
+    a.send(monotonic_now(), Sample{static_cast<double>(sent.size()), 0.0, 0.0}, 0.0);
+    const auto d = receive(mid);
+    REQUIRE(d);
+    sent.push_back(*d);
+  };
+  auto via = [&](net::UdpSocket& nat, const Datagram& d) -> std::optional<HapticLink::Received> {
+    CHECK(nat.send_to(peer_of(sb), d.bytes.data(), d.bytes.size()));
+    const auto got = receive(sb);
+    CHECK(got.has_value());
+    if (!got) return std::nullopt;
+    return feed(b, *got);
+  };
+  for (int k = 0; k < 6; ++k) next();
+
+  CHECK(via(n1, sent[0]).has_value());
+  CHECK(b.peer() == peer_of(n1));
+  // The NAT moves the master: the newest authentic datagram moves the link,
+  // and the slave's next sample goes to the new address.
+  CHECK(via(n2, sent[1]).has_value());
+  CHECK(b.peer() == peer_of(n2));
+  CHECK(b.counters().moved == 1);
+  b.send(monotonic_now(), Sample{9.0, 0.0, 0.0}, 0.0);
+  CHECK(receive(n2).has_value());
+  CHECK(!n1.wait_readable(20 * kNanosPerMilli));
+
+  // A replay from the old address or a third one moves nothing.
+  CHECK(!via(n1, sent[1]).has_value());
+  CHECK(!via(n3, sent[0]).has_value());
+  CHECK(b.peer() == peer_of(n2));
+  // A late datagram still in flight from the old address is a sample, but
+  // the link stays where the newest came from.
+  CHECK(via(n2, sent[3]).has_value());
+  const auto late = via(n1, sent[2]);
+  REQUIRE(late);
+  CHECK(late->verdict == SeqWindow::Verdict::kLate);
+  CHECK(b.peer() == peer_of(n2));
+  // An altered datagram from elsewhere is someone else's: no sample, no
+  // move, counted as foreign rather than as an unauthentic one of the peer.
+  Datagram bad = sent[4];
+  bad.bytes.back() ^= 0x01;
+  const auto foreign = b.counters().foreign;
+  CHECK(!via(n3, bad).has_value());
+  CHECK(b.counters().foreign == foreign + 1);
+  CHECK(b.counters().unauthentic == 0);
+  CHECK(b.peer() == peer_of(n2));
+  CHECK(b.counters().moved == 1);
+  // And the genuine one gets through, from there too.
+  CHECK(via(n3, sent[4]).has_value());
+  CHECK(b.peer() == peer_of(n3));
+  CHECK(b.counters().moved == 2);
+}
+
+TEST_CASE(open_link_stays_with_its_address) {
+  net::UdpSocket sa = bind_loopback(), sb = bind_loopback(), other = bind_loopback();
+  HapticLink a(sa, 56, peer_of(sb), Passivity::kReflective);
+  HapticLink b(sb, 56, peer_of(sa), Passivity::kReflective);
+  a.send(monotonic_now(), Sample{1.0, 0.0, 0.0}, 0.0);
+  auto d = receive(sb);
+  REQUIRE(d);
+  // The same datagram from another address: anyone could have sent it.
+  REQUIRE(other.send_to(peer_of(sb), d->bytes.data(), d->bytes.size()));
+  const auto copy = receive(sb);
+  REQUIRE(copy);
+  CHECK(!feed(b, *copy).has_value());
+  CHECK(b.counters().foreign == 1);
+  CHECK(b.peer() == peer_of(sa));
+  CHECK(feed(b, *d).has_value());
+  CHECK(b.counters().moved == 0);
+}
+
 TEST_CASE(forged_high_seq_stalls_an_open_link_but_not_a_sealed_one) {
   // The attack: one datagram claiming a sequence number far ahead. An open
   // link takes it as the newest and from then on treats every genuine
