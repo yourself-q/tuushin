@@ -44,6 +44,18 @@ namespace tuushin::control {
 // master PC in the two-port and is equally valid.
 class ReflectiveStore {
  public:
+  // `initial_energy` (J, >= 0) is stored before anything entered, like a
+  // spring that starts compressed: the two-port is then passive with respect
+  // to that initial storage, E_out(k) <= E_in(k) + initial_energy for all k,
+  // which still bounds the energy it can ever generate. Energy tanks in
+  // teleoperation are usually started this way (M. Franken, S. Stramigioli,
+  // S. Misra, C. Secchi and A. Macchelli, "Bilateral telemanipulation with
+  // time delays: a two-layer approach combining passivity and transparency",
+  // IEEE T-RO 27(4), 2011). It lets the slave start following before the
+  // master's first energy report has crossed the channel.
+  explicit ReflectiveStore(double initial_energy = 0.0)
+      : initial_(initial_energy > 0.0 ? initial_energy : 0.0) {}
+
   struct Grant {
     double slave = 0.0;    // J that may leave towards the slave this sample
     double master = 0.0;   // J granted to the master this sample (booked)
@@ -70,7 +82,7 @@ class ReflectiveStore {
 
   // E_St. It can be slightly negative after the slave device moved further
   // than predicted during a sample; nothing is granted until inputs cover it.
-  double level() const { return master_in_ + slave_in_ - slave_out_ - granted_; }
+  double level() const { return initial_ + master_in_ + slave_in_ - slave_out_ - granted_; }
 
   // Splits the store between this sample's predicted outputs (J, negative
   // values count as zero). The master's share is booked immediately because
@@ -83,11 +95,13 @@ class ReflectiveStore {
   // packet; the master uses it as the remote input energy of its EnergyPort.
   double granted() const { return granted_; }
 
+  double initial_energy() const { return initial_; }
   double master_input_energy() const { return master_in_; }
   double slave_input_energy() const { return slave_in_; }
   double slave_output_energy() const { return slave_out_; }
 
  private:
+  double initial_;
   double master_in_ = 0.0;
   double slave_in_ = 0.0;
   double slave_out_ = 0.0;

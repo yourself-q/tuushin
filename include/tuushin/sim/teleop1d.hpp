@@ -108,6 +108,10 @@ struct Teleop1DConfig {
   //              drift_gain is not used.
   enum class Passivity { kNone, kChannel, kReflective };
   Passivity passivity = Passivity::kChannel;
+  // kReflective: energy in the slave-side store before anything entered (J).
+  // The teleoperator is then passive with respect to this initial storage;
+  // the device-port margin can go down to -initial_energy.
+  double initial_energy = 0.0;
   // Impedance-type PCs at the device ports predict the device's response to
   // their own force (control/predictive_pc.hpp) instead of assuming the
   // velocity stays constant over the sample. The model masses are what the

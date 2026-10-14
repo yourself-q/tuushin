@@ -197,3 +197,17 @@ TEST_CASE(reflective_store_grants_nothing_after_a_deficit) {
   CHECK_NEAR(g.slave, 0.0, 0.0);
   CHECK_NEAR(g.master, 0.0, 0.0);
 }
+
+TEST_CASE(reflective_store_initial_energy_bounds_net_output) {
+  ReflectiveStore s(0.05);
+  CHECK_NEAR(s.level(), 0.05, 0.0);
+  const auto g = s.allocate(0.04, 0.03);  // more than the initial storage
+  CHECK(g.limited);
+  CHECK_NEAR(g.slave + g.master, 0.05, 1e-15);
+  s.account_slave_energy(-g.slave);
+  CHECK_NEAR(s.level(), 0.0, 1e-15);
+  // Net output never exceeds inputs plus the initial storage.
+  CHECK(s.slave_output_energy() + s.granted() <=
+        s.master_input_energy() + s.slave_input_energy() + s.initial_energy() + 1e-15);
+  CHECK_NEAR(ReflectiveStore(-1.0).level(), 0.0, 0.0);
+}

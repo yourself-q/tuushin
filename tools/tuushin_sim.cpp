@@ -51,6 +51,7 @@ void usage() {
                "  --constant-velocity-pc  PCs assume constant velocity over a sample\n"
                "  --model-mass M        master mass the PC believes in kg (true mass)\n"
                "  --pc-hold N           samples a PC force must stay affordable if held (2)\n"
+               "  --initial-energy E    reflect: energy in the store at start in J (0)\n"
                "  --deadband K          perceptual deadband with Weber fraction K, both ways\n"
                "  --wall-k K            wall stiffness in N/m (5000)\n"
                "  --contact-force       slave reports contact force, not coupling force\n"
@@ -94,6 +95,7 @@ Options parse(int argc, char** argv) {
     else if (a == "--constant-velocity-pc") o.cfg.predictive_pc = false;
     else if (a == "--model-mass") o.cfg.master_model_mass = std::stod(next());
     else if (a == "--pc-hold") o.cfg.pc_hold_samples = std::stoi(next());
+    else if (a == "--initial-energy") o.cfg.initial_energy = std::stod(next());
     else if (a == "--passivity") {
       const std::string p = next();
       using P = sim::Teleop1DConfig::Passivity;

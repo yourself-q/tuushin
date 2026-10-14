@@ -131,7 +131,7 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
 
   control::EnergyPort master_port;
   control::EnergyPort slave_port;       // kNone, kChannel: channel end at the slave
-  control::ReflectiveStore store;       // kReflective
+  control::ReflectiveStore store(cfg.initial_energy);  // kReflective
   control::DevicePredictor master_dev(
       cfg.master_model_mass > 0.0 ? cfg.master_model_mass : cfg.master.mass, dt);
   control::DevicePredictor slave_dev(
@@ -234,6 +234,12 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
       x_cmd = x_master_est;
       v_c = v_received;
       const double f_coupling = cfg.slave.kp * (x_cmd - x_s) + cfg.slave.kd * (v_c - v_s);
+      // The coupling force is reported even when the PC applies less of it:
+      // it is how the slave asks the operator for the energy it lacks. If the
+      // applied force were reported instead, a slave without energy would
+      // report nothing, the master would never push into anything, and no
+      // energy would ever enter (the simulated slave then never moves, even
+      // without delay).
       f_slave = cfg.slave.report_contact_force ? f_contact : f_coupling;
       // Predicted outputs of the two-port over the coming sample: the work
       // the coupling would do on the slave, and the energy the reflected
