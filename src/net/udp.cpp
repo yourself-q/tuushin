@@ -18,6 +18,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <stdexcept>
 #include <system_error>
 #include <utility>
 
