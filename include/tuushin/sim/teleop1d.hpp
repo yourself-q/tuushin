@@ -115,6 +115,14 @@ struct Teleop1DConfig {
   bool predictive_pc = true;
   double master_model_mass = 0.0;  // kg
   double slave_model_mass = 0.0;   // kg
+  // Samples over which a predictive PC's force must stay affordable if held.
+  // 1 is the greedy per-sample limit, which chatters between zero and full
+  // force once the budget is exhausted; 2 stops the device instead of
+  // bouncing it (see limit_force_predictive). Measured on the default
+  // scenario, 2 at the master cuts the residual energy deficit by 5 to 10
+  // times and removes the chatter, at the price of a softer-looking wall in
+  // the least-squares stiffness metric, which the chatter had inflated.
+  int pc_hold_samples = 2;
   bool forward_deadband = false;
   codec::DeadbandParams forward_deadband_params{0.1, 0.002, from_millis(100)};
   bool backward_deadband = false;

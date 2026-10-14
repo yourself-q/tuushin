@@ -49,7 +49,32 @@ namespace tuushin::control {
 //    behaviour gradient-limited passivity controllers are designed to have;
 //    here it falls out of the device dynamics.
 //  * The mass is a model parameter. Underestimating it overestimates the
-//    device's response and makes the controller more conservative.
+//    device's response and makes the controller more conservative; in the
+//    1-DoF simulator (sim/teleop1d.hpp, reflective scheme, 10-100 ms) half
+//    the true mass and +-20 % keep the deficit below 0.1 mJ, twice the true
+//    mass lets it reach tens of mJ. When in doubt, err light.
+//
+// Holding horizon. The largest force with W >= -budget over one sample is,
+// without budget, the force that brings the device's mean displacement over
+// the sample to zero: the device enters the sample moving into the force and
+// leaves it moving out at the same speed. The next sample then has to drop
+// the force to zero, the hand pushes the device back in, and the force
+// chatters between zero and full at half the sample rate while the books
+// stay balanced. The classical TDPA has the same on/off behaviour; H. Singh,
+// A. Jafari and J.-H. Ryu, "Enhancing the force transparency of time domain
+// passivity approach: observer-based gradient controller", ICRA 2019, attack
+// it with an observer as well (their method is not reproduced here).
+// Requiring in addition that the force stays affordable when held for n
+// samples removes the reversal. With the same model the displacement over n
+// held samples is
+//
+//   D_n = n * v * dt + n^2 * c * (H - phi),
+//
+// where v and H are recovered from the history like P above, and the work is
+// again a concave quadratic in phi. For n = 2 and no budget the bound is
+// H + m * v / dt, the force that stops the device within one sample: contact
+// without stored energy becomes perfectly inelastic instead of bouncing, and
+// at rest the force follows the operator's push. Larger n only soften it.
 // Sign convention: power into the controlled two-port is phi * dx, and the
 // device accelerates by -phi / m. At a haptic master phi is the displayed
 // force when it pushes against the positive direction; at a slave robot phi
@@ -68,15 +93,30 @@ class DevicePredictor {
   double displacement(double phi) const { return base() - c_ * phi; }
   double work(double phi) const { return phi * displacement(phi); }
 
+  // The same over n samples with phi held: D_n = hold_base(n) - n^2 c phi.
+  // hold_base(1) equals base().
+  double hold_base(int n) const;
+  double hold_compliance(int n) const { return n * n * c_; }
+  double hold_displacement(double phi, int n) const { return hold_base(n) - hold_compliance(n) * phi; }
+  double hold_work(double phi, int n) const { return phi * hold_displacement(phi, n); }
+
+  // Estimates recovered from the history: everything acting on the device
+  // except the port force (the operator's hand, gravity, friction) in N, and
+  // the velocity at the start of the coming sample times dt.
+  double external_force() const;
+  double velocity_dt() const;
+
  private:
   double c_;
   double dx1_ = 0.0, dx2_ = 0.0;      // last two realized displacements
   double phi1_ = 0.0, phi2_ = 0.0;    // forces held during them
 };
 
-// Scales `phi` towards zero so that the predicted work stays above -budget
-// (budget in J; negative values count as zero). The result's gain is the
-// fraction of the requested force that was removed, 1 - lambda.
-PcResult limit_force_predictive(double budget, double phi, const DevicePredictor& device);
+// Scales `phi` towards zero so that the predicted work over the coming
+// sample, and over `hold_samples` samples if that is larger than one, stays
+// above -budget (budget in J; negative values count as zero). The result's
+// gain is the fraction of the requested force that was removed, 1 - lambda.
+PcResult limit_force_predictive(double budget, double phi, const DevicePredictor& device,
+                                int hold_samples = 2);
 
 }  // namespace tuushin::control

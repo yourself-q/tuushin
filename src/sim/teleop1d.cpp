@@ -188,7 +188,8 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
     if (pcs) {
       const auto pc =
           cfg.predictive_pc
-              ? control::limit_force_predictive(master_port.budget(), f_reflected, master_dev)
+              ? control::limit_force_predictive(master_port.budget(), f_reflected, master_dev,
+                                                cfg.pc_hold_samples)
               : control::limit_force(master_port, f_reflected, v_meas, dt);
       f_display = pc.value;
       pc_m = pc.active;
@@ -246,7 +247,8 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
       const double want_master = -f_slave * v_c * dt;
       const auto grant = store.allocate(want_slave, want_master);
       const auto pc = cfg.predictive_pc
-                          ? control::limit_force_predictive(grant.slave, phi, slave_dev)
+                          ? control::limit_force_predictive(grant.slave, phi, slave_dev,
+                                                            cfg.pc_hold_samples)
                           : control::limit_force(grant.slave, phi, v_s, dt);
       f_ctrl = -pc.value;
       pc_s = pc.active || grant.limited;

@@ -81,13 +81,53 @@ TEST_CASE(predictive_pc_spends_exactly_the_budget) {
   pred.observe(dev.step(0.0), 0.0);
   pred.observe(dev.step(0.0), 0.0);
   const double budget = 2e-5;
-  const auto r = limit_force_predictive(budget, 6.0, pred);
+  const auto r = limit_force_predictive(budget, 6.0, pred, 1);
   CHECK(r.active);
   CHECK(r.value > 0.0 && r.value < 6.0);
   CHECK_NEAR(pred.work(r.value), -budget, 1e-15);
   CHECK_NEAR(r.gain, 1.0 - r.value / 6.0, 1e-15);
   const double realized = dev.step(r.value);
   CHECK_NEAR(r.value * realized, -budget, 1e-15);
+}
+
+TEST_CASE(predictor_recovers_external_force_and_velocity) {
+  const double m = 0.2, dt = 1e-3;
+  HeldMass dev{m, dt, 2.5};
+  dev.v = 0.03;
+  DevicePredictor pred(m, dt);
+  pred.observe(dev.step(1.0), 1.0);
+  pred.observe(dev.step(-4.0), -4.0);
+  CHECK_NEAR(pred.external_force(), 2.5, 1e-9);
+  CHECK_NEAR(pred.velocity_dt(), dev.v * dt, 1e-15);
+  CHECK_NEAR(pred.hold_base(1), pred.base(), 1e-15);
+  // Three samples with the force held.
+  const double phi = 3.0;
+  const double predicted = pred.hold_displacement(phi, 3);
+  const double realized = dev.step(phi) + dev.step(phi) + dev.step(phi);
+  CHECK_NEAR(predicted, realized, 1e-15);
+}
+
+TEST_CASE(predictive_pc_stops_the_device_instead_of_bouncing_it) {
+  // Without budget, a device running into a large force. Over one sample the
+  // affordable force would reverse it; the two-sample hold stops it.
+  const double m = 0.2, dt = 1e-3, hand = 2.0;
+  HeldMass dev{m, dt, hand};
+  dev.v = 0.01;
+  DevicePredictor pred(m, dt);
+  pred.observe(dev.step(0.0), 0.0);
+  pred.observe(dev.step(0.0), 0.0);
+  const double v0 = dev.v;
+  const auto greedy = limit_force_predictive(0.0, 20.0, pred, 1);
+  const auto held = limit_force_predictive(0.0, 20.0, pred, 2);
+  CHECK(greedy.active && held.active);
+  CHECK_NEAR(greedy.value, hand + 2.0 * m * v0 / dt, 1e-9);
+  CHECK_NEAR(held.value, hand + m * v0 / dt, 1e-9);
+  HeldMass copy = dev;
+  copy.step(greedy.value);
+  CHECK_NEAR(copy.v, -v0, 1e-12);  // bounced
+  const double dx = dev.step(held.value);
+  CHECK_NEAR(dev.v, 0.0, 1e-12);   // stopped
+  CHECK(held.value * dx > 0.0);    // and the force absorbed energy
 }
 
 TEST_CASE(predictive_pc_never_flips_the_force) {
