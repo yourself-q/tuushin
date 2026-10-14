@@ -1,0 +1,10 @@
+add_executable(tuushin_tests
+  test_main.cpp
+  test_deadband.cpp
+  test_tdpa.cpp
+  test_channel.cpp
+  test_reflection.cpp
+  test_teleop1d.cpp
+)
+target_link_libraries(tuushin_tests PRIVATE tuushin)
+add_test(NAME tuushin_tests COMMAND tuushin_tests)
