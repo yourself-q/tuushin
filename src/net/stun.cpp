@@ -180,6 +180,7 @@ std::optional<Message> Message::parse(const std::uint8_t* data, std::size_t size
       if (n != 4 || at + 8 != m.bytes_.size()) return std::nullopt;
       const std::uint32_t want = crc32(m.bytes_.data(), at) ^ kFingerprintXor;
       m.fingerprint_ok_ = get32(m.bytes_.data() + at + 4) == want;
+      m.attrs_.push_back({t, at + 4, n});
     } else if (t == attr::kMessageIntegrity) {
       if (n != kIntegritySize) return std::nullopt;
       if (!after_integrity) {

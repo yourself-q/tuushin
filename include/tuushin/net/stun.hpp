@@ -118,6 +118,8 @@ class Message {
   std::uint16_t method() const { return method_; }
   Class cls() const { return cls_; }
   const TransactionId& transaction() const { return tid_; }
+  // The message's bytes; find() points into them.
+  const std::uint8_t* data() const { return bytes_.data(); }
 
   // The first attribute of `type`, if present: its value and length.
   const std::uint8_t* find(std::uint16_t type, std::size_t* size) const;

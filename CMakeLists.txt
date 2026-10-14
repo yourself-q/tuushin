@@ -28,6 +28,7 @@ add_library(tuushin
   src/net/rendezvous.cpp
   src/net/stun.cpp
   src/net/trace.cpp
+  src/net/turn.cpp
   src/net/udp.cpp
   src/rt/thread.cpp
   src/sim/teleop1d.cpp
