@@ -56,6 +56,14 @@ struct MasterConfig {
   // Actuator limit in N, 0 for none. The controller clamps itself so that it
   // books the force the device really applies.
   double max_force = 20.0;
+  // The encoder's resolution in m, 0 for an exact encoder. With one, every
+  // new force is booked with its quantization tax, the device model becomes
+  // a Kalman filter, and the velocity sent to the slave is the filter's
+  // instead of the backward difference (control/predictive_pc.hpp).
+  // `force_rate` (N/s) is how fast the filter expects the operator's push
+  // to change.
+  double encoder_resolution = 0.0;
+  double force_rate = 20.0;
   bool deadband = false;
   codec::DeadbandParams deadband_params{0.1, 0.002, from_millis(100)};
 };
@@ -92,8 +100,10 @@ class MasterController {
   // measured.
   Step step(Nanos now, double position, Nanos cut_after = 0);
 
-  // The velocity sent with the last step (backward difference).
-  double velocity() const { return v_meas_; }
+  // The velocity sent with the last step: the backward difference of the
+  // encoder positions, or the device model's estimate with an encoder
+  // resolution set and a regular history.
+  double velocity() const { return v_sent_; }
   bool has_slave_sample() const { return has_value_; }
   // Energy books at the master device port (power into the teleoperator).
   const control::EnergyPort& port() const { return port_; }
@@ -109,6 +119,7 @@ class MasterController {
   Nanos last_now_ = 0;
   double x_sampled_ = 0.0;
   double v_meas_ = 0.0;
+  double v_sent_ = 0.0;
   double f_display_ = 0.0;
   bool has_value_ = false;
   std::uint32_t last_seq_ = 0;
@@ -134,6 +145,10 @@ struct SlaveConfig {
   bool predictive_pc = true;
   double model_mass = 1.0;  // kg
   int pc_hold_samples = 2;
+  // As in MasterConfig. The velocity the coupling damps is still the one
+  // passed to step().
+  double encoder_resolution = 0.0;  // m
+  double force_rate = 20.0;         // N/s
   bool deadband = false;
   codec::DeadbandParams deadband_params{0.1, 0.05, from_millis(100)};
   // Between samples the slave extrapolates the master position with the last
@@ -177,7 +192,7 @@ class SlaveController {
   bool has_master_sample() const { return has_value_; }
   // Net energy that entered through the slave device port, booked from the
   // realized work of the applied force (predicted, for a sample in which
-  // the watchdog cut it).
+  // the watchdog cut it), less the quantization tax.
   double terminal_net() const { return terminal_net_; }
   // kReflective: the store. kNone and kChannel: the channel end at the slave.
   const control::ReflectiveStore& store() const { return store_; }

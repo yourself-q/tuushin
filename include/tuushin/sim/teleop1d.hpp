@@ -115,6 +115,14 @@ struct Teleop1DConfig {
   // times and removes the chatter, at the price of a softer-looking wall in
   // the least-squares stiffness metric, which the chatter had inflated.
   int pc_hold_samples = 2;
+  // Encoder resolutions in m, 0 for exact encoders. The simulated devices
+  // round their readings, and their velocity becomes the backward
+  // difference of the readings. If the controllers know the resolutions
+  // their predictors filter the readings and they book the quantization tax
+  // (control/predictive_pc.hpp); if not, they treat the readings as exact.
+  double master_encoder_resolution = 0.0;
+  double slave_encoder_resolution = 0.0;
+  bool encoder_resolution_known = true;
   bool forward_deadband = false;
   codec::DeadbandParams forward_deadband_params{0.1, 0.002, from_millis(100)};
   bool backward_deadband = false;
@@ -159,10 +167,20 @@ struct Teleop1DResult {
   // can overshoot by that prediction error once before it blocks output, so
   // expect small negative values of the order of f * a * dt^2.
   double min_passivity_margin = 0.0;  // J
-  // Minimum over time of E_in(master) - E_out(slave) and of
-  // E_in(slave) - E_out(master) at the two ends of the channel, from true
-  // (undelayed) books: the per-direction condition kChannel enforces.
-  // Not computed for kReflective, whose coupling sits inside the two-port.
+  // The same from the work the actuators really did
+  // (teleop::SimulatedDevice::actuator_work), which the books only see
+  // through the encoders. With exact encoders the two agree to rounding.
+  double min_true_margin = 0.0;  // J
+  // The largest amount by which the booked margin exceeded the true one at
+  // any sample: positive means the books credited energy that never
+  // entered, which the quantization tax is there to prevent.
+  double max_book_excess = 0.0;  // J
+  // Minimum over time, in each direction, of the input one end reported to
+  // the other less the other's output beyond what it paid from its own
+  // input (control::EnergyPort::covered_energy), from true (undelayed)
+  // books: the per-direction condition kChannel enforces. The two sum to
+  // the channel's net energy. Not computed for kReflective, whose coupling
+  // sits inside the two-port.
   double min_channel_margin = 0.0;  // J
 };
 

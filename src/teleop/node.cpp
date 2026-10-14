@@ -87,7 +87,8 @@ std::uint32_t random_session() {
 }
 
 double transmitted_energy(const SlaveController& ctl, Passivity scheme) {
-  return scheme == Passivity::kReflective ? ctl.store().granted() : ctl.channel_port().input_energy();
+  return scheme == Passivity::kReflective ? ctl.store().granted()
+                                          : ctl.channel_port().reported_input_energy();
 }
 
 std::uint16_t scheme_flags(Passivity scheme) {
@@ -264,7 +265,8 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
     }
     const double net = port.input_energy() - port.output_energy();
     if (st.send || final) {
-      const Sample s = st.send ? st.sample : Sample{ctl.velocity(), x, port.input_energy()};
+      const Sample s =
+          st.send ? st.sample : Sample{ctl.velocity(), x, port.reported_input_energy()};
       link.send(now, s, net, final);
     }
 

@@ -20,12 +20,42 @@ namespace tuushin::control {
 // Input energy only grows, so a delayed, lost or reordered report can only
 // understate the peer's input energy. The check therefore stays sufficient
 // under time-varying delay and packet loss; the price is conservatism.
+//
+// Outputs beyond the peer's input. A port that books the work its device
+// actually did (account_energy) learns of an output one sample after the
+// controller allowed it, and it can exceed what the controller predicted:
+// a model error, a coarse encoder's noise, a force that was cut. The excess
+// is energy this end owes. If the port kept reporting all its input to the
+// peer, the peer would spend that input a second time, and the excess would
+// stay owed until the peer's own input covered it. In the reflective scheme
+// the peer's "input" is a grant the slave's store makes only for the work
+// it expects the reflected force to do at the master, so the debt can last
+// for seconds and the peer keeps spending: with a 55 um encoder at the
+// master a 50 ms stall left the master 8.7 mJ beyond its grants and the
+// devices 1.9 mJ in deficit a second later.
+//
+// So this port pays its own debt first. Input booked while the outputs
+// exceed the peer's input is kept back (covered_energy) instead of being
+// reported, and it counts towards this port's own budget. Then
+//
+//   E_out(this) <= E_in(peer) + covered        (this port's PC),
+//   E_out(peer) <= E_in(this) - covered        (the peer's PC),
+//
+// and the two sum to the condition for the whole channel. An output beyond
+// both is still possible for a sample (that is what a prediction error is);
+// it is paid back from the next input of either end, and never reported.
 class EnergyPort {
  public:
-  // Energy that has entered the channel through this port. Send it to the peer.
+  // Energy that has entered the channel through this port.
   double input_energy() const { return in_; }
   // Energy that has left the channel through this port.
   double output_energy() const { return out_; }
+  // Input energy that paid for this port's own outputs beyond the peer's
+  // input, and was therefore not reported.
+  double covered_energy() const { return covered_; }
+  // Input energy the peer may spend, input_energy() - covered_energy().
+  // Send it to the peer; it only grows.
+  double reported_input_energy() const { return reported_; }
 
   // Records the peer's input energy. Values that are not larger than the
   // current one (stale or reordered packets) are ignored.
@@ -36,7 +66,7 @@ class EnergyPort {
 
   // Energy that may still leave the channel here without violating passivity.
   double budget() const {
-    const double b = remote_in_ - out_;
+    const double b = remote_in_ + covered_ - out_;
     return b > 0.0 ? b : 0.0;
   }
 
@@ -53,6 +83,10 @@ class EnergyPort {
   void account_energy(double e) {
     if (e > 0.0) {
       in_ += e;
+      const double debt = out_ - remote_in_ - covered_;
+      const double paid = debt <= 0.0 ? 0.0 : e < debt ? e : debt;
+      covered_ += paid;
+      reported_ += e - paid;
     } else {
       out_ -= e;
     }
@@ -61,6 +95,8 @@ class EnergyPort {
  private:
   double in_ = 0.0;
   double out_ = 0.0;
+  double covered_ = 0.0;
+  double reported_ = 0.0;
   double remote_in_ = 0.0;
 };
 

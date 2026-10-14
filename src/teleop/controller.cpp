@@ -35,7 +35,7 @@ void observe(control::DevicePredictor& dev, double dx, double phi, double h, Nan
 MasterController::MasterController(const MasterConfig& cfg)
     : cfg_(cfg),
       dt_(to_seconds(cfg.dt)),
-      dev_(cfg.model_mass, dt_),
+      dev_(cfg.model_mass, dt_, cfg.encoder_resolution, cfg.force_rate),
       enc_(cfg.deadband_params) {}
 
 void MasterController::receive(std::uint32_t seq, const Sample& s) {
@@ -73,15 +73,25 @@ MasterController::Step MasterController::step(Nanos now, double position, Nanos 
   } else {
     out.display_force = f_reflected;
   }
-  // Saturation keeps the sign, so it can only reduce the energy leaving.
+  // Saturation keeps the sign, so it can only reduce the energy leaving
+  // (and the tax).
   if (cfg_.max_force > 0.0) {
     out.display_force = std::clamp(out.display_force, -cfg_.max_force, cfg_.max_force);
   }
+  if (cfg_.encoder_resolution > 0.0) {
+    port_.account_energy(-control::quantization_tax(cfg_.encoder_resolution, dev_.held_force(),
+                                                    out.display_force));
+  }
   f_display_ = out.display_force;
 
-  out.send = cfg_.deadband ? enc_.update(Vec1{{v_meas_}}, now) : true;
+  // A coarse encoder's backward difference is mostly quantization noise
+  // (q / dt: 5.5 cm/s for 55 um at 1 kHz), which the slave's damping would
+  // turn into force noise; the filter's estimate is sent instead once it
+  // has a regular history.
+  v_sent_ = cfg_.encoder_resolution > 0.0 && dev_.ready() ? dev_.velocity_dt() / dt_ : v_meas_;
+  out.send = cfg_.deadband ? enc_.update(Vec1{{v_sent_}}, now) : true;
   if (out.send) {
-    out.sample = Sample{v_meas_, position, port_.input_energy()};
+    out.sample = Sample{v_sent_, position, port_.reported_input_energy()};
     ++sent_;
   }
   return out;
@@ -91,7 +101,7 @@ SlaveController::SlaveController(const SlaveConfig& cfg, double position)
     : cfg_(cfg),
       dt_(to_seconds(cfg.dt)),
       store_(cfg.initial_energy),
-      dev_(cfg.model_mass, dt_),
+      dev_(cfg.model_mass, dt_, cfg.encoder_resolution, cfg.force_rate),
       enc_(cfg.deadband_params),
       x_sampled_(position),
       x_cmd_(position),
@@ -158,9 +168,12 @@ SlaveController::Step SlaveController::step(Nanos now, double position, double v
     // slave pushing against the coupling: phi = -f.
     const double phi = -f_coupling;
     // A predictor that is not ready lets no force through (see step()), so
-    // nothing will leave towards the slave.
+    // nothing will leave towards the slave. The predictive PC also pays the
+    // force's quantization tax from its grant.
+    const double tax =
+        control::quantization_tax(cfg_.encoder_resolution, dev_.held_force(), phi);
     const double want_slave = !cfg_.predictive_pc ? f_coupling * velocity * dt_
-                              : dev_.ready()      ? -dev_.work(phi)
+                              : dev_.ready()      ? tax - dev_.work(phi)
                                                   : 0.0;
     const double want_master = -f_slave_ * v_c_ * dt_;
     const auto grant = store_.allocate(want_slave, want_master);
@@ -196,13 +209,19 @@ SlaveController::Step SlaveController::step(Nanos now, double position, double v
     f_ctrl_ = f_coupling;
     x_cmd_ += v_c_ * dt_;
   }
+  if (cfg_.encoder_resolution > 0.0) {
+    const double tax =
+        control::quantization_tax(cfg_.encoder_resolution, dev_.held_force(), -f_ctrl_);
+    terminal_net_ -= tax;
+    if (cfg_.passivity == Passivity::kReflective) store_.account_slave_energy(-tax);
+  }
   x_master_est_ += v_received * dt_;
   out.force = f_ctrl_;
 
   out.send = cfg_.deadband ? enc_.update(Vec1{{f_slave_}}, now) : true;
   if (out.send) {
     const double energy = cfg_.passivity == Passivity::kReflective ? store_.granted()
-                                                                   : port_.input_energy();
+                                                                   : port_.reported_input_energy();
     out.sample = Sample{f_slave_, 0.0, energy};
     ++sent_;
   }

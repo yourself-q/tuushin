@@ -104,13 +104,63 @@ namespace tuushin::control {
 // count as irregular too: on a real encoder dx_1 / h_1 amplifies the
 // quantization by dt / h_1.
 //
+// Encoder quantization. Everything above takes the encoder to be exact. A
+// real one reads the position to a resolution q (about 55 um on a
+// 3D Systems Touch, 10 um on a Force Dimension omega), and that breaks two
+// things.
+//
+//  * The books. Work booked from readings y = x + e, phi_k (y_{k+1} - y_k),
+//    differs from the work done, phi_k (x_{k+1} - x_k), by phi_k times the
+//    change of the reading error e. Summed by parts the difference is
+//    sum_k e_k (phi_{k-1} - phi_k) plus the end terms: every change of the
+//    force is booked against a position error of up to q/2, and nothing
+//    makes those errors cancel. A force that chatters between 0 and 10 N
+//    while the reading dithers between two counts draws energy the books
+//    show as entering. quantization_tax() bounds the term sample by sample,
+//    and the controllers book it as an output, which makes their books a
+//    lower bound on the true work for any reading error confined to an
+//    interval of width q (rounding, truncation, a constant offset). The
+//    tax charges only increases of |phi| (and the whole force when its sign
+//    flips), so a force that rises once and is held pays q |phi| once.
+//    J. J. Abbott and A. M. Okamura, "Effects of position quantization and
+//    sampling rate on virtual-wall passivity", IEEE T-RO 21(5), 2005, and
+//    N. Diolaiti et al., "Stability of haptic rendering: discretization,
+//    quantization, time delay, and Coulomb effects", IEEE T-RO 22(2), 2006,
+//    show the same mechanism for virtual walls: quantization alone can make
+//    a sampled wall non-passive.
+//  * The prediction. The recursion above differentiates the readings twice:
+//    one count in dx_1 moves the estimate of H by up to 2 m q / dt^2, which
+//    is 22 N for a 0.2 kg device with a 55 um encoder at 1 kHz. With a
+//    resolution given, the predictor estimates v and H with a Kalman filter
+//    on the same model instead, as P. R. Belanger et al., "Estimation of
+//    angular velocity and acceleration from shaft-encoder measurements",
+//    IJRR 17(11), 1998, do for encoders: the state is the position, the
+//    velocity and H; the reading error is taken as uniform over a count
+//    (variance q^2 / 12), and H as a random walk whose change over a sample
+//    has standard deviation force_rate * dt. The predicted displacement is
+//    still that of the device, not of its readings; the difference between
+//    the two is what the tax pays for. Smoother estimates also mean fewer
+//    and smaller force changes, and so a smaller tax.
+//
+// Measured in the 1-DoF simulator (reflective scheme, 55 um master and 1 um
+// slave encoders, 20 s over nine hand motions): with the filter, the tax and
+// the ports paying their own excess first (control/tdpa.hpp), the actuators
+// never generate energy at 10, 50 or 100 ms each way. Controllers that take
+// the readings as exact let the teleoperator generate up to 0.5 mJ, 0.8 J
+// and 1.1 J. The price is transparency: on the default motion at 50 ms the
+// displayed stiffness falls from 202 N/m with exact encoders to 88 N/m.
+//
 // Sign convention: power into the controlled two-port is phi * dx, and the
 // device accelerates by -phi / m. At a haptic master phi is the displayed
 // force when it pushes against the positive direction; at a slave robot phi
 // is minus the force the controller applies.
 class DevicePredictor {
  public:
-  DevicePredictor(double mass, double dt);
+  // `resolution` is the encoder's resolution in m, 0 for an exact encoder
+  // (the three-point recursion). `force_rate` is how fast the forces other
+  // than the port force are expected to change, in N/s; it only matters
+  // with a resolution, as the random walk of the Kalman filter's H.
+  DevicePredictor(double mass, double dt, double resolution = 0.0, double force_rate = 20.0);
 
   // Call once per sample with the displacement realized over the last sample,
   // the port force that was held throughout it, and its length h in seconds
@@ -123,6 +173,12 @@ class DevicePredictor {
   // True when the last two samples were regular. A new predictor is ready:
   // its history is that of a device at rest.
   bool ready() const { return regular_ >= 2; }
+
+  double resolution() const { return q_; }
+  // The port force held at the end of the last sample: the force observed
+  // with it, or 0 after observe_irregular(), whose force was cut. The
+  // quantization tax of the next force is measured from it.
+  double held_force() const { return held_; }
 
   // Coefficients of the predicted displacement dx = base() - compliance() * phi.
   double base() const;
@@ -140,28 +196,52 @@ class DevicePredictor {
   }
   double hold_work(double phi, double n) const { return phi * hold_displacement(phi, n); }
 
-  // Estimates recovered from the history: everything acting on the device
-  // except the port force (the operator's hand, gravity, friction) in N, and
-  // the velocity at the start of the coming sample times dt.
+  // Estimates recovered from the history (or the Kalman filter, with a
+  // resolution): everything acting on the device except the port force (the
+  // operator's hand, gravity, friction) in N, and the velocity at the start
+  // of the coming sample times dt.
   double external_force() const;
   double velocity_dt() const;
 
  private:
   void push(double dx, double phi_held, double r, bool regular);
+  void filter(double dx, double phi_held, double r, bool regular);
 
   double dt_;
+  double mass_;
   double c_;
   double dx1_ = 0.0, dx2_ = 0.0;      // last two realized displacements
   double phi1_ = 0.0, phi2_ = 0.0;    // forces held during them
   double r1_ = 1.0, r2_ = 1.0;        // their lengths in units of dt
   int regular_ = 2;                   // regular samples since an irregular one, up to 2
+  double held_ = 0.0;
+  // Kalman filter, used when q_ > 0. The position is kept relative to the
+  // last reading (e_ = estimate - reading), so that it never grows large.
+  double q_;
+  double noise_;     // variance of a reading, q^2 / 12
+  double h_walk_;    // variance of the change of H over a nominal sample
+  double e_ = 0.0, v_ = 0.0, h_ = 0.0;
+  double p_[3][3] = {};
 };
+
+// Energy (J) to book as an output when the port force goes from `prev`, the
+// force held until now, to `phi`, on an encoder of resolution `q` (m):
+// q * (|phi| - |prev|) when the force grows in the same direction, q * |phi|
+// when it changes sign or starts from zero, and 0 when it shrinks. Booked
+// for every new force, it bounds the work the readings misattribute (see
+// DevicePredictor): with phi_{-1} = 0 the sum over samples 0..N-1 is
+// (q / 2) (sum_k |phi_k - phi_{k-1}| + |phi_{N-1}|), the largest
+// |sum_k phi_k (e_{k+1} - e_k)| can be when every reading error lies in one
+// interval of width q.
+double quantization_tax(double q, double prev, double phi);
 
 // Scales `phi` towards zero so that the predicted work over the coming
 // sample, and over `hold_samples` samples if that is larger than one, stays
-// above -budget (budget in J; negative values count as zero). The result's
-// gain is the fraction of the requested force that was removed, 1 - lambda.
-// While the device is not ready() the result is zero force.
+// above -budget (budget in J; negative values count as zero). With an
+// encoder resolution the quantization tax of moving from the held force to
+// the result counts against the budget as well. The result's gain is the
+// fraction of the requested force that was removed, 1 - lambda. While the
+// device is not ready() the result is zero force.
 PcResult limit_force_predictive(double budget, double phi, const DevicePredictor& device,
                                 int hold_samples = 2);
 

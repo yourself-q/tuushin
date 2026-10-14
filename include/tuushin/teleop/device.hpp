@@ -64,7 +64,9 @@ struct WallParams {
 class SimulatedDevice : public Device1D {
  public:
   double read_position(Nanos now) override;
-  double velocity() const override { return v_; }
+  // The velocity at the last read, or with an encoder resolution the
+  // backward difference of the readings, as device drivers report it.
+  double velocity() const override { return q_ > 0.0 ? v_read_ : v_; }
   void command_force(double f) override {
     f_ = f;
     command_time_ = t_;
@@ -72,7 +74,14 @@ class SimulatedDevice : public Device1D {
   }
   Nanos force_cut_after() const override { return cut_after_; }
 
+  // Rounds the readings to multiples of `q` (m), as an encoder with that
+  // resolution does; 0 (the default) reads the exact position.
+  void set_encoder_resolution(double q);
+  double encoder_resolution() const { return q_; }
+
+  // The physical state, whatever the encoder reads.
   double position() const { return x_; }
+  double true_velocity() const { return v_; }
   // The force the actuator applies now: the last command, or 0 once the
   // watchdog has cut it.
   double force() const { return f_; }
@@ -112,6 +121,11 @@ class SimulatedDevice : public Device1D {
   Nanos watchdog_ = 0;
   Nanos cut_after_ = 0;
   double work_ = 0.0;
+  double q_ = 0.0;
+  bool have_read_ = false;
+  double y_ = 0.0;       // last reading
+  Nanos y_time_ = 0;     // and when it was taken
+  double v_read_ = 0.0;  // backward difference of the readings
 };
 
 // A desktop haptic device held by a simulated operator.

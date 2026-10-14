@@ -38,10 +38,18 @@ Nanos run_time(const std::vector<Stall>& stalls, Nanos due, Nanos last) {
   return t;
 }
 
+// Encoder resolutions (m) of the two devices; 0 reads exactly. `told`
+// says whether the controllers know them.
+struct Encoders {
+  double master = 0.0, slave = 0.0;
+  bool told = true;
+};
+
 // The setup of tests/test_teleop_node.cpp: reflective scheme, 1 kHz, 5 ms
 // each way, the slave holding after 150 ms without samples.
 Margins run(Nanos watchdog, const std::vector<Stall>& master_stalls,
-            const std::vector<Stall>& slave_stalls, Nanos duration = 3 * kNanosPerSecond) {
+            const std::vector<Stall>& slave_stalls, Nanos duration = 3 * kNanosPerSecond,
+            Encoders enc = {}) {
   struct Msg {
     Nanos arrive;
     std::uint32_t seq;
@@ -52,13 +60,17 @@ Margins run(Nanos watchdog, const std::vector<Stall>& master_stalls,
   SimulatedSlave sd(1.0, 2.0, WallParams{}, dt, 10, 0, 0.0);
   md.set_watchdog(watchdog);
   sd.set_watchdog(watchdog);
+  md.set_encoder_resolution(enc.master);
+  sd.set_encoder_resolution(enc.slave);
   MasterConfig mc;
   mc.dt = dt;
+  mc.encoder_resolution = enc.told ? enc.master : 0.0;
   SlaveConfig sc;
   sc.dt = dt;
   sc.hold_after = 150 * kNanosPerMilli;
+  sc.encoder_resolution = enc.told ? enc.slave : 0.0;
   MasterController m(mc);
-  SlaveController s(sc, sd.position());
+  SlaveController s(sc, sd.read_position(0));
   std::deque<Msg> to_slave, to_master;
   Ticker tm(dt, 0), ts(dt, 0);
   Nanos last_m = -dt, last_s = -dt;
@@ -109,11 +121,13 @@ Margins run(Nanos watchdog, const std::vector<Stall>& master_stalls,
 
 // Worst margins over stalls of `len` starting at 40 phases of the motion,
 // at the master, the slave or both.
-Margins worst_single_stalls(Nanos watchdog, Nanos len, bool master, bool slave) {
+Margins worst_single_stalls(Nanos watchdog, Nanos len, bool master, bool slave,
+                            Encoders enc = {}) {
   Margins w;
   for (int k = 0; k < 40; ++k) {
     const std::vector<Stall> st{{300 * kNanosPerMilli + k * 50 * kNanosPerMilli + 137'000, len}};
-    const auto r = run(watchdog, master ? st : std::vector<Stall>{}, slave ? st : std::vector<Stall>{});
+    const auto r = run(watchdog, master ? st : std::vector<Stall>{},
+                       slave ? st : std::vector<Stall>{}, 3 * kNanosPerSecond, enc);
     w.books = std::min(w.books, r.books);
     w.physical = std::min(w.physical, r.physical);
     w.cuts += r.cuts;
@@ -164,5 +178,35 @@ TEST_CASE(stalled_loops_generate_energy_without_a_watchdog) {
   // millijoules.
   const auto w = worst_single_stalls(0, 50 * kNanosPerMilli, true, false);
   CHECK(w.cuts == 0);
+  CHECK(w.physical < -1e-3);
+}
+
+TEST_CASE(stalled_loops_stay_passive_with_coarse_encoders) {
+  // The same stalls on a 55 um master encoder and a 1 um slave encoder, which
+  // the controllers know: the filter restarts after an irregular sample like
+  // the three-point model, and each rise of a port force pays the
+  // quantization tax. Physically nothing is generated. The books stay at a
+  // few millijoules below zero because the tax is the worst case of the
+  // misattributed work: a master pressing an almost still handle into the
+  // wall pays it on every rise of the force the filter's velocity noise
+  // allows, while the input it predicted mostly never comes.
+  const Nanos wd = 2 * kNanosPerMilli;
+  const Encoders enc{55e-6, 1e-6};
+  for (const Nanos len : {12 * kNanosPerMilli, 50 * kNanosPerMilli, 100 * kNanosPerMilli}) {
+    for (int who = 0; who < 3; ++who) {
+      const auto w = worst_single_stalls(wd, len, who != 1, who != 0, enc);
+      CHECK(w.cuts > 0);
+      CHECK(w.physical > -1e-6);
+      CHECK(w.books > -1e-2);
+    }
+  }
+}
+
+TEST_CASE(stalled_loops_generate_energy_on_coarse_encoders_they_do_not_know) {
+  // Why the controllers must know the resolution: credited with the work
+  // that quantization misattributes, the master spends energy that never
+  // entered, and the teleoperator generates some after 50 ms master stalls.
+  const Encoders enc{55e-6, 1e-6, false};
+  const auto w = worst_single_stalls(2 * kNanosPerMilli, 50 * kNanosPerMilli, true, false, enc);
   CHECK(w.physical < -1e-3);
 }

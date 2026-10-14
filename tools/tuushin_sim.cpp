@@ -51,6 +51,9 @@ void usage() {
                "  --constant-velocity-pc  PCs assume constant velocity over a sample\n"
                "  --model-mass M        master mass the PC believes in kg (true mass)\n"
                "  --pc-hold N           samples a PC force must stay affordable if held (2)\n"
+               "  --master-encoder Q    master encoder resolution in m (0 = exact)\n"
+               "  --slave-encoder Q     slave encoder resolution in m (0 = exact)\n"
+               "  --encoders-unknown    controllers treat the encoder readings as exact\n"
                "  --initial-energy E    reflect: energy in the store at start in J (0)\n"
                "  --deadband K          perceptual deadband with Weber fraction K, both ways\n"
                "  --wall-k K            wall stiffness in N/m (5000)\n"
@@ -95,6 +98,9 @@ Options parse(int argc, char** argv) {
     else if (a == "--constant-velocity-pc") o.cfg.predictive_pc = false;
     else if (a == "--model-mass") o.cfg.master_model_mass = std::stod(next());
     else if (a == "--pc-hold") o.cfg.pc_hold_samples = std::stoi(next());
+    else if (a == "--master-encoder") o.cfg.master_encoder_resolution = std::stod(next());
+    else if (a == "--slave-encoder") o.cfg.slave_encoder_resolution = std::stod(next());
+    else if (a == "--encoders-unknown") o.cfg.encoder_resolution_known = false;
     else if (a == "--initial-energy") o.cfg.initial_energy = std::stod(next());
     else if (a == "--passivity") {
       const std::string p = next();
@@ -153,6 +159,8 @@ void print_result(const sim::Teleop1DResult& r) {
   if (r.diverged) std::printf(" (at %.3f s)", r.diverged_at);
   std::printf("\n");
   std::printf("min_passivity_margin   %.6g J\n", r.min_passivity_margin);
+  std::printf("min_true_margin        %.6g J\n", r.min_true_margin);
+  std::printf("max_book_excess        %.6g J\n", r.max_book_excess);
   std::printf("min_channel_margin     %.6g J\n", r.min_channel_margin);
   std::printf("max_master_pos         %.4f m\n", r.max_master_pos);
   std::printf("max_display_force      %.3f N\n", r.max_display_force);
@@ -179,14 +187,15 @@ int main(int argc, char** argv) {
       print_result(sim::run_teleop1d(o.cfg, *fwd, *bwd));
       return 0;
     }
-    std::printf("one_way_ms,diverged,min_margin_J,max_force_N,displayed_k_Npm,pos_rmse_m,"
-                "drift_m,force_rmse_N,fwd_rate,bwd_rate,pc_m,pc_s\n");
+    std::printf("one_way_ms,diverged,min_margin_J,min_true_margin_J,max_force_N,"
+                "displayed_k_Npm,pos_rmse_m,drift_m,force_rmse_N,fwd_rate,bwd_rate,pc_m,pc_s\n");
     for (const double d : o.sweep) {
       auto fwd = make_channel(o, d, o.trace_fwd, o.seed);
       auto bwd = make_channel(o, d, o.trace_bwd, o.seed + 1);
       const auto r = sim::run_teleop1d(o.cfg, *fwd, *bwd);
-      std::printf("%g,%d,%.4g,%.3f,%.1f,%.5f,%.5f,%.3f,%.1f,%.1f,%.4f,%.4f\n", d,
-                  r.diverged ? 1 : 0, r.min_passivity_margin, r.max_display_force,
+      std::printf("%g,%d,%.4g,%.4g,%.3f,%.1f,%.5f,%.5f,%.3f,%.1f,%.1f,%.4f,%.4f\n", d,
+                  r.diverged ? 1 : 0, r.min_passivity_margin, r.min_true_margin,
+                  r.max_display_force,
                   r.displayed_stiffness, r.pos_rmse, r.final_drift, r.force_rmse,
                   r.forward_packet_rate, r.backward_packet_rate, r.master_pc_active,
                   r.slave_pc_active);

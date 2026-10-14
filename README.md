@@ -100,12 +100,19 @@ series give about 1430 N/m.
 | one-way delay | no passivity control: margin | conventional TDPA: stiffness / margin | TDPA with energy reflection: stiffness / margin |
 |---|---|---|---|
 | 0 ms | 0 J | 1318 N/m / 0 J | 1470 N/m / 0 J |
-| 5 ms | −19 J | 501 / −1.3e−4 J | 1358 / 0 J |
-| 10 ms | −66 J | 112 / −1.2e−3 J | 1133 / 0 J |
-| 25 ms | −410 J | 43 / −0.051 J | 438 / −3.9e−5 J |
-| 50 ms | −140 J | 43 / −0.19 J | 202 / −3.7e−5 J |
-| 100 ms | −461 J | 53 / −0.19 J | 110 / −8.9e−5 J |
-| 200 ms | −322 J | 84 / −0.17 J | 90 / −1.8e−4 J |
+| 5 ms | −19 J | 256–508 / −1.3e−4–0 J | 1358 / 0 J |
+| 10 ms | −66 J | 97–107 / −1.2e−3 J | 1129 / 0 J |
+| 25 ms | −410 J | 38–87 / −0.055–−0.044 J | 438 / −3.9e−5 J |
+| 50 ms | −140 J | 53–106 / −0.24–−0.13 J | 202 / −3.7e−5 J |
+| 100 ms | −461 J | 75–78 / −0.17 J | 99–102 / −6.4e−5 J |
+| 200 ms | −322 J | 77 / −0.16 J | 87 / −9.3e−5 J |
+
+The ranges are over twelve runs whose hand motion differs by one part in
+10^12. The conventional scheme's numbers are chaotic: every sample its PC
+cuts changes the command the slave integrates, so a rounding difference
+grows into a different trajectory (at 50 ms the final position drift lands
+anywhere between −4 and 14 mm). With energy reflection the PCs only scale
+forces and the same runs agree to the digits shown.
 
 Without passivity control the loop generates hundreds of joules and runs
 into the force limit from 5 ms on. The conventional TDPA keeps each channel
@@ -169,7 +176,7 @@ the master, the slave or both:
 
 | | 25 ms stall | 50 ms | 100 ms | random stalls at both ends |
 |---|---|---|---|---|
-| no watchdog | 0 J | −0.019 J | −0.025 J | −0.019 J |
+| no watchdog | −8e−6 J | −0.019 J | −0.025 J | −0.006 J |
 | watchdog, two periods | −5e−5 J | −6e−5 J | −4e−5 J | 0 J |
 
 Random stalls: 30 per second at each end, 0.2 to 12 ms long, 200 runs; with
@@ -180,6 +187,50 @@ setup of the test `nodes_run_a_session_over_loopback`), 2 of 48 sessions
 without the watchdog fell below −1 mJ (the worst to −6 mJ); with it the
 worst of 48 sessions was −1e−5 J, and of 60 under 24 busy processes
 −2e−5 J.
+
+### Coarse encoders
+
+Everything above reads the device positions exactly. A real encoder rounds
+them, to about 55 µm on a 3D Systems Touch, and that breaks the books: work
+booked from readings is off by every change of the force times a position
+error of up to half a count, and nothing makes those errors cancel. Abbott
+and Okamura (IEEE T-RO 2005) show the same mechanism making a sampled
+virtual wall non-passive. Told the resolution, the controllers
+
+- estimate the device's velocity and the other forces on it with a Kalman
+  filter on the readings instead of differencing them twice, which turns
+  one count into 22 N of apparent force on a 0.2 kg device at 1 kHz;
+- book the worst case of the misattributed work as an output, a *tax* of
+  q |Δφ| on every rise of the port force, which makes the books a lower
+  bound on the true work for any reading error within one count.
+
+And every port pays its own excess first: when its output has run past
+what the other end granted, its next input covers that before any of it is
+reported to the other end, which would otherwise spend it a second time.
+
+Reflective scheme, 55 µm master and 1 µm slave encoders, 20 s over nine
+hand motions (0.4 to 0.6 Hz, 3 to 5 cm; `tests/test_teleop1d.cpp` checks
+four of them, `tuushin-sim --master-encoder 55e-6 --slave-encoder 1e-6`
+runs the default one):
+
+| one-way delay | worst true margin: resolution known | not known | exact encoders | force displayed: known | exact encoders |
+|---|---|---|---|---|---|
+| 10 ms | 0 J | −4.8e−4 J | 0 J | 32 % | 77 % |
+| 50 ms | 0 J | −0.79 J | −1.4e−4 J | 12 % | 29 % |
+| 100 ms | 0 J | −1.14 J | −1.3e−4 J | 4 % | 13 % |
+
+*True margin* is minus the work the actuators really did, which the books
+see only through the encoders. *Force displayed* is the force on the master
+in contact as a share of the contact force one delay earlier.
+
+Treating the readings as exact, the predictor differentiates quantization
+noise and the teleoperator generates up to a joule. Knowing the
+resolution, it generates nothing, also under the loop stalls above
+(`tests/test_teleop_stall.cpp`). The price is transparency: less than half
+the force reaches the operator, on the default motion at 50 ms the
+displayed stiffness falls from 202 N/m with exact encoders to 88 N/m, and
+the books, which pay the worst case of every rise of the force, end a few
+millijoules below the true margin.
 
 ## Authentication
 
@@ -236,6 +287,12 @@ traffic.
   hello can be answered once more afterwards (still without starting a
   session). A master whose wall clock is set back is refused until it
   passes the newest time the slave has seen.
+- **Coarse encoders cost transparency.** With a 55 µm master encoder the
+  teleoperator stays passive, but at 50 ms less than half the force reaches
+  the operator (Coarse encoders above). The tax is the worst case, and a
+  master pressing an almost still handle into the wall pays it on every
+  rise of the force that the filter's velocity noise allows, while the
+  input it predicted mostly never comes.
 - **Simulated devices only, one degree of freedom.** `teleop::Device1D` is
   the interface a real device will implement.
 - **The slave needs a reachable UDP port.** A master behind a NAT works (the

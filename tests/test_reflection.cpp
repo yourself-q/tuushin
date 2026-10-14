@@ -1,9 +1,16 @@
+#include <algorithm>
+#include <cmath>
+#include <vector>
+
 #include "test.hpp"
 #include "tuushin/control/predictive_pc.hpp"
 #include "tuushin/control/reflection.hpp"
+#include "tuushin/rng.hpp"
 
+using tuushin::Rng;
 using tuushin::control::DevicePredictor;
 using tuushin::control::limit_force_predictive;
+using tuushin::control::quantization_tax;
 using tuushin::control::ReflectiveStore;
 
 namespace {
@@ -208,6 +215,132 @@ TEST_CASE(predictive_pc_never_flips_the_force) {
   const auto neg = limit_force_predictive(-1.0, -3.0, pred);  // negative budget = 0
   CHECK(neg.value <= 0.0 && neg.value >= -3.0);
   CHECK(pred.work(neg.value) >= -1e-18);
+}
+
+TEST_CASE(quantization_tax_charges_each_rise_of_the_force_once) {
+  const double q = 55e-6;
+  CHECK_NEAR(quantization_tax(q, 0.0, 5.0), 5.0 * q, 1e-18);   // from zero
+  CHECK_NEAR(quantization_tax(q, 5.0, 5.0), 0.0, 0.0);         // held
+  CHECK_NEAR(quantization_tax(q, 5.0, 3.0), 0.0, 0.0);         // shrinking
+  CHECK_NEAR(quantization_tax(q, -3.0, -5.0), 2.0 * q, 1e-18); // growing
+  CHECK_NEAR(quantization_tax(q, 5.0, -2.0), 2.0 * q, 1e-18);  // sign flip
+  CHECK_NEAR(quantization_tax(0.0, 0.0, 5.0), 0.0, 0.0);       // exact encoder
+}
+
+// The tax summed over a force history is (q/2) (sum |phi_k - phi_{k-1}| +
+// |phi_last|), and that is exactly the most the readings can misattribute:
+// the work booked from readings y = x + e exceeds the work done by
+// sum_k phi_k (e_{k+1} - e_k), which, for errors in an interval of width q,
+// an adversary can push to the tax and no further.
+TEST_CASE(quantization_tax_is_the_worst_misattributed_work) {
+  Rng rng(3);
+  const double q = 55e-6;
+  for (int trial = 0; trial < 200; ++trial) {
+    // Forces that ramp, hold, chatter and change sign.
+    std::vector<double> phi(400);
+    double f = 0.0;
+    for (auto& p : phi) {
+      const double u = rng.uniform();
+      if (u < 0.3) f += rng.normal() * 2.0;
+      else if (u < 0.5) f = -f;
+      else if (u < 0.6) f = 0.0;
+      p = f;
+    }
+    double tax = 0.0, variation = 0.0, prev = 0.0;
+    for (double p : phi) {
+      tax += quantization_tax(q, prev, p);
+      variation += std::fabs(p - prev);
+      prev = p;
+    }
+    CHECK_NEAR(tax, 0.5 * q * (variation + std::fabs(phi.back())), 1e-12 * (1.0 + tax));
+    // Reading errors e_0..e_N in [c, c + q]: random, and the adversary's,
+    // which sits at the top of the interval wherever the force drops.
+    const double c = (rng.uniform() - 1.0) * q;
+    const auto misattributed = [&](bool adversarial) {
+      double m = 0.0, e = 0.0;
+      for (std::size_t k = 0; k <= phi.size(); ++k) {
+        const double before = k == 0 ? 0.0 : phi[k - 1];
+        const double after = k == phi.size() ? 0.0 : phi[k];
+        const double ek = c + (adversarial ? (before > after ? q : 0.0) : q * rng.uniform());
+        if (k > 0) m += before * (ek - e);
+        e = ek;
+      }
+      return m;
+    };
+    CHECK(misattributed(false) <= tax + 1e-12);
+    CHECK_NEAR(misattributed(true), tax, 1e-12 * (1.0 + tax));
+  }
+}
+
+TEST_CASE(predictive_pc_pays_the_quantization_tax_from_the_budget) {
+  // A device moving into the force at 2 cm/s: 20 um per sample, less than a
+  // 55 um count. The 4 N it is asked for slows it without stopping it, so
+  // the force absorbs 0.04 mJ and an exact encoder's PC passes it in full.
+  // With the coarse encoder the rise costs q * 4 N = 0.22 mJ, which no
+  // displacement under a count can pay.
+  const double m = 0.2, dt = 1e-3, q = 55e-6;
+  HeldMass dev{m, dt, 0.0};
+  dev.v = 0.02;
+  DevicePredictor exact(m, dt), coarse(m, dt, q);
+  for (int k = 0; k < 3; ++k) {
+    const double dx = dev.step(0.0);
+    exact.observe(dx, 0.0);
+    coarse.observe(dx, 0.0);
+  }
+  CHECK(exact.work(4.0) > 0.0);
+  CHECK(!limit_force_predictive(0.0, 4.0, exact, 1).active);
+  const auto blocked = limit_force_predictive(0.0, 4.0, coarse, 1);
+  CHECK(blocked.active);
+  CHECK(quantization_tax(q, 0.0, blocked.value) - coarse.work(blocked.value) <= 1e-15);
+  // With a budget the PC spends exactly it, tax included.
+  const double budget = 1e-4;
+  const auto r = limit_force_predictive(budget, 4.0, coarse, 1);
+  CHECK(r.active && r.value > 0.0 && r.value < 4.0);
+  CHECK_NEAR(quantization_tax(q, 0.0, r.value) - coarse.work(r.value), budget, 1e-15);
+}
+
+// Property: whatever the device state, the held force, the request and the
+// budget, the PC's force costs at most the budget over every horizon it
+// checks, tax included, and any larger force of the same sign would not.
+TEST_CASE(predictive_pc_force_is_the_largest_affordable_with_the_tax) {
+  Rng rng(11);
+  const double dt = 1e-3;
+  for (int trial = 0; trial < 20000; ++trial) {
+    const double m = 0.05 + rng.uniform();
+    const double q = rng.bernoulli(0.2) ? 0.0 : rng.uniform() * 1e-4;
+    HeldMass dev{m, dt, rng.normal() * 3.0};
+    dev.v = rng.normal() * 0.05;
+    DevicePredictor pred(m, dt, q);
+    double held = 0.0;
+    for (int k = 0; k < 4; ++k) {
+      held = rng.bernoulli(0.3) ? 0.0 : rng.normal() * 5.0;
+      const double dx = dev.step(held);
+      pred.observe(q > 0.0 ? std::round(dev.x / q) * q - std::round((dev.x - dx) / q) * q : dx,
+                   held);
+    }
+    const double phi = rng.normal() * 8.0;
+    const double budget = rng.bernoulli(0.3) ? 0.0 : rng.exponential(5e-4);
+    const int hold = rng.bernoulli(0.5) ? 1 : 2;
+    const auto r = limit_force_predictive(budget, phi, pred, hold);
+    const auto cost = [&](double f) {
+      double worst = quantization_tax(q, held, f) - pred.work(f);
+      if (hold > 1) worst = std::max(worst, quantization_tax(q, held, f) - pred.hold_work(f, hold));
+      return worst;
+    };
+    const bool sign_ok = r.value * phi >= 0.0 && std::fabs(r.value) <= std::fabs(phi);
+    const double scale = 1e-12 + 1e-9 * std::fabs(phi) * (q + 1e-4);
+    const bool affordable = r.value == phi ? true : cost(r.value) <= budget + scale;
+    const double bigger = r.value + 1e-6 * phi;
+    const bool largest = !r.active || r.value == phi || cost(bigger) > budget - scale;
+    if (!sign_ok || !affordable || !largest) {
+      CHECK(sign_ok);
+      CHECK(affordable);
+      CHECK(largest);
+      std::printf("trial %d m %g q %g held %g phi %g budget %g hold %d -> %g\n", trial, m, q,
+                  held, phi, budget, hold, r.value);
+      return;
+    }
+  }
 }
 
 TEST_CASE(reflective_store_grants_in_full_when_covered) {

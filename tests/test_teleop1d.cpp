@@ -1,4 +1,5 @@
 #include <cmath>
+#include <iterator>
 #include <memory>
 
 #include "test.hpp"
@@ -57,8 +58,15 @@ TEST_CASE(teleop_channel_tdpa_keeps_the_channel_passive) {
   CHECK(r.max_master_pos < 0.1);
   CHECK(r.max_display_force < 20.0);
   // The conventional scheme changes the velocity command, so the slave
-  // drifts away from the master by several millimetres.
-  CHECK(std::fabs(r.final_drift) > 0.002);
+  // drifts away from the master by several millimetres. Where it ends up
+  // depends on every sample the PC cut and is chaotic: at 50 ms a change of
+  // one part in 10^12 in the hand's motion moves it between -4 and 14 mm,
+  // so a single run can land near zero; the mean over several delays does
+  // not.
+  double drift = 0.0;
+  const int delays[] = {20, 50, 80, 100, 150};
+  for (int ms : delays) drift += std::fabs(run(cfg, from_millis(ms)).final_drift);
+  CHECK(drift / std::size(delays) > 0.003);
 }
 
 TEST_CASE(teleop_reflective_tdpa_is_passive_at_the_device_ports) {
@@ -128,4 +136,37 @@ TEST_CASE(teleop_deadband_cuts_packet_rate) {
   // E. Steinbach, "Energy prediction for teleoperation systems that combine
   // the time domain passivity approach with perceptual deadband-based haptic
   // data reduction", IEEE Trans. Haptics 9(4), 2016, address this.
+}
+
+TEST_CASE(teleop_reflective_tdpa_stays_passive_on_coarse_encoders) {
+  // A 55 um master encoder (3D Systems Touch) and a 1 um slave encoder. With
+  // the resolutions known the books never credit more than the actuators
+  // took in, whatever the motion, so the true margin is that of the books'
+  // guarantee: nothing is generated. The price is transparency: at 50 ms
+  // the wall feels about half as stiff as with exact encoders.
+  for (int ms : {10, 50, 100}) {
+    for (double freq : {0.4, 0.6}) {
+      for (double amplitude : {0.03, 0.05}) {
+        sim::Teleop1DConfig cfg;
+        cfg.passivity = Passivity::kReflective;
+        cfg.master_encoder_resolution = 55e-6;
+        cfg.slave_encoder_resolution = 1e-6;
+        cfg.op.ref_freq = freq;
+        cfg.op.ref_amplitude = amplitude;
+        const auto r = run(cfg, from_millis(ms));
+        CHECK(!r.diverged);
+        CHECK(r.max_book_excess < 1e-12);
+        CHECK(r.min_true_margin > -1e-9);
+      }
+    }
+  }
+  // Told nothing, the controllers treat the readings as exact: the
+  // prediction differentiates quantization noise twice, and at 50 ms the
+  // teleoperator generates a third of a joule.
+  sim::Teleop1DConfig cfg;
+  cfg.passivity = Passivity::kReflective;
+  cfg.master_encoder_resolution = 55e-6;
+  cfg.slave_encoder_resolution = 1e-6;
+  cfg.encoder_resolution_known = false;
+  CHECK(run(cfg, from_millis(50)).min_true_margin < -0.1);
 }

@@ -29,14 +29,29 @@ SimulatedDevice::SimulatedDevice(double mass, double damping, Nanos nominal_dt, 
       command_time_(start) {}
 
 double SimulatedDevice::read_position(Nanos now) {
-  if (now <= t_) return x_;
-  if (watchdog_ > 0 && f_ != 0.0 && now > command_time_ + watchdog_) {
-    advance(std::max(t_, command_time_ + watchdog_));
-    f_ = 0.0;
-    cut_after_ = watchdog_;
+  if (now > t_) {
+    if (watchdog_ > 0 && f_ != 0.0 && now > command_time_ + watchdog_) {
+      advance(std::max(t_, command_time_ + watchdog_));
+      f_ = 0.0;
+      cut_after_ = watchdog_;
+    }
+    advance(now);
   }
-  advance(now);
-  return x_;
+  if (q_ <= 0.0) return x_;
+  const double y = std::round(x_ / q_) * q_;
+  if (have_read_ && t_ > y_time_) v_read_ = (y - y_) / to_seconds(t_ - y_time_);
+  if (!have_read_ || t_ > y_time_) {
+    have_read_ = true;
+    y_ = y;
+    y_time_ = t_;
+  }
+  return y_;
+}
+
+void SimulatedDevice::set_encoder_resolution(double q) {
+  q_ = q > 0.0 ? q : 0.0;
+  have_read_ = false;
+  v_read_ = 0.0;
 }
 
 void SimulatedDevice::advance(Nanos now) {
@@ -80,7 +95,7 @@ double SimulatedMaster::external_force(double t, double x, double v) const {
 }
 
 double SimulatedMaster::hand_force() const {
-  return external_force(to_seconds(time() - start()), position(), velocity());
+  return external_force(to_seconds(time() - start()), position(), true_velocity());
 }
 
 SimulatedSlave::SimulatedSlave(double mass, double damping, const WallParams& wall,
@@ -100,6 +115,8 @@ double SimulatedSlave::external_force(double, double x, double v) const {
   return -wall_force(wall_, x, v);
 }
 
-double SimulatedSlave::contact_force() const { return wall_force(wall_, position(), velocity()); }
+double SimulatedSlave::contact_force() const {
+  return wall_force(wall_, position(), true_velocity());
+}
 
 }  // namespace tuushin::teleop
