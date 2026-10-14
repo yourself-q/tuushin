@@ -22,8 +22,10 @@ add_library(tuushin
   src/control/tdpa.cpp
   src/net/channel.cpp
   src/net/clock_sync.cpp
+  src/net/probe.cpp
   src/net/trace.cpp
   src/net/udp.cpp
+  src/rt/thread.cpp
   src/sim/teleop1d.cpp
   src/wire/packet.cpp
 )

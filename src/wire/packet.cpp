@@ -107,6 +107,18 @@ std::size_t encode_padded(const Header& h, std::size_t padding, std::vector<std:
   return out.size();
 }
 
+std::size_t encode_probe_echo(const Header& h, std::uint64_t receipts, std::size_t payload,
+                              std::vector<std::uint8_t>& out) {
+  Header hh = h;
+  hh.type = PacketType::kProbeEcho;
+  const bool with_map = payload >= kReceiptMapSize;
+  hh.flags = with_map ? kFlagReceiptMap : 0;
+  put_header(hh, payload, out);
+  if (with_map) put_u64(out, receipts);
+  out.resize(kHeaderSize + payload, 0);
+  return out.size();
+}
+
 std::optional<Header> decode_header(const std::uint8_t* data, std::size_t size) {
   if (data == nullptr || size < kHeaderSize || size > kMaxDatagram) return std::nullopt;
   if (data[0] != kMagic0 || data[1] != kMagic1 || data[2] != kVersion) return std::nullopt;
@@ -145,6 +157,15 @@ std::optional<HapticPayload> decode_haptic(const std::uint8_t* data, std::size_t
     if (!std::isfinite(out.energy[i])) return std::nullopt;
   }
   return out;
+}
+
+std::optional<std::uint64_t> decode_receipts(const std::uint8_t* data, std::size_t size) {
+  const auto h = decode_header(data, size);
+  if (!h || h->type != PacketType::kProbeEcho || (h->flags & kFlagReceiptMap) == 0 ||
+      h->payload_len < kReceiptMapSize) {
+    return std::nullopt;
+  }
+  return get_u64(data + kHeaderSize);
 }
 
 }  // namespace tuushin::wire

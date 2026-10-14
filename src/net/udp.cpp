@@ -5,11 +5,15 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <system_error>
 #include <utility>
@@ -25,6 +29,13 @@ namespace {
 }
 
 const sockaddr* as_sa(const Endpoint& e) { return static_cast<const sockaddr*>(e.data()); }
+
+// Kernel receive stamps are on the realtime clock (CLOCK_REALTIME, which
+// std::chrono::system_clock reads on POSIX systems).
+Nanos realtime_now() {
+  using namespace std::chrono;
+  return duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count();
+}
 
 }  // namespace
 
@@ -139,13 +150,15 @@ UdpSocket::~UdpSocket() {
   if (fd_ >= 0) ::close(fd_);
 }
 
-UdpSocket::UdpSocket(UdpSocket&& o) noexcept : fd_(std::exchange(o.fd_, -1)), ipv6_(o.ipv6_) {}
+UdpSocket::UdpSocket(UdpSocket&& o) noexcept
+    : fd_(std::exchange(o.fd_, -1)), ipv6_(o.ipv6_), rx_timestamps_(o.rx_timestamps_) {}
 
 UdpSocket& UdpSocket::operator=(UdpSocket&& o) noexcept {
   if (this != &o) {
     if (fd_ >= 0) ::close(fd_);
     fd_ = std::exchange(o.fd_, -1);
     ipv6_ = o.ipv6_;
+    rx_timestamps_ = o.rx_timestamps_;
   }
   return *this;
 }
@@ -188,9 +201,23 @@ bool UdpSocket::send_to(const Endpoint& to, const std::uint8_t* data, std::size_
   }
 }
 
+bool UdpSocket::enable_rx_timestamps() {
+  const int one = 1;
+#if defined(SO_TIMESTAMPNS)
+  rx_timestamps_ = ::setsockopt(fd_, SOL_SOCKET, SO_TIMESTAMPNS, &one, sizeof one) == 0;
+#elif defined(SO_TIMESTAMP)
+  rx_timestamps_ = ::setsockopt(fd_, SOL_SOCKET, SO_TIMESTAMP, &one, sizeof one) == 0;
+#endif
+  return rx_timestamps_;
+}
+
 std::optional<std::size_t> UdpSocket::recv_from(std::uint8_t* buffer, std::size_t capacity,
-                                                Endpoint* from) {
+                                                Endpoint* from, Nanos* rx_time) {
   Endpoint src;
+  union {
+    cmsghdr align;
+    unsigned char bytes[128];
+  } control;
   for (;;) {
     iovec iov{buffer, capacity};
     msghdr msg{};
@@ -198,10 +225,48 @@ std::optional<std::size_t> UdpSocket::recv_from(std::uint8_t* buffer, std::size_
     msg.msg_namelen = static_cast<socklen_t>(Endpoint::kCapacity);
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
+    if (rx_timestamps_) {
+      msg.msg_control = control.bytes;
+      msg.msg_controllen = sizeof control.bytes;
+    }
     // recvmsg reports truncation in msg_flags on every POSIX system, whereas
     // MSG_TRUNC as an input flag of recvfrom is Linux-specific.
     const ssize_t n = ::recvmsg(fd_, &msg, 0);
     if (n >= 0) {
+      if (rx_time != nullptr) {
+        Nanos stamp = -1;
+        if (rx_timestamps_ && (msg.msg_flags & MSG_CTRUNC) == 0) {
+          for (cmsghdr* c = CMSG_FIRSTHDR(&msg); c != nullptr; c = CMSG_NXTHDR(&msg, c)) {
+            if (c->cmsg_level != SOL_SOCKET) continue;
+#if defined(SCM_TIMESTAMPNS)
+            if (c->cmsg_type == SCM_TIMESTAMPNS) {
+              timespec ts;
+              std::memcpy(&ts, CMSG_DATA(c), sizeof ts);
+              stamp = static_cast<Nanos>(ts.tv_sec) * kNanosPerSecond + ts.tv_nsec;
+            }
+#endif
+#if defined(SCM_TIMESTAMP)
+            if (c->cmsg_type == SCM_TIMESTAMP) {
+              timeval tv;
+              std::memcpy(&tv, CMSG_DATA(c), sizeof tv);
+              stamp = static_cast<Nanos>(tv.tv_sec) * kNanosPerSecond +
+                      static_cast<Nanos>(tv.tv_usec) * 1000;
+            }
+#endif
+          }
+        }
+        const Nanos mono = monotonic_now();
+        if (stamp >= 0) {
+          // Age of the datagram on the realtime clock, applied to the
+          // monotonic one. A step of the realtime clock (NTP) between arrival
+          // and this read would show up here, so the age is clamped to be
+          // non-negative; such steps are rare and affect only queued packets.
+          const Nanos age = realtime_now() - stamp;
+          *rx_time = mono - (age > 0 ? age : 0);
+        } else {
+          *rx_time = mono;
+        }
+      }
       src.set_size(static_cast<std::uint32_t>(msg.msg_namelen));
       if (from != nullptr) *from = src;
       if ((msg.msg_flags & MSG_TRUNC) != 0) return capacity + 1;
@@ -215,15 +280,36 @@ std::optional<std::size_t> UdpSocket::recv_from(std::uint8_t* buffer, std::size_
 }
 
 bool UdpSocket::wait_readable(Nanos timeout) {
+  if (timeout < 0) timeout = 0;
+  // An interrupted wait returns false like a timeout; callers loop on the
+  // clock anyway, and retrying with the full timeout would overshoot.
+#if defined(__linux__)
   pollfd p{};
   p.fd = fd_;
   p.events = POLLIN;
-  const int ms = timeout <= 0 ? 0 : static_cast<int>((timeout + kNanosPerMilli - 1) / kNanosPerMilli);
-  for (;;) {
-    const int r = ::poll(&p, 1, ms);
-    if (r >= 0) return r > 0 && (p.revents & POLLIN) != 0;
-    if (errno != EINTR) return false;
+  timespec ts{};
+  ts.tv_sec = static_cast<time_t>(timeout / kNanosPerSecond);
+  ts.tv_nsec = static_cast<long>(timeout % kNanosPerSecond);
+  const int r = ::ppoll(&p, 1, &ts, nullptr);
+  return r > 0 && (p.revents & POLLIN) != 0;
+#else
+  if (fd_ < FD_SETSIZE) {
+    fd_set set;
+    FD_ZERO(&set);
+    FD_SET(fd_, &set);
+    const Nanos us = (timeout + 999) / 1000;
+    timeval tv{};
+    tv.tv_sec = static_cast<time_t>(us / 1'000'000);
+    tv.tv_usec = static_cast<suseconds_t>(us % 1'000'000);
+    return ::select(fd_ + 1, &set, nullptr, nullptr, &tv) > 0;
   }
+  pollfd p{};
+  p.fd = fd_;
+  p.events = POLLIN;
+  const int ms = static_cast<int>((timeout + kNanosPerMilli - 1) / kNanosPerMilli);
+  const int r = ::poll(&p, 1, ms);
+  return r > 0 && (p.revents & POLLIN) != 0;
+#endif
 }
 
 }  // namespace tuushin::net

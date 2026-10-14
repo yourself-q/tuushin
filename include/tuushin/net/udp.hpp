@@ -68,12 +68,24 @@ class UdpSocket {
   // kernel (buffer full, unreachable); the caller treats it as lost.
   bool send_to(const Endpoint& to, const std::uint8_t* data, std::size_t size);
 
+  // Asks the kernel to stamp each datagram on arrival (SO_TIMESTAMPNS on
+  // Linux, SO_TIMESTAMP elsewhere). The stamp then no longer depends on when
+  // the application gets round to reading, so a loop may sleep between
+  // packets without blurring delay measurements. Returns false if
+  // unsupported; recv_from then stamps at read time.
+  bool enable_rx_timestamps();
+
   // Receives one datagram if one is queued. Returns its size (datagrams
   // longer than `capacity` are truncated and reported as `capacity + 1`, so
-  // callers can drop them) or nullopt if none is waiting.
-  std::optional<std::size_t> recv_from(std::uint8_t* buffer, std::size_t capacity, Endpoint* from);
+  // callers can drop them) or nullopt if none is waiting. If `rx_time` is
+  // given it receives the arrival time on monotonic_now()'s clock.
+  std::optional<std::size_t> recv_from(std::uint8_t* buffer, std::size_t capacity, Endpoint* from,
+                                       Nanos* rx_time = nullptr);
 
-  // Waits until a datagram is queued or `timeout` passes; true if readable.
+  // Waits until a datagram is queued or `timeout` passes; true if readable,
+  // false on timeout or when interrupted by a signal.
+  // Resolution is about a microsecond (ppoll on Linux, select elsewhere;
+  // poll's millisecond timeout is too coarse for a 1 kHz loop).
   bool wait_readable(Nanos timeout);
 
   int native_handle() const { return fd_; }
@@ -81,6 +93,7 @@ class UdpSocket {
  private:
   int fd_ = -1;
   bool ipv6_ = false;
+  bool rx_timestamps_ = false;
 };
 
 }  // namespace tuushin::net

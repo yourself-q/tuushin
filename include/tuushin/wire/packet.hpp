@@ -21,7 +21,7 @@ namespace tuushin::wire {
 //        3    1 type         PacketType
 //        4    4 session      random per run, chosen by the initiator
 //        8    4 seq          per-sender sequence number, starts at 1
-//       12    2 flags        reserved, 0
+//       12    2 flags        per type, see below; 0 unless defined
 //       14    2 payload_len  bytes after the header
 //       16    8 send_time    sender's monotonic clock, ns
 //       24    4 echo_seq     newest seq received from the peer, 0 if none
@@ -66,6 +66,17 @@ struct Header {
 // Saturating conversion for Header::echo_hold.
 std::uint32_t hold_field(Nanos hold);
 
+// Flag of kProbeEcho: the payload starts with an 8-byte receipt map, a
+// little-endian bit field in which bit i is set if the reflector had received
+// probe echo_seq - 1 - i of the same session when it sent this echo. The map
+// tells a lost probe from a lost echo: when an echo goes missing, the maps
+// of the next ones still say whether its probe arrived. TWAMP (RFC 5357)
+// separates the directions by the reflector's sequence numbers alone, which
+// gives the count of losses per direction but not which packets they were;
+// a replayable trace needs the latter.
+constexpr std::uint16_t kFlagReceiptMap = 1;
+constexpr std::size_t kReceiptMapSize = 8;
+
 // Haptic sample, payload of kHaptic:
 //
 //   offset size field
@@ -98,11 +109,17 @@ std::size_t encode_haptic(const Header& h, const HapticPayload& p, std::vector<s
 // Probe and echo datagrams carry `padding` zero bytes so that probes can be
 // sized like the traffic they stand in for.
 std::size_t encode_padded(const Header& h, std::size_t padding, std::vector<std::uint8_t>& out);
+// A kProbeEcho of `payload` bytes; the receipt map is included (and
+// kFlagReceiptMap set) if the payload has room for it.
+std::size_t encode_probe_echo(const Header& h, std::uint64_t receipts, std::size_t payload,
+                              std::vector<std::uint8_t>& out);
 
 // Decoders return nullopt for anything malformed: wrong magic or version,
 // truncated, inconsistent lengths, out-of-range counts, non-finite values.
 // They never throw, since datagrams come from the network.
 std::optional<Header> decode_header(const std::uint8_t* data, std::size_t size);
 std::optional<HapticPayload> decode_haptic(const std::uint8_t* data, std::size_t size);
+// The receipt map of a kProbeEcho, if it carries one.
+std::optional<std::uint64_t> decode_receipts(const std::uint8_t* data, std::size_t size);
 
 }  // namespace tuushin::wire
