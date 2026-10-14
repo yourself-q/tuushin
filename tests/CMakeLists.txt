@@ -3,6 +3,7 @@ add_executable(tuushin_tests
   test_deadband.cpp
   test_tdpa.cpp
   test_channel.cpp
+  test_crypto.cpp
   test_reflection.cpp
   test_teleop1d.cpp
   test_wire.cpp

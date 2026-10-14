@@ -20,6 +20,7 @@ add_library(tuushin
   src/control/predictive_pc.cpp
   src/control/reflection.cpp
   src/control/tdpa.cpp
+  src/crypto/noise.cpp
   src/net/channel.cpp
   src/net/clock_sync.cpp
   src/net/probe.cpp
@@ -36,6 +37,26 @@ add_library(tuushin
 target_include_directories(tuushin PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
+
+# libsodium (ISC license) provides the primitives behind crypto/noise.hpp:
+# X25519, ChaCha20-Poly1305 and SHA-256. Its headers stay out of ours, so
+# it is a private dependency.
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+  pkg_check_modules(SODIUM QUIET IMPORTED_TARGET libsodium>=1.0.18)
+endif()
+if(TARGET PkgConfig::SODIUM)
+  target_link_libraries(tuushin PRIVATE PkgConfig::SODIUM)
+else()
+  find_path(SODIUM_INCLUDE_DIR sodium.h)
+  find_library(SODIUM_LIBRARY NAMES sodium libsodium)
+  if(NOT SODIUM_INCLUDE_DIR OR NOT SODIUM_LIBRARY)
+    message(FATAL_ERROR "libsodium not found; install it (apt install libsodium-dev, "
+                        "brew install libsodium, vcpkg install libsodium)")
+  endif()
+  target_include_directories(tuushin PRIVATE ${SODIUM_INCLUDE_DIR})
+  target_link_libraries(tuushin PRIVATE ${SODIUM_LIBRARY})
+endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(tuushin PRIVATE -Wall -Wextra -Wpedantic -Wshadow)
