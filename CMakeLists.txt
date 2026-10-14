@@ -20,6 +20,7 @@ add_library(tuushin
   src/control/predictive_pc.cpp
   src/control/reflection.cpp
   src/control/tdpa.cpp
+  src/crypto/legacy_digest.cpp
   src/crypto/noise.cpp
   src/net/channel.cpp
   src/net/clock_sync.cpp
