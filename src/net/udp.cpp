@@ -39,6 +39,48 @@ Nanos realtime_now() {
 
 }  // namespace
 
+RxStampConverter::Sandwich RxStampConverter::read_clocks() {
+  Sandwich best;
+  for (int i = 0; i < 3; ++i) {
+    Sandwich s;
+    s.mono_before = monotonic_now();
+    s.realtime = realtime_now();
+    s.mono_after = monotonic_now();
+    if (i == 0 || s.mono_after - s.mono_before < best.mono_after - best.mono_before) best = s;
+    if (best.mono_after - best.mono_before <= kResolution) break;
+  }
+  return best;
+}
+
+void RxStampConverter::observe(const Sandwich& s) {
+  const Nanos width = s.mono_after - s.mono_before;
+  if (width < 0 || width > kMaxWidth) return;
+  const Nanos mid = s.mono_before + width / 2;
+  const Nanos offset = s.realtime - mid;
+  const Nanos half_width = width / 2 + 1;
+  if (have_) {
+    const Nanos elapsed = mid - at_;
+    const Nanos moved = offset > offset_ ? offset - offset_ : offset_ - offset;
+    const Nanos slack = half_width_ + half_width + kResolution +
+                        static_cast<Nanos>(static_cast<double>(elapsed > 0 ? elapsed : 0) *
+                                           (static_cast<double>(kSlewPerSecond) / kNanosPerSecond));
+    if (moved > slack) {
+      stepped_ = true;
+      stepped_at_ = s.realtime;
+    }
+  }
+  have_ = true;
+  offset_ = offset;
+  half_width_ = half_width;
+  at_ = mid;
+}
+
+Nanos RxStampConverter::to_monotonic(Nanos stamp, Nanos read_time) const {
+  if (!have_ || (stepped_ && stamp < stepped_at_)) return read_time;
+  const Nanos rx = stamp - offset_;
+  return rx < read_time ? rx : read_time;
+}
+
 std::optional<Endpoint> Endpoint::resolve(const std::string& host, std::uint16_t port,
                                           bool prefer_ipv6) {
   addrinfo hints{};
@@ -151,7 +193,10 @@ UdpSocket::~UdpSocket() {
 }
 
 UdpSocket::UdpSocket(UdpSocket&& o) noexcept
-    : fd_(std::exchange(o.fd_, -1)), ipv6_(o.ipv6_), rx_timestamps_(o.rx_timestamps_) {}
+    : fd_(std::exchange(o.fd_, -1)),
+      ipv6_(o.ipv6_),
+      rx_timestamps_(o.rx_timestamps_),
+      stamps_(o.stamps_) {}
 
 UdpSocket& UdpSocket::operator=(UdpSocket&& o) noexcept {
   if (this != &o) {
@@ -159,6 +204,7 @@ UdpSocket& UdpSocket::operator=(UdpSocket&& o) noexcept {
     fd_ = std::exchange(o.fd_, -1);
     ipv6_ = o.ipv6_;
     rx_timestamps_ = o.rx_timestamps_;
+    stamps_ = o.stamps_;
   }
   return *this;
 }
@@ -208,6 +254,7 @@ bool UdpSocket::enable_rx_timestamps() {
 #elif defined(SO_TIMESTAMP)
   rx_timestamps_ = ::setsockopt(fd_, SOL_SOCKET, SO_TIMESTAMP, &one, sizeof one) == 0;
 #endif
+  if (rx_timestamps_) stamps_.observe(RxStampConverter::read_clocks());
   return rx_timestamps_;
 }
 
@@ -255,16 +302,12 @@ std::optional<std::size_t> UdpSocket::recv_from(std::uint8_t* buffer, std::size_
 #endif
           }
         }
-        const Nanos mono = monotonic_now();
         if (stamp >= 0) {
-          // Age of the datagram on the realtime clock, applied to the
-          // monotonic one. A step of the realtime clock (NTP) between arrival
-          // and this read would show up here, so the age is clamped to be
-          // non-negative; such steps are rare and affect only queued packets.
-          const Nanos age = realtime_now() - stamp;
-          *rx_time = mono - (age > 0 ? age : 0);
+          const auto clocks = RxStampConverter::read_clocks();
+          stamps_.observe(clocks);
+          *rx_time = stamps_.to_monotonic(stamp, clocks.mono_after);
         } else {
-          *rx_time = mono;
+          *rx_time = monotonic_now();
         }
       }
       src.set_size(static_cast<std::uint32_t>(msg.msg_namelen));

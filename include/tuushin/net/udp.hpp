@@ -42,6 +42,56 @@ class Endpoint {
   std::uint32_t len_ = 0;
 };
 
+// Converts the kernel's receive stamps, which are on the realtime clock, to
+// monotonic_now()'s clock. The two clocks differ by an offset that changes
+// only when the realtime clock is set (a step) or, where the monotonic clock
+// is not slewed with it, slowly; so the offset is measured at each read and
+// subtracted from the stamp.
+//
+// The offset is read as a sandwich, a realtime reading between two monotonic
+// ones, as PTP_SYS_OFFSET_EXTENDED reads a hardware clock against the system
+// clock: the offset is then known to within half the sandwich's width. A
+// plain pair of readings has no such bound. A thread descheduled between the
+// two (a loaded host, a virtual machine's vCPU) reads the realtime clock late
+// by the whole pause, and the datagram it converts seems to have arrived that
+// much earlier, before it was sent; one such reading, 2.5 ms wide, turned up
+// in 5000 on a loaded Linux VM. Sandwiches wider than kMaxWidth are
+// discarded and the last narrow one stands.
+//
+// A step of the realtime clock shows as an offset that moved by more than
+// the two sandwiches' uncertainty allows. A datagram stamped before the step
+// was noticed may be on either side of it, so it gets the read time instead,
+// which is late but never early.
+class RxStampConverter {
+ public:
+  struct Sandwich {
+    Nanos mono_before = 0;  // monotonic_now()
+    Nanos realtime = 0;     // ns since the Unix epoch
+    Nanos mono_after = 0;
+  };
+  static constexpr Nanos kMaxWidth = 20'000;
+  // Slack for a step: the realtime clock's resolution (a microsecond on
+  // some systems) and a slew of up to 1000 ppm between readings.
+  static constexpr Nanos kResolution = 1'000;
+  static constexpr Nanos kSlewPerSecond = 1'000'000;
+
+  // The narrowest of a few sandwiches of this process's clocks.
+  static Sandwich read_clocks();
+  // Takes a reading into account.
+  void observe(const Sandwich& s);
+  // The arrival time, on the monotonic clock, of a datagram stamped `stamp`
+  // (realtime) and read at `read_time` (monotonic); never after read_time.
+  Nanos to_monotonic(Nanos stamp, Nanos read_time) const;
+
+ private:
+  bool have_ = false;
+  Nanos offset_ = 0;      // realtime - monotonic
+  Nanos half_width_ = 0;  // uncertainty of offset_
+  Nanos at_ = 0;          // monotonic time of the reading behind offset_
+  bool stepped_ = false;
+  Nanos stepped_at_ = 0;  // realtime when the last step was noticed
+};
+
 // Non-blocking UDP socket (POSIX). Setup errors throw std::system_error;
 // per-datagram errors are reported through return values because a real-time
 // loop must not stop on a transient network error.
@@ -94,6 +144,7 @@ class UdpSocket {
   int fd_ = -1;
   bool ipv6_ = false;
   bool rx_timestamps_ = false;
+  RxStampConverter stamps_;
 };
 
 }  // namespace tuushin::net
