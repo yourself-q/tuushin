@@ -13,9 +13,11 @@ not synchronized, and NATs. tuushin aims to be a shared, measured base for
 that case: the passivity control that keeps the loop stable, the transport
 that carries it, and tools that measure real paths and replay them.
 
-**Status: early.** One degree of freedom, simulated devices, measured on
-loopback and in a lab of Linux NATs so far. POSIX C++17, developed on macOS
-and also tested on Linux (Ubuntu 24.04, GCC 13.3). MIT licensed.
+**Status: early.** One degree of freedom, measured on loopback and in a
+lab of Linux NATs so far; simulated devices, and firmware for a haptic
+knob on an ESP32 that has run under emulation but not yet on a chip.
+POSIX C++17, developed on macOS and also tested on Linux (Ubuntu 24.04,
+GCC 13.3). MIT licensed.
 
 ## What is in it
 
@@ -27,8 +29,10 @@ and also tested on Linux (Ubuntu 24.04, GCC 13.3). MIT licensed.
 | `net/` | UDP sockets with kernel receive timestamps and hop-limited sends, clock-skew estimation from four-timestamp exchanges, channel models (fixed delay, jitter, Gilbert-Elliott loss, bottleneck queue, recorded traces), path measurement with probes and a reflector, a rendezvous server and client for ends behind NATs, a measurement of how many hops an end's own NATs reach, and STUN messages and a TURN client (RFC 8656) for a relayed path where no direct one opens (see NAT traversal below). |
 | `wire/` | The datagram format: a 32-byte header whose echo fields let each end measure the round trip from ordinary traffic, as RTCP does. |
 | `crypto/` | A Noise_NNpsk0 handshake and ChaCha20-Poly1305 on libsodium: a pre-shared key becomes fresh keys for every session, and every datagram is authenticated and encrypted (see Authentication below). SHA-1, HMAC-SHA1 and MD5, only because STUN and TURN require them. |
+| `device/` | `RemoteDevice`: a device running tuushin's firmware, over a serial port or TCP, as a `Device1D`, and the link's protocol, which the firmware compiles too (see A device in the loop below). |
+| `firmware/` | The device's servo loop (`firmware/core`: field-oriented control of a gimbal motor, calibration, a watchdog and faults, and a simulated motor to test it on) and its port to the ESP32 family under ESP-IDF (`firmware/esp32`). |
 | `sim/` | A deterministic 1-DoF teleoperation simulator built on the same controllers and devices. |
-| `tools/` | `tuushin-sim`, `tuushin-teleop` (master, slave and rendezvous server as separate processes), `tuushin-probe` (measure a path, write replayable traces; `pair` measures between two networks of one host on one clock), `tuushin-netreplay` (Linux: replay a trace on an interface, datagram by datagram, for network namespaces, Mininet and testbeds built on them), `nat_lab.sh` (master and slave behind Linux NATs in network namespaces, with coturn as a relay), `netreplay_lab.sh` (checks the replay against its traces), `pair_lab.sh` (checks `pair` behind two NATs, with coturn as the STUN server), `fetch_starlink.sh` (public Starlink one-way delays as traces). `tests/sim_nat.hpp` and `tests/sim_turn.hpp` are a NAT and a TURN server in user space for tests on any system. |
+| `tools/` | `tuushin-sim`, `tuushin-teleop` (master, slave and rendezvous server as separate processes), `tuushin-probe` (measure a path, write replayable traces; `pair` measures between two networks of one host on one clock), `tuushin-netreplay` (Linux: replay a trace on an interface, datagram by datagram, for network namespaces, Mininet and testbeds built on them), `nat_lab.sh` (master and slave behind Linux NATs in network namespaces, with coturn as a relay), `netreplay_lab.sh` (checks the replay against its traces), `pair_lab.sh` (checks `pair` behind two NATs, with coturn as the STUN server), `fetch_starlink.sh` (public Starlink one-way delays as traces), `tuushin-devsim` (the firmware on a simulated motor, behind a pty or a TCP port), `tuushin-device` (bring up one device on its own), `device_lab.sh` and `emu_lab.sh` (the teleoperator end to end with devices running the firmware, simulated or under QEMU). `tests/sim_nat.hpp` and `tests/sim_turn.hpp` are a NAT and a TURN server in user space for tests on any system. |
 
 ## Build and test
 
@@ -53,7 +57,8 @@ Simulate a teleoperator touching a wall with 25 ms one-way delay:
 ```
 
 Run the master and the slave as separate processes over UDP (simulated
-devices for now). On loopback, `--emulate-*` impairs each end's outgoing
+devices here; `--device` drives one running the firmware, A device in the
+loop below). On loopback, `--emulate-*` impairs each end's outgoing
 datagrams in-process, so the measurements see the impairment as if the
 network had caused it:
 
@@ -1124,6 +1129,85 @@ Security 2019, figure 1). `sudo ifconfig awdl0 down` removed it (until
 `up` or a restart). A Mac measuring a path, or running an end of a
 teleoperator, wants AWDL off.
 
+## A device in the loop
+
+The controllers drive a `teleop::Device1D`. Besides the simulated ones,
+`device::RemoteDevice` is a device running tuushin's own firmware: a
+haptic knob of one axis, a gimbal motor under field-oriented control with
+a magnetic encoder, whose servo loop runs on a microcontroller and talks
+to the host over a serial port (or TCP, for the simulation and the
+emulator).
+
+| part | what it is |
+|---|---|
+| `include/tuushin/device/proto.hpp` | The link, compiled by both sides: messages in COBS frames with a CRC-16. The device streams a State every millisecond on its own clock (the encoder count, the speed, the torque applied, the work it booked, and which command was in effect since when); the host sends a torque whenever it has one, which the device applies on its next tick. |
+| `firmware/core` | `fw::DeviceCore`, the servo loop in portable C++ that does not allocate: field-oriented control by voltage, the calibration of the motor's electrical zero, and the safety rules (the driver is off until the host enables it, the torque is cut 2 ms after the last command and the driver switched off after 500 ms, a failing encoder or a runaway latches a fault). `fw::Plant` is a simulated gimbal motor (back-EMF, cogging, friction, a hand that turns it, an object it runs into) for the core to drive. |
+| `firmware/esp32` | The core on an ESP32, ESP32-S3 or ESP32-C3 under ESP-IDF, with the parts, the wiring and the bring-up: [firmware/esp32/README.md](firmware/esp32/README.md). Built, and run end to end under QEMU; not yet run on a chip. |
+| `tuushin-devsim` | The core driving the plant in real time behind a pseudo-terminal or a TCP port: a device to develop against with no hardware. |
+| `tuushin-device` | One device on its own, for bringing it up: its Info, its encoder, its calibration, a steady torque to weigh on a scale, a spring to feel. |
+| `device_lab.sh`, `emu_lab.sh` | The teleoperator end to end with two simulated knobs, or with the ESP32 firmware under QEMU at the slave. |
+
+```sh
+./build/tools/tuushin-devsim --tcp 47300 --hand &       # a knob that a hand turns to and fro
+./build/tools/tuushin-device tcp:127.0.0.1:47300 info
+./build/tools/tuushin-teleop master HOST --device tcp:127.0.0.1:47300
+./build/tools/tuushin-teleop slave --device serial:/dev/cu.usbmodem1101,radius=0.025
+tools/device_lab.sh build 10
+```
+
+`--device` takes `serial:PATH` (or `PATH`) or `tcp:HOST:PORT`, then
+`,option=value`: `radius` (0.02 m; the controllers think in metres and
+newtons at the rim, the device in radians and N m at the shaft),
+`reverse`, `baud`, `torque-limit`, `damping` (on the device's own ticks),
+`velocity-limit`, `state-us`, `calibrate=auto|always|never` and `nozero`.
+
+What the host takes from the device:
+
+- **Its model**, from its Info: the rotor's inertia over `r^2` as a mass
+  (17.5 g at the rim for the simulated knob), the encoder's count as the
+  quantization, and the torque ceiling as the largest force.
+- **The slave's coupling**, from the device's damping and the loop's
+  delay rather than a fixed gain. Damping on the device's ticks acts with
+  no link in between, and a sampled spring `K` stays passive while that
+  damping `b` exceeds `K T / 2` (Colgate and Schenkel 1997); here the
+  force also waits for the link and the State's age, which count as a
+  longer hold, and the slave takes half the stiffness that allows: 524 N/m
+  for the simulated knob (2.5 N s/m at the rim, 2.39 ms), where a slave on
+  a simulated device couples with 2000.
+- **The energy books**, from the work the device measures. The firmware
+  sums the commanded torque times the displacement over its ticks, and
+  each State carries the total. The controllers' own estimate, which
+  splits a sample's displacement by a model when the force changes within
+  it, missed by hundreds of micrometres on a slave pressed into the
+  object. With the device's damping off, the books matched the simulated
+  motor's true work: −9.51 against −9.5 mJ at the master, +7.81 against
+  +7.6 mJ at the slave; with damping, they differ by what the damping
+  dissipates, outside the books.
+- **The actuation delay**: half the least round trip and one tick, as the
+  first guess of the online estimate (Actuation delay above).
+
+Ten seconds of `device_lab.sh` on an Apple M4 Mac, a hand at the master,
+an object half a radian on at the slave:
+
+| | master | slave |
+|---|---|---|
+| States, lost | 10032, 0 | 13217, 0 |
+| device round trip p50 (a command to the State applying it) | 1.26 ms | 1.34 ms |
+| coupling | | 524 N/m |
+| largest force | 3.46 N displayed | 11.9 N |
+| energy | 0.0346 J | −0.0337 J |
+| margin at the end, and at its lowest | +0.95 mJ, −2.5 mJ | |
+
+The dip is the teleoperator's, not the books'. In a run followed sample
+by sample (no damping on the devices, a coupling of 300 N/m, a dip of
+1.57 mJ), the slave's passivity controller switched the force between
+nothing and 3 to 4 N from one sample to the next as the slave left the
+object, and the 17.5 g knob bounced off it: with States 0.8 to 1.8 ms old
+and a command acting 0.9 ms after it is sent, the speed reversed within a
+sample, and that one sample did 0.7 mJ of work; the master made the
+other 0.6 mJ. Under QEMU, the ESP32 firmware at the slave dipped 0.35 mJ,
+and 1.27 mJ in an earlier run.
+
 ## Known issues
 
 - **Devices need a watchdog.** The stall handling above relies on the
@@ -1172,8 +1256,16 @@ teleoperator, wants AWDL off.
   to move under changing forces: until then it stays at the maximum,
   which holds the forces back. A delay that varies from command to
   command is not modelled (Actuation delay above).
-- **Simulated devices only, one degree of freedom.** `teleop::Device1D` is
-  the interface a real device will implement.
+- **No real device yet, one degree of freedom.** The firmware has run on
+  a simulated motor, as a process and under QEMU, but not on a chip:
+  its timing at 5 kHz, the encoders' drivers and the torque's true scale
+  are unmeasured (firmware/esp32/README.md). The torque is set by voltage,
+  without current sensing, so the energy books are as right as the
+  motor's resistance and torque constant, and the resistance drifts with
+  the windings' temperature.
+- **A light knob bouncing off an object generates energy.** With the
+  firmware's devices the teleoperator's margin dips by 0.35 to 2.5 mJ as
+  the slave leaves the object (A device in the loop, above).
 - **Only the slave takes a relay, over UDP.** One relay is enough to cross
   both NATs, but a slave without one cannot be reached through a symmetric
   NAT, and a master cannot offer a relay of its own. There is no TURN over
@@ -1224,8 +1316,9 @@ teleoperator, wants AWDL off.
   Starlink one above.
 - A relayed session that moves to a direct path once one opens; then QUIC
   datagrams as a transport.
-- Deadbands that adapt to the measured delay; more degrees of freedom; a real
-  device behind `Device1D`.
+- The firmware on a chip and a real knob, measured; then the overshoot
+  where a light knob leaves an object.
+- Deadbands that adapt to the measured delay; more degrees of freedom.
 
 ## References
 
@@ -1247,6 +1340,10 @@ The code cites its sources where it uses them. The main ones:
   variances and adaptive Kalman filtering", IEEE T-AC 15(2), 1970, for
   covariance matching, which tunes the filter and sizes the model error
   margin.
+- J. E. Colgate and G. G. Schenkel, "Passivity of a class of sampled-data
+  systems: application to haptic interfaces", Journal of Robotic Systems
+  14(1), 1997, for the damping a sampled spring needs, which sets the
+  coupling a device can take.
 - P. Hinterseer, S. Hirche, S. Chaudhuri, E. Steinbach and M. Buss,
   "Perception-based data reduction and transmission of haptic data in
   telepresence and teleaction systems", IEEE Trans. Signal Processing 56(2), 2008.

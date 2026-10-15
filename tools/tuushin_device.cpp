@@ -246,7 +246,7 @@ void spring(device::RemoteDevice& dev, const Options& o) {
               "delay %.2f ms: %.4g N m/rad is what that allows)\n",
               k, o.b, dev.damping(), 1e3 * horizon, allowed);
   if (allowed > 0.0 && k > allowed) {
-    std::printf("over what the damping allows: the knob may buzz or swing up; let go to stop it\n");
+    std::printf("over what the damping allows: the knob may buzz or swing up; Ctrl-C stops it\n");
   }
   const double w0 = dev.actuator_work();
   double centre = 0.0;
