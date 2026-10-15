@@ -110,6 +110,12 @@ void HapticLink::send(Nanos now, const Sample& s, double monitor, bool final) {
   pending_.push(Pending{now + *transit, pending_order_++, buf_});
 }
 
+bool HapticLink::send_copy(const net::Route& to) {
+  // buf_ holds the last datagram until the next send().
+  if (!sealed_ || counters_.sent == 0) return false;
+  return paths_->send(to, buf_.data(), buf_.size());
+}
+
 void HapticLink::transmit(const std::vector<std::uint8_t>& datagram) {
   if (!paths_->send(route_, datagram.data(), datagram.size())) ++counters_.send_failed;
 }

@@ -93,6 +93,17 @@ class HapticLink {
   // ports; `final` marks the end of the session.
   void send(Nanos now, const Sample& s, double monitor, bool final = false);
 
+  // Sends a copy of the last datagram send() made, sealed as it was, along
+  // `to` instead of the peer's route, past the emulation. False if the link
+  // is open or has sent nothing, or the copy could not be sent. Where it
+  // arrives, the other end's link follows this end to the copy's source
+  // if it is the newest datagram there (above), which a punch cannot make
+  // it do: this is how a session whose path failed finds a new one
+  // (teleop/node.hpp). The copy repeats a sequence number that went to the
+  // peer a period or more earlier, so where that datagram arrived the copy
+  // is a duplicate and moves nothing: the old path, while it works, wins.
+  bool send_copy(const net::Route& to);
+
   // Releases emulated datagrams that are due at `now`.
   void pump(Nanos now);
   // When the next emulated datagram is due, if any is queued.

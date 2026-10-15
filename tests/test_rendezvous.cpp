@@ -953,3 +953,22 @@ TEST_CASE(relayed_session_survives_a_nat_that_rebinds) {
   CHECK(r.slave[0].ended_by_final);
   CHECK(r.slave[0].link.foreign == 0 && r.master.link.foreign == 0);
 }
+
+TEST_CASE(relayed_session_survives_a_rebinding_nat_between_symmetric_nats) {
+  // As above, with a master behind a NAT that gives every destination its
+  // own port: its punches towards the new relay leave from a port the
+  // slave was never told of. They are copies of the master's last sample,
+  // so the slave's link follows the master there, and the slave's samples
+  // through the new relay go to that port, which lets them in.
+  const auto r = relayed_session(test::SimNat::Mapping::kAddressPortDependent, true, true);
+  REQUIRE(r.master.authenticated && r.master.relayed);
+  CHECK(r.allocations == 2);
+  CHECK(any_contains(r.slave_events, "relay lost (437"));
+  CHECK(r.master.rejoins >= 1);
+  CHECK(r.master.link.moved == 1);
+  CHECK(r.master.link.received > 700);
+  REQUIRE(r.slave.size() == 1);
+  CHECK(r.slave[0].ended_by_final);
+  CHECK(r.slave[0].link.moved == 1);
+  CHECK(r.slave[0].link.foreign == 0 && r.master.link.foreign == 0);
+}

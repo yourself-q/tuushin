@@ -187,7 +187,14 @@ class RelayAnnouncer {
 
 // The rendezvous during a session (RendezvousConfig::rejoin_after): looks
 // for an end that has moved when the other end falls silent, and punches
-// towards the other end's new address when the server announces one.
+// towards the other end's new address when the server announces one. The
+// punches are copies of the link's last datagram (HapticLink::send_copy):
+// they open this end's NAT as a punch does, and they also authenticate,
+// so the other end's link follows this end to the port its NAT sent them
+// from. A NAT that gives every destination its own port (or the other
+// end's relay, which sees this end at such a port) has the session found
+// again only so: the other end would otherwise keep sending to the port
+// it knew, which now lets nothing in.
 class SessionRejoin {
  public:
   SessionRejoin(net::RendezvousClient& rv, const net::Endpoint& server,
@@ -218,8 +225,9 @@ class SessionRejoin {
     return true;
   }
 
-  // Every tick; `last_rx` is when the last authentic sample arrived.
-  void tick(Nanos now, Nanos last_rx) {
+  // Every tick, before the link sends; `last_rx` is when the last authentic
+  // sample arrived.
+  void tick(Nanos now, Nanos last_rx, HapticLink& link) {
     const bool silent = now - last_rx > cfg_.rejoin_after;
     if (silent) {
       if (now >= next_rejoin_) {
@@ -235,7 +243,9 @@ class SessionRejoin {
     // Also while the silence lasts: the server announces a move only once,
     // and a punch towards it that was lost would otherwise not be repeated.
     if ((now < punch_until_ || silent) && now >= next_punch_) {
-      for (const auto& t : to_) socket_.send_to(t, punch_.data(), punch_.size());
+      for (const auto& t : to_) {
+        if (!link.send_copy(net::Route{t, false})) socket_.send_to(t, punch_.data(), punch_.size());
+      }
       next_punch_ = now + cfg_.punch_interval;
     }
   }
@@ -513,7 +523,7 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
     }
     const Nanos late = now - ticker.due();
     ticker.taken(now);
-    if (rejoin) rejoin->tick(now, last_rx);
+    if (rejoin) rejoin->tick(now, last_rx, link);
 
     const double x = device.read_position(now);
     const auto& port = ctl.port();
@@ -894,7 +904,7 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
       if (stop_since >= 0 && now >= stop_since + cfg.final_linger) break;
       const Nanos late = now - ticker.due();
       ticker.taken(now);
-      if (rejoin) rejoin->tick(now, last_rx);
+      if (rejoin) rejoin->tick(now, last_rx, link);
       if (rv) {
         if (const auto line = relay_announcer.update(paths, *rv, now)) tell(*line);
       }

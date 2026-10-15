@@ -97,7 +97,11 @@ struct RendezvousConfig {
   // which punches towards it for rejoin_punch, so that its own NAT lets the
   // moved end's datagrams in; the link then follows the moved end
   // (HapticLink). Both ends look for a move because neither can tell which
-  // one moved: each only hears nothing.
+  // one moved: each only hears nothing. The punches are copies of the
+  // link's last datagram (HapticLink::send_copy), which authenticate: where
+  // the punching end's NAT sends them from a port of their own (it gives
+  // every destination one), the moved end's link follows the punching end
+  // there in turn, and answers to that port.
   Nanos rejoin_after = 100 * kNanosPerMilli;
   Nanos rejoin_punch = kNanosPerSecond;
   // Master: how long after its first hellos to the slave's own candidates
