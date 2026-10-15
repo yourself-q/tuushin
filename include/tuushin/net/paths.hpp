@@ -52,8 +52,9 @@ class Paths {
   Paths& operator=(const Paths&) = delete;
 
   // Allocates a relay on `server` with long-term credentials, from a new
-  // socket bound to the direct socket's address with an ephemeral port.
-  // Throws if that socket cannot be bound or cannot send to the server.
+  // socket bound to the direct socket's address with an ephemeral port and
+  // marked with its DSCP, since it carries the same datagrams. Throws if
+  // that socket cannot be bound or cannot send to the server.
   void enable_relay(const Endpoint& server, const std::string& username,
                     const std::string& password);
 

@@ -20,6 +20,7 @@ void Paths::enable_relay(const Endpoint& server, const std::string& username,
   const auto bind = Endpoint::from_address(address.data(), address.size(), 0);
   if (!bind) throw std::runtime_error("Paths: the direct socket has no address to bind next to");
   UdpSocket s(*bind);
+  if (direct_.dscp() >= 0) s.set_dscp(direct_.dscp());
   const auto to = server.for_family(s.is_ipv6());
   if (!to) throw std::runtime_error("Paths: cannot reach the TURN server " + server.to_string() +
                                     " from an IPv4 socket");

@@ -137,6 +137,8 @@ class UdpSocket {
   // ignore or rewrite it; it costs nothing where they do. Returns false if
   // the system refused.
   bool set_dscp(int dscp);
+  // The code point set_dscp last set, or -1.
+  int dscp() const { return dscp_; }
 
   // Sends one datagram. Returns false if it could not be handed to the
   // kernel (buffer full, unreachable); the caller treats it as lost.
@@ -178,6 +180,7 @@ class UdpSocket {
   int fd_ = -1;
   bool ipv6_ = false;
   bool rx_timestamps_ = false;
+  int dscp_ = -1;
   RxStampConverter stamps_;
 };
 

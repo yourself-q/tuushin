@@ -19,6 +19,13 @@
 //   on the robot side:     tuushin-teleop slave --key-file K --rendezvous SERVER
 //   on the operator side:  tuushin-teleop master --key-file K --rendezvous SERVER
 //
+// Where both NATs give every destination its own port, no direct path opens;
+// the slave can then take a relay on a TURN server (net/paths.hpp), which
+// the master is told of and tries when its direct hellos go unanswered:
+//
+//   on the robot side:     tuushin-teleop slave --key-file K --rendezvous SERVER
+//                              --turn TURNSERVER --turn-user U --turn-pass-file P
+//
 // Both ends can impair their outgoing datagrams in-process to try a path on
 // loopback: --emulate-delay 25 on each end gives a 50 ms round trip, and
 // --emulate-trace replays a path recorded with tuushin-probe.
@@ -74,6 +81,12 @@ void usage() {
                "      --contact-force      report the contact force, not the coupling force\n"
                "      --wall-k K           simulated wall stiffness in N/m (5000)\n"
                "      --log PREFIX         per-session CSV log PREFIX<session>.csv\n"
+               "      --turn HOST[:PORT]   with --rendezvous: take a relay on this TURN server\n"
+               "                           (port 3478) and announce it, for masters that\n"
+               "                           cannot reach this end directly\n"
+               "      --turn-user NAME     the TURN server's long-term credentials: user name\n"
+               "      --turn-pass-file FILE\n"
+               "                           and a file holding the password (first line)\n"
                "  tuushin-teleop master [HOST] [options]\n"
                "      HOST                 the slave; optional with --rendezvous\n"
                "      --duration S         seconds to run (10)\n"
@@ -118,6 +131,7 @@ double parse_double(const std::string& s, const char* what) {
 
 constexpr std::uint16_t kDefaultPort = 47100;
 constexpr std::uint16_t kDefaultRendezvousPort = 47200;
+constexpr std::uint16_t kDefaultTurnPort = 3478;  // RFC 8656, section 18
 
 struct Options {
   std::string mode;
@@ -144,6 +158,7 @@ struct Options {
   double hold_after_ms = 150.0;
   bool contact_force = false;
   double wall_k = 5000.0;
+  std::string turn, turn_user, turn_pass_file;
   // emulation
   double delay_ms = 0.0, jitter_ms = 0.0, loss = 0.0;
   bool reorder = false;
@@ -343,6 +358,45 @@ std::optional<teleop::RendezvousConfig> rendezvous_of(const Options& o,
   return rc;
 }
 
+// The relay of --turn, reached from `sock`. The password comes from a file
+// rather than the command line, which other users can read in the process
+// list.
+std::optional<teleop::RelayConfig> relay_of(const Options& o, const net::UdpSocket& sock) {
+  if (o.turn.empty()) {
+    if (!o.turn_user.empty() || !o.turn_pass_file.empty()) {
+      throw std::runtime_error("--turn-user and --turn-pass-file need --turn");
+    }
+    return std::nullopt;
+  }
+  if (o.rendezvous.empty()) {
+    throw std::runtime_error("--turn needs --rendezvous, through which the relay is announced");
+  }
+  if (o.turn_user.empty() || o.turn_pass_file.empty()) {
+    throw std::runtime_error("--turn needs --turn-user and --turn-pass-file");
+  }
+  const auto [host, port] = split_host_port(o.turn, kDefaultTurnPort);
+  const auto server = net::Endpoint::resolve(host, port, o.ipv6);
+  if (!server) throw std::runtime_error("cannot resolve TURN server " + host);
+  if (!server->for_family(sock.is_ipv6())) {
+    throw std::runtime_error("the TURN server " + server->to_string() +
+                             " is IPv6, and this host has no IPv6 socket");
+  }
+  std::FILE* f = std::fopen(o.turn_pass_file.c_str(), "r");
+  if (!f) throw std::runtime_error("cannot open " + o.turn_pass_file);
+  char text[512];
+  const std::size_t n = std::fread(text, 1, sizeof text - 1, f);
+  std::fclose(f);
+  std::string password(text, n);
+  password = password.substr(0, password.find_first_of("\r\n"));
+  if (password.empty()) throw std::runtime_error(o.turn_pass_file + " holds no password");
+  struct stat st;
+  if (::stat(o.turn_pass_file.c_str(), &st) == 0 && (st.st_mode & 077) != 0) {
+    std::fprintf(stderr, "note: %s is readable by other users (chmod 600 it)\n",
+                 o.turn_pass_file.c_str());
+  }
+  return teleop::RelayConfig{*server, o.turn_user, password};
+}
+
 std::string join(const std::vector<net::Endpoint>& v) {
   std::string s;
   for (const auto& e : v) s += (s.empty() ? "" : ", ") + e.to_string();
@@ -416,6 +470,9 @@ int run_master(const Options& o) {
     if (!rep.candidates.empty()) {
       std::printf("rendezvous: the slave at %s\n", join(rep.candidates).c_str());
     }
+    if (!rep.relays.empty()) {
+      std::printf("rendezvous: the slave's relay at %s\n", join(rep.relays).c_str());
+    }
   }
   if (rep.rendezvous_failed) {
     std::printf("the rendezvous server announced no slave within %.0f s (is the slave registered "
@@ -427,14 +484,17 @@ int run_master(const Options& o) {
     std::printf("handshake failed: no authenticated reply within %.0f s (is the slave running, "
                 "with the same key?",
                 to_seconds(cfg.handshake_timeout));
-    if (!rep.candidates.empty()) {
+    if (!rep.candidates.empty() && rep.relays.empty()) {
       std::printf(" Or a NAT on the way gives every destination its own port, which hole "
-                  "punching cannot cross; see the README");
+                  "punching cannot cross: give the slave a relay with --turn; see the README");
     }
     std::printf(")\n");
     return 2;
   }
-  if (cfg.rendezvous) std::printf("reached the slave at %s\n", rep.slave.canonical().to_string().c_str());
+  if (cfg.rendezvous) {
+    std::printf("reached the slave at %s%s\n", rep.slave.canonical().to_string().c_str(),
+                rep.relayed ? ", its relay" : "");
+  }
   if (rep.authenticated) std::printf("authenticated (%s)\n", crypto::NoiseNNpsk0::kProtocolName);
 
   std::printf("session %08x, %llu ticks (%llu skipped), master PC active %.1f %%\n", rep.session,
@@ -486,6 +546,7 @@ int run_slave(const Options& o) {
   cfg.log_prefix = o.log;
   cfg.psk = load_key(o);
   cfg.rendezvous = rendezvous_of(o, cfg.psk, sock);
+  cfg.relay = relay_of(o, sock);
 
   teleop::WallParams wall;
   wall.k = o.wall_k;
@@ -502,8 +563,9 @@ int run_slave(const Options& o) {
     std::fprintf(stderr, "rendezvous: %s\n", what.c_str());
   };
   hooks.on_session_end = [](const teleop::SlaveSessionReport& r) {
-    std::printf("session %08x from %s, scheme %s, %s, ended by %s\n", r.session,
-                r.master.canonical().to_string().c_str(), scheme_name(r.scheme),
+    std::printf("session %08x from %s%s, scheme %s, %s, ended by %s\n", r.session,
+                r.master.canonical().to_string().c_str(),
+                r.relayed ? " through the relay" : "", scheme_name(r.scheme),
                 r.authenticated ? "authenticated" : "not authenticated",
                 r.ended_by_final ? "the master" : "timeout or stop");
     std::printf("%llu ticks (%llu skipped), slave PC active %.1f %%\n",
@@ -586,6 +648,9 @@ int main(int argc, char** argv) {
       else if (a == "--hold-after") o.hold_after_ms = parse_double(next(), "hold-after");
       else if (a == "--contact-force") o.contact_force = true;
       else if (a == "--wall-k") o.wall_k = parse_double(next(), "wall-k");
+      else if (a == "--turn") o.turn = next();
+      else if (a == "--turn-user") o.turn_user = next();
+      else if (a == "--turn-pass-file") o.turn_pass_file = next();
       else if (a == "--emulate-delay") o.delay_ms = parse_double(next(), "emulate-delay");
       else if (a == "--emulate-jitter") o.jitter_ms = parse_double(next(), "emulate-jitter");
       else if (a == "--emulate-reorder") o.reorder = true;
@@ -595,6 +660,9 @@ int main(int argc, char** argv) {
       else if ((o.mode == "master" || o.mode == "keygen") && !a.empty() && a[0] != '-' &&
                o.host.empty()) o.host = a;
       else throw std::runtime_error("unknown option " + a);
+    }
+    if (o.mode != "slave" && !o.turn.empty()) {
+      throw std::runtime_error("--turn is for the slave; the master reaches its relay");
     }
     if (o.mode == "master") {
       if (o.host.empty() && o.rendezvous.empty()) {

@@ -278,6 +278,7 @@ UdpSocket::UdpSocket(UdpSocket&& o) noexcept
     : fd_(std::exchange(o.fd_, -1)),
       ipv6_(o.ipv6_),
       rx_timestamps_(o.rx_timestamps_),
+      dscp_(o.dscp_),
       stamps_(o.stamps_) {}
 
 UdpSocket& UdpSocket::operator=(UdpSocket&& o) noexcept {
@@ -286,6 +287,7 @@ UdpSocket& UdpSocket::operator=(UdpSocket&& o) noexcept {
     fd_ = std::exchange(o.fd_, -1);
     ipv6_ = o.ipv6_;
     rx_timestamps_ = o.rx_timestamps_;
+    dscp_ = o.dscp_;
     stamps_ = o.stamps_;
   }
   return *this;
@@ -312,6 +314,7 @@ bool UdpSocket::set_dscp(int dscp) {
   } else {
     ok = ::setsockopt(fd_, IPPROTO_IP, IP_TOS, &tos, sizeof tos) == 0;
   }
+  if (ok) dscp_ = dscp;
   return ok;
 }
 
