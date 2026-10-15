@@ -24,7 +24,7 @@ and also tested on Linux (Ubuntu 24.04, GCC 13.3). MIT licensed.
 | `control/` | Time Domain Passivity Approach (TDPA): passivity observers and controllers in the conventional two-channel form, and the variant that books energy reflection at a slave-side position coupling in one store (Panzirsch, Ryu and Ferre 2019, "Approach 3"). The passivity controllers predict the work a zero-order-held force will do on a light device instead of assuming constant velocity. |
 | `codec/` | Perceptual deadband data reduction (Weber's law, Hinterseer et al. 2008). |
 | `teleop/` | Master and slave controllers, the device interface (`Device1D`) with simulated devices, `HapticLink` (one end of a session over UDP), and real-time master and slave nodes. |
-| `net/` | UDP sockets with kernel receive timestamps and hop-limited sends, clock-skew estimation from four-timestamp exchanges, channel models (fixed delay, jitter, Gilbert-Elliott loss, bottleneck queue, recorded traces), path measurement with probes and a reflector, a rendezvous server and client for ends behind NATs, and STUN messages and a TURN client (RFC 8656) for a relayed path where no direct one opens (see NAT traversal below). |
+| `net/` | UDP sockets with kernel receive timestamps and hop-limited sends, clock-skew estimation from four-timestamp exchanges, channel models (fixed delay, jitter, Gilbert-Elliott loss, bottleneck queue, recorded traces), path measurement with probes and a reflector, a rendezvous server and client for ends behind NATs, a measurement of how many hops an end's own NATs reach, and STUN messages and a TURN client (RFC 8656) for a relayed path where no direct one opens (see NAT traversal below). |
 | `wire/` | The datagram format: a 32-byte header whose echo fields let each end measure the round trip from ordinary traffic, as RTCP does. |
 | `crypto/` | A Noise_NNpsk0 handshake and ChaCha20-Poly1305 on libsodium: a pre-shared key becomes fresh keys for every session, and every datagram is authenticated and encrypted (see Authentication below). SHA-1, HMAC-SHA1 and MD5, only because STUN and TURN require them. |
 | `sim/` | A deterministic 1-DoF teleoperation simulator built on the same controllers and devices. |
@@ -333,25 +333,54 @@ the IPFS network and found 70 % of them succeed, propose sending low-TTL
 packets first (section 7.2). tuushin does two things:
 
 - **Priming.** On learning the other end's candidates, each end first sends
-  them datagrams with a small hop limit (`--prime-hops`, 3 by default).
-  They open its own NAT and expire on the way, before they reach the other
-  NAT.
+  them datagrams with a small hop limit, measured at start (below). They
+  open its own NAT and expire on the way, before they reach the other NAT.
 - **Ready.** Each end then tells the server it is ready, and sends
   datagrams that go the whole way (hellos, punches) only once the server
   has passed on the other end's ready, or after 2 s without it. The server
   forgets an end's ready when the other end moves or registers anew, and
   tells the end so.
 
-Choosing `--prime-hops`: a datagram sent with a hop limit of t is
-forwarded by the first t − 1 routers and dropped by the t-th. It has to
-pass this end's NATs and must not reach the other end's, which takes a
-datagram addressed to itself whatever hop limit it has left. 3 passes a
-home router and the next hop (often a carrier-grade NAT) and stops before
-the other end's NAT wherever that is more than 3 hops away, as it nearly
-always is for two homes (traceroute shows the count). Two ends close
-together on one network may need 2. With 0, or on a system that cannot
-limit the hop count, nothing is primed: the master still waits for the
-slave's ready, but the slave, which must then go first, punches at once.
+**The hop limit.** A datagram sent with a hop limit of t is forwarded by
+the first t − 1 routers and dropped by the t-th. It has to pass every NAT
+in front of this end (a home router, and often a carrier-grade NAT behind
+it) and must not reach the other end's, which takes a datagram addressed to
+itself whatever hop limit it has left. Guha and Francis (2005), on the same
+method for TCP, name choosing it as a problem and leave it open. tuushin
+measures it the way traceroute finds a path: while it registers, each end
+sends small datagrams towards the rendezvous server with hop limits 1 to
+10, each from a socket of its own, and reads the routers' time-exceeded
+errors from the sockets' error queues (`IP_RECVERR`, Linux). A NAT must
+send such errors and pass back those for its mappings (RFC 5508). Linux
+sends them from its inside address, which is private (RFC 1918) or, at a
+carrier-grade NAT, shared (RFC 6598); the first router that answers from a
+public address is past this end's NATs, and its hop count is the limit. A
+NAT that answers from its outside address instead, as many home routers
+do, answers from the address the server sees this end at, and the limit is
+one past it. Silent routers are skipped: once the first public router has
+answered, the silent hops before it get one more probe and twice its round
+trip to answer. The measurement runs alongside the registration, which
+takes a round trip to the server, further away, so it delays little.
+
+Each end prints what it found (`rendezvous: priming with hop limit 2
+(measured: 10.0.0.1, 198.51.100.1)`). Where nothing can be measured the
+limit is 3, which passes a home router and the next hop and stops before
+the other end's NAT wherever that is more than 3 hops away: on systems
+other than Linux, with a server at an IPv6 or private address, and behind
+a NAT that passes no errors back, after waiting 0.5 s for them.
+`--prime-hops N` sets the limit instead of measuring it. With 0, or on a
+system that cannot limit the hop count, nothing is primed: the master
+still waits for the slave's ready, but the slave, which must then go
+first, punches at once.
+
+A limit too large reaches the other NAT. One too small opens nothing,
+and then the ready alone orders the datagrams, which fails when the other
+end becomes ready later than this one by more than its datagrams take to
+reach this end's NAT: the late end knows at once that this one is ready
+and sends, while this end hears of the late ready only through the server.
+An end is late when its route to the server is longer, or its measurement
+waits; the difference is most likely to exceed the route between the ends
+when they are close to each other and far from the server.
 
 `tools/nat_lab.sh` builds a master and a slave behind Linux NATs that
 filter by address and port, a rendezvous server and a chain of routers
@@ -362,19 +391,24 @@ session:
 
 | scenario | result | time |
 |---|---|---|
-| cone NATs (endpoint-independent mapping) | connects | 2.15 s |
-| the master starts 0.5 s before the slave | connects | 2.65 s |
+| cone NATs (endpoint-independent mapping) | connects; measured limit 2 | 2.14 s |
+| the master starts 0.5 s before the slave | connects | 2.66 s |
 | both behind one NAT | connects, over the LAN | 2.09 s |
-| the slave 100 ms behind its NAT | connects | 2.76 s |
-| the master 100 ms behind its NAT | connects | 2.97 s |
+| the slave 100 ms behind its NAT | connects | 2.75 s |
+| the master 100 ms behind its NAT | connects | 2.98 s |
 | both NATs accept datagrams to themselves | connects | 2.14 s |
-| the slave 100 ms behind a NAT that accepts them | connects (failed without priming and ready) | 2.75 s |
-| the master 100 ms behind a NAT that accepts them | connects (failed without priming and ready) | 2.98 s |
-| both 100 ms behind NATs that accept them | connects | 3.58 s |
-| the slave 100 ms behind a NAT that accepts them, `--prime-hops 0` | connects: ready alone orders it | 2.76 s |
+| the slave 100 ms behind a NAT that accepts them | connects (failed without priming and ready) | 2.77 s |
+| the master 100 ms behind a NAT that accepts them | connects (failed without priming and ready) | 2.97 s |
+| both 100 ms behind NATs that accept them | connects | 3.57 s |
+| the slave 100 ms behind a NAT that accepts them, `--prime-hops 0` | connects: ready alone orders it | 2.75 s |
 | the master 100 ms behind a NAT that accepts them, `--prime-hops 0` | fails: the NAT moved the master to another port | — |
-| the same, primed, with one router between the NATs | fails: the primes reach the other NAT, with one hop to live | — |
-| the same with `--prime-hops 2` | connects | 2.96 s |
+| the same, primed, with one router between the NATs | connects; measured limit 2 | 2.97 s |
+| the same with `--prime-hops 3` (the earlier default) | fails: the primes reach the other NAT, with one hop to live | — |
+| a carrier-grade NAT behind one home router, or behind both | connects; measured limit 3 there | 2.19 s, 2.22 s |
+| the carrier-grade NATs send no time-exceeded errors | connects; limit 3, past the silent hop | 2.25 s |
+| home routers that answer from their outside address | connects; limit 2, one past the NAT | 2.15 s |
+| home routers that pass no errors back | connects; not measured, limit 3 after 0.5 s | 2.59 s |
+| the slave's NAT passes no errors back, so the slave is ready 0.5 s late; the master starts first, behind a NAT that accepts datagrams to itself and answers from its outside address | connects; limit 2 (with 1, the first public answer, which opens nothing, it failed) | 3.12 s |
 | a symmetric NAT (a new port per destination) at either end or both | fails without a relay (Through a relay, below) | — |
 
 The slave punches until its session starts, so an end 100 ms behind its
@@ -563,9 +597,12 @@ the slave kept sending to the master's port for the old relay.
   the session, and a relayed session starts more than a second after the
   master (it waits `relay_delay`): the lab's `--turn --rebind-at 1` loses
   it.
-- **`--prime-hops` is a guess about the path.** Two ends a few hops apart
-  need a smaller value, or the primes reach the other NAT (the lab's one-
-  router case); nothing measures the hop count yet.
+- **The hop limit is measured only on Linux, over IPv4, and once.**
+  Elsewhere, and behind a NAT that passes no errors back, it is 3, which
+  is too large for two ends a few hops apart (the lab's one-router case).
+  It is measured at start and not again when an end moves. A carrier-grade
+  NAT that answers from a pool address other than the one the server sees
+  is taken for a router past it, so the limit stops inside it.
 - **A move costs about 100 ms plus a round trip to the server** (When an end
   moves, above), about 200 ms through a relay, during which the ends hear
   nothing from each other, as in any outage. Behind a NAT that
@@ -582,8 +619,8 @@ the slave kept sending to the master's port for the old relay.
 
 - Traces of real paths (fibre, 4G and 5G in Japan) recorded with
   `tuushin-probe`, published so that any simulator or testbed can replay them.
-- A measured hop count for priming; a relayed session that moves to a
-  direct path once one opens; then QUIC datagrams as a transport.
+- A relayed session that moves to a direct path once one opens; then QUIC
+  datagrams as a transport.
 - Deadbands that adapt to the measured delay; more degrees of freedom; a real
   device behind `Device1D`.
 
@@ -625,6 +662,12 @@ The code cites its sources where it uses them. The main ones:
   knowledge: large scale measurement campaign on decentralized NAT
   traversal", arXiv:2510.27500, 2025, for priming with low-TTL datagrams
   (section 7.2).
+- S. Guha and P. Francis, "Characterization and measurement of TCP
+  traversal through NATs and firewalls", IMC 2005, for the low-TTL methods
+  and their open question, the hop limit; P. Srisuresh, B. Ford,
+  S. Sivakumar and S. Guha, RFC 5508, for what NATs do with ICMP errors;
+  J. Weil et al., RFC 6598, for the shared address space, and
+  S. Perreault et al., RFC 6888, for the carrier-grade NATs that use it.
 
 ## License
 
