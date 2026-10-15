@@ -53,6 +53,24 @@ class Device1D {
   // micrometres off: work booked that no force did. The controllers book
   // this instead when it is given.
   virtual std::optional<double> port_work() const { return std::nullopt; }
+  // Whether the device keeps the commanded force's port_work() within a
+  // cap the host sends with it (command_force_capped), on its own ticks.
+  // The books learn of the work a sample and a link's latency after it
+  // was done, and a device against a stiff object can do a contact's
+  // worth of it in that time; the device can stop it within a tick.
+  virtual bool limits_work() const { return false; }
+  // command_force, with port_work() kept at most `work_cap` (J, on
+  // port_work()'s count) while this force is in effect, if the device
+  // limits_work(); a force that takes energy out is never held back.
+  virtual void command_force_capped(double f, double /*work_cap*/) { command_force(f); }
+  // How much further than the port_work() the last read returned the
+  // forces commanded so far may still take it (J, at least 0): the
+  // largest cap among the commands that may be in effect now or later.
+  // A controller keeps that much of its energy for the device instead of
+  // passing it on, which the device would otherwise spend a second time.
+  // Infinite while a force without a cap may still be in effect; empty
+  // for a device that does not limit its work.
+  virtual std::optional<double> work_reserved() const { return std::nullopt; }
   // Why the device cannot go on (a latched fault, a link that went
   // quiet), or nullptr while it can. A node ends its session on it.
   virtual const char* fault() const { return nullptr; }

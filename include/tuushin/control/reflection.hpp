@@ -89,7 +89,13 @@ class ReflectiveStore {
   // it leaves for the master and cannot be taken back; the slave's share is
   // only an allowance for the slave PC, and the realized output is booked
   // through account_slave_energy on the next sample.
-  Grant allocate(double want_slave, double want_master);
+  //
+  // `reserved` (J) is what the slave device may still take out under the
+  // work caps it was sent (teleop::Device1D::work_reserved) beyond what is
+  // booked. The store will pay it whatever the PC grants now, so the master
+  // gets none of it: its share is at most level() - reserved, and the
+  // slave's grows into what that leaves.
+  Grant allocate(double want_slave, double want_master, double reserved = 0.0);
 
   // Cumulative energy granted to the master. Send it with every backward
   // packet; the master uses it as the remote input energy of its EnergyPort.

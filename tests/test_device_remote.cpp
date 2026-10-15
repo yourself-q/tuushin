@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <memory>
@@ -126,6 +127,15 @@ struct Bench {
       dev->command_force(force);
     }
   }
+  // The same with a work cap on every command (J, port_work's count).
+  void run_capped(double dur, double force, double cap) {
+    const double end = link->time() + dur;
+    while (link->time() < end - 1e-9) {
+      link->advance_to(link->time() + 1e-3, dev.get());
+      dev->read_position(link->clock());
+      dev->command_force_capped(force, cap);
+    }
+  }
   bool logged(const char* what) const {
     for (const auto& l : logs) {
       if (l.find(what) != std::string::npos) return true;
@@ -238,6 +248,36 @@ TEST_CASE(remote_port_work_is_the_devices_from_the_connect_on) {
     CHECK_NEAR(w, b.link->plant().motor_work() - w0, 2e-5);
     CHECK_NEAR(w, b.dev->actuator_work(), 0.0);
     CHECK_NEAR(w, 1.0 * 0.004 + 0.5 * 0.006, 3e-4);
+  }
+}
+
+TEST_CASE(remote_work_cap_stops_the_knob_where_the_work_reaches_it) {
+  // 1 N against the hand's 0.1 N m/rad would do 4 mJ; capped at 1 mJ the
+  // device lets it go only as far as 1 mJ takes it, whichever way x runs.
+  for (bool reverse : {false, true}) {
+    RemoteConfig cfg;
+    cfg.reverse = reverse;
+    Bench b(quiet(), 0.5e-3, cfg);
+    b.dev->connect();
+    CHECK(b.dev->limits_work());
+    REQUIRE(b.dev->work_reserved().has_value());
+    CHECK(*b.dev->work_reserved() == 0.0);  // nothing commanded
+    b.hold(0.1);
+    b.run_capped(1.0, 1.0, 1e-3);
+    const double w = *b.dev->port_work();
+    CHECK(w <= 1e-3 + 2e-6);
+    CHECK(w > 0.9e-3);
+    CHECK(b.dev->latest_state().flags & kStateCapped);
+    // What the caps in flight still allow.
+    CHECK_NEAR(*b.dev->work_reserved(), std::max(0.0, 1e-3 - w), 1e-12);
+    // Without a cap the device may do any work while the command may be
+    // in effect, and none once a disable has taken over.
+    b.run(0.01, 1.0);
+    CHECK(std::isinf(*b.dev->work_reserved()));
+    b.dev->disable();
+    b.link->advance_to(b.link->time() + 5e-3, b.dev.get());
+    b.dev->read_position(b.link->clock());
+    CHECK(*b.dev->work_reserved() == 0.0);
   }
 }
 

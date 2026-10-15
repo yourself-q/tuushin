@@ -119,8 +119,17 @@ class RemoteDevice final : public teleop::Device1D {
   // first command switches the driver on.
   void command_force(double f) override;
   Nanos force_cut_after() const override;
-  // The work the State used last reports, since connect().
+  // The work the State used last reports, with the tax the device booked
+  // on its own under a work cap, since connect().
   std::optional<double> port_work() const override;
+  // With firmware that keeps work caps (Info::flags & kInfoWorkCap).
+  bool limits_work() const override;
+  // The cap goes to the device on its own count; with firmware that keeps
+  // none, the force goes without it.
+  void command_force_capped(double f, double work_cap) override;
+  // From the caps of the commands from the one the State used last
+  // applied on: the device applies the newest it has.
+  std::optional<double> work_reserved() const override;
   const char* fault() const override;
 
   // Switches the driver off; the next command_force switches it on.
@@ -179,7 +188,8 @@ class RemoteDevice final : public teleop::Device1D {
   void pump_locked(Nanos now);
   void on_state(const State& s, Nanos now);
   void send(const std::uint8_t* frame, std::size_t n);
-  void send_command(double torque, std::uint8_t flags);
+  // `work_cap` on the device's count, with kCmdWorkCap.
+  void send_command(double torque, std::uint8_t flags, double work_cap = 0.0);
   // Waits until `done` (checked under the lock) or `deadline`, polling.
   bool wait_for(const std::function<bool()>& done, Nanos deadline);
   float set_param(Param p, double value);
@@ -212,10 +222,14 @@ class RemoteDevice final : public teleop::Device1D {
   std::uint16_t seq_ = 0;
   bool sent_any_ = false;
   Nanos sent_at_[64] = {};
+  // The most work + tax, on the device's count, each command lets the
+  // device reach: -inf for one that applies no torque, +inf for one
+  // without a cap, and for those not sent from here.
+  double caps_[64];
   float torque_limit_ = 0.0f;
   float damping_ = 0.0f;
   Nanos ack_rtt_ = 0;
-  double work0_ = 0.0;
+  double work0_ = 0.0, tax0_ = 0.0;  // the device's at connect()
   State used_;  // the State the last read used
   mutable std::string fault_;
 

@@ -621,15 +621,20 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
     // sample carries the same, final, figures.
     MasterController::Step st;
     if (!final) {
-      st = ctl.step(now, device.sampled_at(now), x, device.force_cut_after(), device.port_work());
-      device.command_force(-st.display_force);
+      st = ctl.step(now, device.sampled_at(now), x, device.force_cut_after(), device.port_work(),
+                    device.work_reserved());
+      if (st.work_cap) {
+        device.command_force_capped(-st.display_force, *st.work_cap);
+      } else {
+        device.command_force(-st.display_force);
+      }
     } else {
       device.command_force(0.0);
     }
     const double net = port.input_energy() - port.output_energy();
     if (st.send || final) {
       const Sample s =
-          st.send ? st.sample : Sample{ctl.velocity(), x, port.reported_input_energy()};
+          st.send ? st.sample : Sample{ctl.velocity(), x, ctl.reported_energy()};
       link.send(now, s, net, final);
     }
 
@@ -1042,8 +1047,12 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
       SlaveController::Step st;
       if (!final) {
         st = ctl.step(now, device.sampled_at(now), x, device.velocity(), fc,
-                       device.force_cut_after(), device.port_work());
-        device.command_force(st.force);
+                       device.force_cut_after(), device.port_work(), device.work_reserved());
+        if (st.work_cap) {
+          device.command_force_capped(st.force, *st.work_cap);
+        } else {
+          device.command_force(st.force);
+        }
       } else {
         device.command_force(0.0);
       }

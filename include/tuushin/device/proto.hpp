@@ -62,7 +62,7 @@ struct Command {
   float torque = 0.0f;  // N m, along +count
   std::uint8_t flags = 0;
   // With kCmdWorkCap: the most work the torque may have done on the shaft
-  // (J, on State::work's count, since the device started) while this
+  // (J, State::work + State::tax, since the device started) while this
   // command is in effect. A device that advertises kInfoWorkCap scales the
   // torque down on its own ticks, from where the shaft is going, so as to
   // keep its work within the cap; a torque that takes energy out of the

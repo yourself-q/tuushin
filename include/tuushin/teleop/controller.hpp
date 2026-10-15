@@ -236,6 +236,11 @@ class MasterController {
     bool pc_active = false;
     bool send = false;  // false when the deadband suppressed the sample
     Sample sample;      // for the slave, valid when send is set
+    // The cap on the device's port_work() (same count) to command the
+    // force with (Device1D::command_force_capped): what the books allow
+    // it from the reading on, the budget. Set with a passivity controller
+    // and the device's measured work.
+    std::optional<double> work_cap;
   };
 
   // One sample at time `now` with the encoder at `position`. Books the work
@@ -263,8 +268,13 @@ class MasterController {
   // flight. `port_work` is the device's Device1D::port_work(): when given,
   // the books take the work the device measured instead of the device
   // model's split of the displacement, which the model still observes.
+  // `work_reserved` is the device's Device1D::work_reserved(): of the
+  // input energy it reports, the controller holds back what the device
+  // may still spend beyond the budget under the caps it was sent, which
+  // the slave would otherwise spend as well (reported_energy()).
   Step step(Nanos now, Nanos sampled, double position, Nanos cut_after,
-            std::optional<double> port_work = std::nullopt);
+            std::optional<double> port_work = std::nullopt,
+            std::optional<double> work_reserved = std::nullopt);
 
   // The velocity sent with the last step: the backward difference of the
   // encoder positions, or the device model's estimate with an encoder
@@ -277,6 +287,10 @@ class MasterController {
   bool has_slave_sample() const { return has_value_; }
   // Energy books at the master device port (power into the teleoperator).
   const control::EnergyPort& port() const { return port_; }
+  // The input energy reported to the slave with the last step: the port's
+  // reported_input_energy(), less what the device's caps may still spend
+  // of it. It only grows.
+  double reported_energy() const { return reported_; }
   // The actuation delay the controller books and predicts with: the
   // configured one, or its estimate.
   Nanos actuation_delay() const { return model_.actuation_delay(); }
@@ -300,6 +314,7 @@ class MasterController {
   bool has_value_ = false;
   std::uint32_t last_seq_ = 0;
   double f_reflected_ = 0.0;
+  double reported_ = 0.0;
   std::uint64_t sent_ = 0;
 };
 
@@ -361,6 +376,9 @@ class SlaveController {
     bool pc_active = false;
     bool send = false;
     Sample sample;  // for the master, valid when send is set
+    // As in MasterController::Step, kReflective only: the slave's grant,
+    // and a share of the store beyond it (kCapSpareShare in the source).
+    std::optional<double> work_cap;
   };
 
   // One sample at time `now` with the encoder at `position`, the device's
@@ -373,9 +391,12 @@ class SlaveController {
     return step(now, now, position, velocity, contact_force, cut_after);
   }
   // The same for a position sampled at `sampled`, and with the work the
-  // device measured, as in MasterController.
+  // device measured, as in MasterController. kReflective grants the master
+  // none of what the device may still take out under its caps
+  // (`work_reserved`, control::ReflectiveStore::allocate).
   Step step(Nanos now, Nanos sampled, double position, double velocity, double contact_force,
-            Nanos cut_after, std::optional<double> port_work = std::nullopt);
+            Nanos cut_after, std::optional<double> port_work = std::nullopt,
+            std::optional<double> work_reserved = std::nullopt);
 
   // Diagnostics of the last step.
   double command() const { return x_cmd_; }            // coupling target (m)

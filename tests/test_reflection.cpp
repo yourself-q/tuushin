@@ -696,3 +696,27 @@ TEST_CASE(reflective_store_initial_energy_bounds_net_output) {
         s.master_input_energy() + s.slave_input_energy() + s.initial_energy() + 1e-15);
   CHECK_NEAR(ReflectiveStore(-1.0).level(), 0.0, 0.0);
 }
+
+TEST_CASE(reflective_store_keeps_the_devices_reservation_from_the_master) {
+  // The slave device may still take 0.7 J out under the caps it was sent:
+  // the master gets at most what is left beside it.
+  ReflectiveStore s;
+  s.on_master_input_energy(1.0);
+  auto g = s.allocate(0.1, 0.5, 0.7);
+  CHECK(g.limited);
+  CHECK_NEAR(g.master, 0.3, 1e-15);
+  CHECK_NEAR(g.slave, 0.1, 1e-15);
+  CHECK_NEAR(s.level(), 0.7, 1e-15);
+  // Reserved beyond the level: nothing for the master, and the slave's
+  // share grows into what the master's would have taken.
+  g = s.allocate(0.9, 0.2, 2.0);
+  CHECK(g.limited);
+  CHECK(g.master == 0.0);
+  CHECK_NEAR(g.slave, 0.7, 1e-15);
+  // A request that fits beside the reservation passes unchanged.
+  ReflectiveStore t;
+  t.on_master_input_energy(1.0);
+  g = t.allocate(0.2, 0.3, 0.5);
+  CHECK(!g.limited);
+  CHECK(g.master == 0.3 && g.slave == 0.2);
+}

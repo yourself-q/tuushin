@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
+#include <limits>
 #include <stdexcept>
 
 #include "tuushin/rt/thread.hpp"
@@ -147,6 +149,7 @@ RemoteDevice::RemoteDevice(std::unique_ptr<ByteStream> stream, const RemoteConfi
     : stream_(std::move(stream)), cfg_(cfg), sign_(cfg.reverse ? -1.0 : 1.0) {
   if (!stream_) throw std::invalid_argument("RemoteDevice: no stream");
   if (!(cfg_.radius > 0.0)) throw std::invalid_argument("RemoteDevice: the radius must be positive");
+  std::fill(std::begin(caps_), std::end(caps_), std::numeric_limits<double>::infinity());
 }
 
 RemoteDevice::~RemoteDevice() {
@@ -267,17 +270,22 @@ void RemoteDevice::send(const std::uint8_t* frame, std::size_t n) {
   }
 }
 
-void RemoteDevice::send_command(double torque, std::uint8_t flags) {
+void RemoteDevice::send_command(double torque, std::uint8_t flags, double work_cap) {
   Command c;
+  c.torque = static_cast<float>(torque);
+  c.flags = flags;
+  c.work_cap = work_cap;
   {
     std::lock_guard<std::mutex> lk(mu_);
     c.seq = ++seq_;
     sent_at_[c.seq & 63] = now();
+    constexpr double kInf = std::numeric_limits<double>::infinity();
+    caps_[c.seq & 63] = !(flags & kCmdEnable) || c.torque == 0.0f ? -kInf
+                        : (flags & kCmdWorkCap)                    ? work_cap
+                                                                   : kInf;
     sent_any_ = true;
     ++stats_.commands;
   }
-  c.torque = static_cast<float>(torque);
-  c.flags = flags;
   std::uint8_t frame[kMaxFrame];
   const std::size_t n = encode(c, frame);
   send(frame, n);
@@ -450,6 +458,7 @@ void RemoteDevice::connect() {
   {
     std::lock_guard<std::mutex> lk(mu_);
     work0_ = state_.work;
+    tax0_ = state_.tax;
     used_ = state_;
     stats_ = RemoteStats{};
     stats_.crc_errors = reader_.crc_errors();
@@ -503,6 +512,37 @@ void RemoteDevice::command_force(double f) {
   send_command(sign_ * f * cfg_.radius, kCmdEnable);
 }
 
+bool RemoteDevice::limits_work() const {
+  return connected_ && (info_.flags & kInfoWorkCap) != 0;
+}
+
+void RemoteDevice::command_force_capped(double f, double work_cap) {
+  if (!connected_) return;
+  if (!limits_work()) {
+    command_force(f);
+    return;
+  }
+  send_command(sign_ * f * cfg_.radius, kCmdEnable | kCmdWorkCap, work_cap + work0_ + tax0_);
+}
+
+std::optional<double> RemoteDevice::work_reserved() const {
+  if (!limits_work()) return std::nullopt;
+  std::lock_guard<std::mutex> lk(mu_);
+  constexpr double kInf = std::numeric_limits<double>::infinity();
+  // The commands from the one the State applied to the newest; the older
+  // ones are behind the device. A State that applied none of the last 64
+  // leaves them unknown.
+  // None sent: a command left from before was cut by the watchdog.
+  if (!sent_any_) return 0.0;
+  const auto behind = static_cast<std::uint16_t>(seq_ - used_.cmd_seq);
+  if (behind >= 64) return kInf;
+  double cap = -kInf;
+  for (std::uint16_t k = 0; k <= behind; ++k) {
+    cap = std::max(cap, caps_[static_cast<std::uint16_t>(used_.cmd_seq + k) & 63]);
+  }
+  return std::max(0.0, cap - (used_.work + used_.tax));
+}
+
 void RemoteDevice::disable() {
   send_command(0.0, 0);
 }
@@ -547,7 +587,8 @@ std::optional<double> RemoteDevice::port_work() const {
   if (!connected_) return std::nullopt;
   // The device sums the torque times the angle; with x = sign r theta and
   // the torque sign f r, that is f times x as the controllers see them.
-  return used_.work - work0_;
+  // Its tax is work the books have to count as done.
+  return used_.work - work0_ + (used_.tax - tax0_);
 }
 
 double RemoteDevice::actuator_work() const {

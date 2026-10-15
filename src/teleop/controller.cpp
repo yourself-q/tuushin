@@ -97,6 +97,9 @@ constexpr double kShorterSeconds = 0.1;
 constexpr double kAdaptPerSecond = 3.0;
 constexpr double kAdaptNisClip = 9.0;
 constexpr double kAdaptLogMax = 5.545177444479562;  // 2 ln 16
+// The share of the reflective store, beyond its grant, that the slave
+// device's work cap lets it take out (SlaveController::step).
+constexpr double kCapSpareShare = 0.5;
 
 // The work into the two-port over a sample: the device's measured work
 // when it reports it, else the device model's. The port force phi opposes
@@ -259,7 +262,8 @@ void MasterController::receive(std::uint32_t seq, const Sample& s) {
 }
 
 MasterController::Step MasterController::step(Nanos now, Nanos sampled, double position,
-                                              Nanos cut_after, std::optional<double> port_work) {
+                                              Nanos cut_after, std::optional<double> port_work,
+                                              std::optional<double> work_reserved) {
   // Book the work the forces over the last sample actually did, then
   // display the reflected force through the PC. The velocity is the backward
   // difference of the encoder position, as on a real device.
@@ -308,6 +312,16 @@ MasterController::Step MasterController::step(Nanos now, Nanos sampled, double p
   }
   f_display_ = out.display_force;
   model_.command(now, f_display_);
+  if (cfg_.passivity != Passivity::kNone && port_work_) {
+    out.work_cap = *port_work_ + port_.budget();
+  }
+  // The device may take the port's work up to the largest cap it still
+  // holds, and an input booked since that cap was sent lowered the work
+  // without raising the budget: it was reported, and the device can
+  // spend it again. So what the caps reach beyond the budget is held back
+  // from the report until the device has commands with smaller ones.
+  const double hold = work_reserved ? std::max(0.0, *work_reserved - port_.budget()) : 0.0;
+  reported_ = std::max(reported_, port_.reported_input_energy() - hold);
 
   // A coarse encoder's backward difference is mostly quantization noise
   // (q / dt: 5.5 cm/s for 55 um at 1 kHz), which the slave's damping would
@@ -316,7 +330,7 @@ MasterController::Step MasterController::step(Nanos now, Nanos sampled, double p
   v_sent_ = cfg_.encoder_resolution > 0.0 && dev.ready() ? dev.velocity_dt() / dt_ : v_meas_;
   out.send = cfg_.deadband ? enc_.update(Vec1{{v_sent_}}, now) : true;
   if (out.send) {
-    out.sample = Sample{v_sent_, position, port_.reported_input_energy()};
+    out.sample = Sample{v_sent_, position, reported_};
     ++sent_;
   }
   return out;
@@ -356,7 +370,8 @@ void SlaveController::receive(std::uint32_t seq, const Sample& s) {
 
 SlaveController::Step SlaveController::step(Nanos now, Nanos sampled, double position,
                                             double velocity, double contact_force,
-                                            Nanos cut_after, std::optional<double> port_work) {
+                                            Nanos cut_after, std::optional<double> port_work,
+                                            std::optional<double> work_reserved) {
   const bool fresh = fresh_;
   fresh_ = false;
   if (fresh) fresh_at_ = now;
@@ -391,6 +406,7 @@ SlaveController::Step SlaveController::step(Nanos now, Nanos sampled, double pos
   v_requested_ = v_received;
 
   Step out;
+  control::ReflectiveStore::Grant grant;
   if (cfg_.passivity == Passivity::kReflective) {
     // The coupling follows the delayed master position itself. The PC scales
     // the coupling force on the slave device only, so the command is never
@@ -426,7 +442,7 @@ SlaveController::Step SlaveController::step(Nanos now, Nanos sampled, double pos
                               : dev.ready()      ? tax - dev.work(phi) - lead
                                                   : 0.0;
     const double want_master = -f_slave_ * v_c_ * dt_;
-    const auto grant = store_.allocate(want_slave, want_master);
+    grant = store_.allocate(want_slave, want_master, work_reserved.value_or(0.0));
     const auto pc = cfg_.predictive_pc
                         ? control::limit_force_predictive(grant.slave, phi, dev,
                                                           cfg_.pc_hold_samples, cfg_.pc_confidence,
@@ -460,11 +476,23 @@ SlaveController::Step SlaveController::step(Nanos now, Nanos sampled, double pos
     f_ctrl_ = f_coupling;
     x_cmd_ += v_c_ * dt_;
   }
-  if (cfg_.encoder_resolution > 0.0) {
-    const double tax =
-        control::quantization_tax(cfg_.encoder_resolution, dev.held_force(), -f_ctrl_);
-    terminal_net_ -= tax;
-    if (cfg_.passivity == Passivity::kReflective) store_.account_slave_energy(-tax);
+  const double tax =
+      cfg_.encoder_resolution > 0.0
+          ? control::quantization_tax(cfg_.encoder_resolution, dev.held_force(), -f_ctrl_)
+          : 0.0;
+  terminal_net_ -= tax;
+  if (cfg_.passivity == Passivity::kReflective) {
+    store_.account_slave_energy(-tax);
+    if (port_work_) {
+      // The device's cap: its grant, less the tax, which is booked and
+      // is no work of the device's, and a share of what the store holds
+      // beyond, which the master then cannot be granted while the cap is
+      // in effect. Without the share a misprediction would scale the
+      // force down at once; with all of it the master would get nothing.
+      const double spare = std::max(0.0, store_.level());
+      const double own = std::clamp(grant.slave - tax, 0.0, spare);
+      out.work_cap = *port_work_ + own + kCapSpareShare * (spare - own);
+    }
   }
   model_.command(now, -f_ctrl_);
   x_master_est_ += v_received * dt_;

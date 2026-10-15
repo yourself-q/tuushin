@@ -407,3 +407,68 @@ TEST_CASE(slave_resets_estimate_to_each_new_position) {
   CHECK(std::fabs(st.sample.value - cfg.kp * 0.005) < 1e-9);
   CHECK(st.force == 0.0 || std::fabs(st.force) < 1e-12);
 }
+
+TEST_CASE(master_caps_the_devices_work_at_the_budget) {
+  MasterConfig cfg;
+  {
+    // Without the device's measured work there is nothing to cap.
+    MasterController m(cfg);
+    m.receive(1, Sample{0.0, 0.0, 0.010});
+    CHECK(!m.step(0, 0.0).work_cap);
+  }
+  MasterController m(cfg);
+  m.receive(1, Sample{0.0, 0.0, 0.010});
+  const auto s = m.step(0, 0, 0.0, 0, 0.002);
+  REQUIRE(s.work_cap.has_value());
+  CHECK_NEAR(m.port().budget(), 0.010, 1e-15);
+  CHECK_NEAR(*s.work_cap, 0.012, 1e-15);
+  cfg.passivity = Passivity::kNone;
+  MasterController none(cfg);
+  CHECK(!none.step(0, 0, 0.0, 0, 0.002).work_cap);
+}
+
+TEST_CASE(master_holds_back_what_the_devices_caps_may_still_spend) {
+  // The hand put 3 mJ into the master device while a command whose cap
+  // let the device's work reach the 2 mJ budget above the reading before
+  // was still in effect: the device may still do 5 mJ, which the budget
+  // covers only 2 of. The 3 mJ the port reports are held back until the
+  // device has the commands with the smaller cap.
+  MasterController m(MasterConfig{});
+  m.receive(1, Sample{0.0, 0.0, 0.002});
+  m.step(0, 0, 0.0, 0, 0.0, 0.0);
+  auto s = m.step(kNanosPerMilli, kNanosPerMilli, 0.0, 0, -0.003, 0.005);
+  CHECK_NEAR(m.port().reported_input_energy(), 0.003, 1e-15);
+  CHECK_NEAR(m.reported_energy(), 0.0, 1e-15);
+  CHECK_NEAR(s.sample.energy, 0.0, 1e-15);
+  s = m.step(2 * kNanosPerMilli, 2 * kNanosPerMilli, 0.0, 0, -0.003, 0.002);
+  CHECK_NEAR(s.sample.energy, 0.003, 1e-15);
+  // What was reported stays reported.
+  s = m.step(3 * kNanosPerMilli, 3 * kNanosPerMilli, 0.0, 0, -0.003, 1.0);
+  CHECK_NEAR(s.sample.energy, 0.003, 1e-15);
+}
+
+TEST_CASE(slave_caps_the_devices_work_and_keeps_it_from_the_master) {
+  SlaveConfig cfg;
+  cfg.initial_energy = 0.010;
+  {
+    SlaveController s(cfg, 0.0);
+    CHECK(!s.step(0, 0.0, 0.0, 0.0).work_cap);
+  }
+  {
+    // At rest with nothing from the master there is no grant: the cap is
+    // half of what the store holds.
+    SlaveController s(cfg, 0.0);
+    const auto st = s.step(0, 0, 0.0, 0.0, 0.0, 0, 0.004, 0.0);
+    REQUIRE(st.work_cap.has_value());
+    CHECK_NEAR(*st.work_cap, 0.004 + 0.5 * 0.010, 1e-15);
+  }
+  // A master moving against the coupling force is granted the work the
+  // force does on it, less what the device may still take out.
+  for (const double reserved : {0.0, 0.0098}) {
+    SlaveController s(cfg, 0.0);
+    s.receive(1, Sample{-0.1, 0.005, 0.0});
+    s.step(0, 0, 0.0, 0.0, 0.0, 0, 0.0, reserved);
+    const double want = (cfg.kp * 0.005 + cfg.kd * -0.1) * 0.1 * 1e-3;
+    CHECK_NEAR(s.store().granted(), reserved > 0.0 ? 0.010 - reserved : want, 1e-15);
+  }
+}
