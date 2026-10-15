@@ -4,6 +4,8 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+#include <algorithm>
+
 #if defined(__linux__)
 #include <linux/errqueue.h>
 #include <netinet/ip_icmp.h>
@@ -45,18 +47,37 @@ bool HopTrace::settled() const {
   return true;
 }
 
-std::string HopTrace::to_string() const {
-  std::size_t n = static_cast<std::size_t>(public_hop());
-  if (n == 0) {
-    for (std::size_t i = 0; i < routers.size(); ++i) {
-      if (routers[i].valid()) n = i + 1;
-    }
+namespace {
+
+// The last hop that answered from the address of `outside`; 0 if none did.
+int outside_hop(const std::vector<Endpoint>& routers, const Endpoint& outside) {
+  if (!outside.valid()) return 0;
+  const auto a = outside.address();
+  int hop = 0;
+  for (std::size_t i = 0; i < routers.size(); ++i) {
+    if (routers[i].valid() && routers[i].address() == a) hop = static_cast<int>(i) + 1;
   }
+  return hop;
+}
+
+}  // namespace
+
+int HopTrace::limit(const Endpoint& outside) const {
+  const int nat = outside_hop(routers, outside);
+  return nat > 0 ? nat + 1 : public_hop();
+}
+
+std::string HopTrace::to_string(const Endpoint& outside) const {
+  const int nat = outside_hop(routers, outside);
+  std::size_t n = std::min(static_cast<std::size_t>(limit(outside)), routers.size());
+  if (n == 0) n = routers.size();
+  while (n > 0 && !routers[n - 1].valid()) --n;
   if (n == 0) return "no router answered";
   std::string s;
   for (std::size_t i = 0; i < n; ++i) {
     if (i > 0) s += ", ";
     s += routers[i].valid() ? address_string(routers[i]) : "*";
+    if (static_cast<int>(i) + 1 == nat) s += " (the NAT's outside)";
   }
   return s;
 }
@@ -176,25 +197,33 @@ std::optional<HopTrace> trace_hops(const Endpoint& target, const Endpoint& local
   trace.routers.resize(s.fds.size());
   for (std::size_t i = 0; i < s.fds.size(); ++i) probe(i);
 
+  // An answer comes back after about the round trip to its router. Once
+  // the first public router has answered, after t, the silent hops before
+  // it, whose answers were due earlier, get a second probe each and as
+  // long again to answer, with some slack for routers slow to make their
+  // errors; whatever the hops past it say no longer matters. Until a
+  // public router answers, the silent hops get their second probe halfway
+  // through the timeout.
+  static constexpr Nanos kSlack = 20 * kNanosPerMilli;
+  std::vector<Nanos> answered(s.fds.size(), -1);
+  std::vector<pollfd> polled(s.fds.size());
   const Nanos start = monotonic_now();
   bool resent = false;
-  std::vector<pollfd> polled(s.fds.size());
   for (;;) {
     if (trace.settled()) break;
     const Nanos elapsed = monotonic_now() - start;
-    if (elapsed >= timeout) break;
-    // Once more for the hops still silent below the first public answer: a
-    // probe or its answer may have been lost, or a router may limit the
-    // rate of its errors.
-    if (!resent && elapsed >= timeout / 2) {
-      const int p = trace.public_hop();
+    const int p = trace.public_hop();
+    const Nanos deadline =
+        p > 0 ? std::min(timeout, 2 * answered[static_cast<std::size_t>(p) - 1] + kSlack) : timeout;
+    if (elapsed >= deadline) break;
+    if (!resent && (p > 0 || elapsed >= timeout / 2)) {
       const std::size_t below = p > 0 ? static_cast<std::size_t>(p) - 1 : s.fds.size();
       for (std::size_t i = 0; i < below; ++i) {
         if (!trace.routers[i].valid()) probe(i);
       }
       resent = true;
     }
-    const Nanos until = resent ? timeout : timeout / 2;
+    const Nanos until = resent ? deadline : timeout / 2;
     const int ms = static_cast<int>((until - elapsed + kNanosPerMilli - 1) / kNanosPerMilli);
     for (std::size_t i = 0; i < s.fds.size(); ++i) polled[i] = pollfd{s.fds[i], 0, 0};
     // The errors show as POLLERR, which poll reports whatever was asked.
@@ -205,7 +234,10 @@ std::optional<HopTrace> trace_hops(const Endpoint& target, const Endpoint& local
       Endpoint router;
       while (read_error(s.fds[i], router)) {
       }
-      if (router.valid()) trace.routers[i] = router;
+      if (router.valid() && !trace.routers[i].valid()) {
+        trace.routers[i] = router;
+        answered[i] = monotonic_now() - start;
+      }
     }
   }
   return trace;

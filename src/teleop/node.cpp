@@ -172,29 +172,29 @@ class PrimingHops {
   bool ready() const {
     return done_ || trace_.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
   }
-  // The hop limit, once the measurement has finished.
-  int hops() {
-    finish();
+  // The hop limit, once the measurement has finished, for an end the
+  // server sees at `observed` (net::HopTrace::limit); the first call's
+  // `observed` stands.
+  int hops(const net::Endpoint& observed) {
+    finish(observed);
     return hops_;
   }
-  // How it was found: measured (the routers that answered), or why not.
-  const std::string& how() {
-    finish();
-    return how_;
-  }
+  // How it was found: measured (the routers that answered), or why not;
+  // valid once hops() has returned.
+  const std::string& how() const { return how_; }
 
  private:
-  void finish() {
+  void finish(const net::Endpoint& observed) {
     if (done_) return;
     done_ = true;
     const auto trace = trace_.get();
     if (!trace) {
       how_ = "not measured: that needs Linux and a server at a public IPv4 address";
-    } else if (trace->public_hop() == 0) {
+    } else if (trace->limit(observed) == 0) {
       how_ = "not measured: no router past the NATs answered (" + trace->to_string() + ")";
     } else {
-      hops_ = trace->public_hop();
-      how_ = "measured: " + trace->to_string();
+      hops_ = trace->limit(observed);
+      how_ = "measured: " + trace->to_string(observed);
     }
   }
 
@@ -451,7 +451,7 @@ std::optional<Handshake> master_handshake(net::UdpSocket& socket, const net::End
             }
           }
           announced = t;
-          primed = prime(socket, targets, priming->hops(), punch);
+          primed = prime(socket, targets, priming->hops(rv->observed()), punch);
           if (primed) rv->set_ready(true);
           if (known_since < 0) {
             known_since = t;
@@ -534,7 +534,7 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
     const auto hs =
         master_handshake(socket, slave, rep.session, device, cfg, stop, buf, rep, rv, priming);
     if (priming) {
-      rep.prime_hops = priming->hops();
+      rep.prime_hops = priming->hops(rv->observed());
       rep.prime_how = priming->how();
     }
     if (!hs) {
@@ -745,7 +745,7 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
   };
   bool priming_told = false;
   auto prime_hops = [&] {
-    const int hops = priming->hops();
+    const int hops = priming->hops(rv->observed());
     if (!priming_told) tell(priming_line(hops, priming->how()));
     priming_told = true;
     return hops;
@@ -786,7 +786,9 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
       const Nanos now = monotonic_now();
       device.read_position(now);
       paths.service(now);
-      if (priming && !priming_told && priming->ready()) prime_hops();
+      // Told as soon as both the trace and where the server sees this end
+      // are known.
+      if (priming && !priming_told && rv_answered && priming->ready()) prime_hops();
       if (rv) {
         if (const auto line = relay_announcer.update(paths, *rv, now)) tell(*line);
         if (const auto reg = rv->poll(now); reg && rv_server) {

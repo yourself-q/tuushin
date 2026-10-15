@@ -69,6 +69,38 @@ TEST_CASE(hops_first_public_answer) {
   CHECK(t.settled());
 }
 
+TEST_CASE(hops_a_nat_that_answers_from_outside) {
+  // A home router that sends its errors from its outside address, the one
+  // the rendezvous server sees: the first public answer is the NAT itself.
+  const Endpoint outside = *Endpoint::resolve("198.51.100.2", 47100);
+  HopTrace t;
+  t.routers = {at("198.51.100.2"), at("198.51.100.1")};
+  CHECK(t.public_hop() == 1);
+  CHECK(t.limit() == 1);
+  CHECK(t.limit(outside) == 2);
+  CHECK(t.to_string(outside) == "198.51.100.2 (the NAT's outside), 198.51.100.1");
+  // The trace may stop at the NAT, settled; the limit passes it all the same.
+  t.routers = {at("198.51.100.2"), Endpoint{}};
+  CHECK(t.settled());
+  CHECK(t.limit(outside) == 2);
+  CHECK(t.to_string(outside) == "198.51.100.2 (the NAT's outside)");
+  // Seen through a dual-stack socket, the server reports the mapped form.
+  CHECK(t.limit(*Endpoint::resolve("::ffff:198.51.100.2", 1)) == 2);
+
+  // A carrier-grade NAT that does the same, behind a home router.
+  const Endpoint cgn = *Endpoint::resolve("203.0.113.7", 1024);
+  t.routers = {at("192.168.1.1"), at("203.0.113.7"), at("203.0.113.1")};
+  CHECK(t.limit() == 2);
+  CHECK(t.limit(cgn) == 3);
+
+  // Elsewhere the outside address changes nothing.
+  t.routers = {at("10.0.0.1"), at("100.64.0.1"), at("198.51.100.1")};
+  CHECK(t.limit(cgn) == 3);
+  CHECK(t.limit(Endpoint{}) == 3);
+  t.routers = {at("10.0.0.1"), Endpoint{}};
+  CHECK(t.limit(cgn) == 0);
+}
+
 TEST_CASE(hops_trace_needs_a_public_ipv4_target) {
   const Endpoint local = at("0.0.0.0");
   const Nanos t0 = monotonic_now();
