@@ -175,6 +175,15 @@ namespace tuushin::control {
 // squared nu^2 / S averages 1, so the log of the walk's variance moves by
 // 3/s times (min(nu^2 / S, 9) - 1), with the rate kept between force_rate
 // and 16 force_rate. Its misses are then about one standard deviation.
+// It raises the rate quickly and lowers it slowly: a rate too low lets the
+// innovations exceed their spread many times over, while one too high
+// barely widens the spread, which the reading error's q^2 / 12 dominates,
+// so nu^2 / S stays just under 1. After a push that swung by 3 N at 2 Hz
+// the rate stands at 66 N/s; with the device kept oscillating by a spring
+// on its readings it is still 38 N/s five seconds later and 9 N/s after
+// twenty. Reading errors replaced by white noise of the same variance give
+// the same, so it is not their correlation. The slow side is the safe one:
+// a rate too high costs transparency, not passivity.
 //
 // Measured in the 1-DoF simulator (reflective scheme, 55 um master and 1 um
 // slave encoders, 20 s over nine hand motions): with the filter, the tax and
