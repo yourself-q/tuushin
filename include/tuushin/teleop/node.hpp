@@ -78,8 +78,17 @@ struct RendezvousConfig {
   // before the other end's NAT wherever the two are more than 3 hops apart,
   // as two homes nearly always are. Where the system cannot limit the hop
   // count, the first datagrams that go the whole way open the NAT instead,
-  // as without priming.
+  // as without priming. 0 primes nothing.
   int prime_hops = 3;
+  // Both: before registering, find the hop limit instead (net/hops.hpp):
+  // the hop count to the first router past this end's NATs on the way to
+  // the server, which passes them all, however many there are, and stops
+  // before the other end's NAT, however close that is (unless it lies on
+  // the way to the server). prime_hops stands where nothing could be measured: on systems
+  // other than Linux, towards a server at a private or an IPv6 address, or
+  // where no router past the NATs answers. It takes a round trip to that
+  // router, half a second at most.
+  bool measure_hops = true;
   // Both: how long to wait for the other end's ready before sending
   // datagrams that go the whole way regardless.
   Nanos ready_wait = 2 * kNanosPerSecond;
@@ -149,6 +158,8 @@ struct MasterNodeReport {
   net::Endpoint observed;          // this end's address as the server saw it
   std::vector<net::Endpoint> candidates;  // the slave's, as the server announced them
   std::vector<net::Endpoint> relays;      // the slave's relayed addresses, likewise
+  int prime_hops = 0;      // the hop limit of the priming (RendezvousConfig::measure_hops)
+  std::string prime_how;   // how it was found: measured (the routers), or why not
   bool relayed = false;  // the session ran to one of the relays
   std::uint64_t rejoins = 0;  // the slave announced anew during the session
   std::uint64_t ticks = 0, skipped = 0;

@@ -18,6 +18,7 @@ add_executable(tuushin_tests
   test_rendezvous.cpp
   test_stun.cpp
   test_turn.cpp
+  test_hops.cpp
 )
 target_link_libraries(tuushin_tests PRIVATE tuushin)
 add_test(NAME tuushin_tests COMMAND tuushin_tests)

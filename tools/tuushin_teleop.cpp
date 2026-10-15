@@ -104,9 +104,10 @@ void usage() {
                "      --rendezvous HOST[:PORT]\n"
                "                           meet the other end through this rendezvous\n"
                "                           server (port 47200); needs --key-file\n"
-               "      --prime-hops N       with --rendezvous: hop limit of the datagrams that\n"
+               "      --prime-hops auto|N  with --rendezvous: hop limit of the datagrams that\n"
                "                           open this end's NAT before the other end's\n"
-               "                           arrive (3; 0 does not limit them)\n"
+               "                           arrive (auto: measured on Linux, 3 where it\n"
+               "                           cannot be; 0 primes nothing)\n"
                "      --port P             slave's UDP port (47100)\n"
                "      --scheme S           none, channel or reflect (reflect)\n"
                "      --rate HZ            control rate (1000)\n"
@@ -143,6 +144,7 @@ struct Options {
   double deadband = 0.0;
   int dscp = 46;
   int prime_hops = 3;
+  bool prime_auto = true;
   bool rt = true;
   double watchdog_ms = -1.0;  // negative: the PC's holding horizon
   bool ipv6 = false;
@@ -349,12 +351,13 @@ std::optional<teleop::RendezvousConfig> rendezvous_of(const Options& o,
                              " is IPv6, and this host has no IPv6 socket");
   }
   if (o.prime_hops < 0 || o.prime_hops > 255) {
-    throw std::runtime_error("--prime-hops must be 0..255");
+    throw std::runtime_error("--prime-hops must be auto or 0..255");
   }
   teleop::RendezvousConfig rc;
   rc.server = *server;
   rc.id = crypto::rendezvous_id(*psk);
   rc.prime_hops = o.prime_hops;
+  rc.measure_hops = o.prime_auto;
   return rc;
 }
 
@@ -461,6 +464,12 @@ int run_master(const Options& o) {
   const auto rep = teleop::run_master_node(sock, peer ? *peer : net::Endpoint{}, device, cfg,
                                            make_emulation(o, start, 1), &g_stop);
   if (cfg.rendezvous) {
+    if (rep.prime_hops > 0) {
+      std::printf("rendezvous: priming with hop limit %d (%s)\n", rep.prime_hops,
+                  rep.prime_how.c_str());
+    } else {
+      std::printf("rendezvous: not priming (%s)\n", rep.prime_how.c_str());
+    }
     if (rep.observed.valid()) {
       std::printf("rendezvous: %s sees this end at %s\n",
                   cfg.rendezvous->server.to_string().c_str(), rep.observed.to_string().c_str());
@@ -638,7 +647,11 @@ int main(int argc, char** argv) {
       else if (a == "--log") o.log = next();
       else if (a == "--key-file") o.key_file = next();
       else if (a == "--rendezvous") o.rendezvous = next();
-      else if (a == "--prime-hops") o.prime_hops = static_cast<int>(parse_double(next(), "hops"));
+      else if (a == "--prime-hops") {
+        const std::string v = next();
+        o.prime_auto = v == "auto";
+        if (!o.prime_auto) o.prime_hops = static_cast<int>(parse_double(v, "hops"));
+      }
       else if (a == "--duration") o.duration = parse_double(next(), "duration");
       else if (a == "--max-force") o.max_force = parse_double(next(), "max-force");
       else if (a == "--bind") o.bind = next();

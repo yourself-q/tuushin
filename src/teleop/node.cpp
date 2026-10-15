@@ -5,11 +5,15 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <future>
 #include <optional>
 #include <random>
 #include <stdexcept>
+#include <string>
+#include <system_error>
 #include <utility>
 
+#include "tuushin/net/hops.hpp"
 #include "tuushin/wire/packet.hpp"
 
 namespace tuushin::teleop {
@@ -138,6 +142,71 @@ bool prime(net::UdpSocket& socket, const std::vector<net::Endpoint>& to, int hop
   bool any = false;
   for (const auto& t : to) any = socket.send_limited(t, punch.data(), punch.size(), hops) || any;
   return any;
+}
+
+// The hop limit of the priming (RendezvousConfig::measure_hops). The
+// measurement runs on a thread of its own while this end registers: it
+// takes a round trip to the first router past the NATs (half a second if
+// one before it stays silent), and the hop limit is needed only once the
+// server has announced the other end, a round trip to the server, which is
+// further away, and often a wait for the other end later.
+class PrimingHops {
+ public:
+  PrimingHops(const RendezvousConfig& rc, const net::UdpSocket& socket) : hops_(rc.prime_hops) {
+    if (!rc.measure_hops) {
+      how_ = "as configured";
+      done_ = true;
+      return;
+    }
+    auto measure = [server = rc.server, local = socket.local_endpoint()] {
+      return net::trace_hops(server, local);
+    };
+    try {
+      trace_ = std::async(std::launch::async, measure);
+    } catch (const std::system_error&) {
+      trace_ = std::async(std::launch::deferred, measure);  // no thread to spare: when needed
+    }
+  }
+
+  // Whether hops() would return at once.
+  bool ready() const {
+    return done_ || trace_.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+  }
+  // The hop limit, once the measurement has finished.
+  int hops() {
+    finish();
+    return hops_;
+  }
+  // How it was found: measured (the routers that answered), or why not.
+  const std::string& how() {
+    finish();
+    return how_;
+  }
+
+ private:
+  void finish() {
+    if (done_) return;
+    done_ = true;
+    const auto trace = trace_.get();
+    if (!trace) {
+      how_ = "not measured: that needs Linux and a server at a public IPv4 address";
+    } else if (trace->public_hop() == 0) {
+      how_ = "not measured: no router past the NATs answered (" + trace->to_string() + ")";
+    } else {
+      hops_ = trace->public_hop();
+      how_ = "measured: " + trace->to_string();
+    }
+  }
+
+  std::future<std::optional<net::HopTrace>> trace_;
+  int hops_;
+  std::string how_;
+  bool done_ = false;
+};
+
+std::string priming_line(int hops, const std::string& how) {
+  return (hops > 0 ? "priming with hop limit " + std::to_string(hops) : std::string("not priming")) +
+         " (" + how + ")";
 }
 
 // Keeps this end's relayed address announced through the rendezvous: the
@@ -288,7 +357,8 @@ std::optional<Handshake> master_handshake(net::UdpSocket& socket, const net::End
                                           const MasterNodeConfig& cfg,
                                           const std::atomic<bool>* stop,
                                           std::vector<std::uint8_t>& buf, MasterNodeReport& rep,
-                                          std::optional<net::RendezvousClient>& rv) {
+                                          std::optional<net::RendezvousClient>& rv,
+                                          std::optional<PrimingHops>& priming) {
   const Passivity scheme = cfg.control.passivity;
   const auto prologue = handshake_prologue(session, scheme);
   crypto::NoiseNNpsk0 hs(crypto::NoiseNNpsk0::Role::kInitiator, *cfg.psk, prologue.data(),
@@ -381,7 +451,7 @@ std::optional<Handshake> master_handshake(net::UdpSocket& socket, const net::End
             }
           }
           announced = t;
-          primed = prime(socket, targets, cfg.rendezvous->prime_hops, punch);
+          primed = prime(socket, targets, priming->hops(), punch);
           if (primed) rv->set_ready(true);
           if (known_since < 0) {
             known_since = t;
@@ -454,12 +524,19 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
   std::vector<std::uint8_t> buf(wire::kMaxDatagram + 1);
   std::optional<crypto::SessionKeys> keys;
   std::optional<net::RendezvousClient> rv;
+  std::optional<PrimingHops> priming;
   if (cfg.rendezvous) {
+    priming.emplace(*cfg.rendezvous, socket);
     rv.emplace(cfg.rendezvous->server, cfg.rendezvous->id, net::RendezvousRole::kMaster,
                net::host_addresses(socket));
   }
   if (cfg.psk) {
-    const auto hs = master_handshake(socket, slave, rep.session, device, cfg, stop, buf, rep, rv);
+    const auto hs =
+        master_handshake(socket, slave, rep.session, device, cfg, stop, buf, rep, rv, priming);
+    if (priming) {
+      rep.prime_hops = priming->hops();
+      rep.prime_how = priming->how();
+    }
     if (!hs) {
       rep.handshake_failed = true;
       return rep;
@@ -641,8 +718,10 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
   // hellos get through NATs further away than the priming reaches.
   std::optional<net::RendezvousClient> rv;
   std::optional<net::Endpoint> rv_server;
+  std::optional<PrimingHops> priming;
   if (cfg.rendezvous) {
     if (!cfg.psk) throw std::invalid_argument("run_slave_node: a rendezvous needs a pre-shared key");
+    priming.emplace(*cfg.rendezvous, socket);
     rv.emplace(cfg.rendezvous->server, cfg.rendezvous->id, net::RendezvousRole::kSlave,
                net::host_addresses(socket));
     rv_server = cfg.rendezvous->server.for_family(socket.is_ipv6());
@@ -663,6 +742,13 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
   const auto punch = punch_datagram();
   auto tell = [&](const std::string& what) {
     if (hooks.on_rendezvous) hooks.on_rendezvous(what);
+  };
+  bool priming_told = false;
+  auto prime_hops = [&] {
+    const int hops = priming->hops();
+    if (!priming_told) tell(priming_line(hops, priming->how()));
+    priming_told = true;
+    return hops;
   };
 
   while (!stopped()) {
@@ -700,6 +786,7 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
       const Nanos now = monotonic_now();
       device.read_position(now);
       paths.service(now);
+      if (priming && !priming_told && priming->ready()) prime_hops();
       if (rv) {
         if (const auto line = relay_announcer.update(paths, *rv, now)) tell(*line);
         if (const auto reg = rv->poll(now); reg && rv_server) {
@@ -735,7 +822,7 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
             paths.permit(rv->peer());
             announced = now;
             punch_until = -1;
-            if (!prime(socket, punch_to, cfg.rendezvous->prime_hops, punch)) {
+            if (!prime(socket, punch_to, prime_hops(), punch)) {
               // Unprimed: the punches open this end's NAT, at once.
               punch_until = now + cfg.rendezvous->punch_duration;
               next_punch = now;

@@ -24,6 +24,7 @@ add_library(tuushin
   src/crypto/noise.cpp
   src/net/channel.cpp
   src/net/clock_sync.cpp
+  src/net/hops.cpp
   src/net/paths.cpp
   src/net/probe.cpp
   src/net/rendezvous.cpp
@@ -42,6 +43,10 @@ add_library(tuushin
 target_include_directories(tuushin PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
+
+# The hop count is measured on a thread of its own (teleop/node.cpp).
+find_package(Threads REQUIRED)
+target_link_libraries(tuushin PUBLIC Threads::Threads)
 
 # libsodium (ISC license) provides the primitives behind crypto/noise.hpp:
 # X25519, ChaCha20-Poly1305 and SHA-256. Its headers stay out of ours, so
