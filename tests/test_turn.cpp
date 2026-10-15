@@ -6,6 +6,7 @@
 
 #include "sim_turn.hpp"
 #include "test.hpp"
+#include "tuushin/net/paths.hpp"
 #include "tuushin/net/turn.hpp"
 
 using namespace tuushin;
@@ -459,4 +460,84 @@ TEST_CASE(turn_relays_through_a_server) {
 
   r.client.release();
   REQUIRE(r.pump([&] { return server.live_allocations() == 0; }));
+}
+
+TEST_CASE(paths_carry_datagrams_directly_and_through_the_relay) {
+  UdpSocket direct(*Endpoint::resolve("127.0.0.1", 0));
+  UdpSocket peer(*Endpoint::resolve("127.0.0.1", 0));
+  const Endpoint peer_ep = peer.local_endpoint();
+  Paths paths(direct);
+  CHECK(paths.turn() == nullptr);
+  CHECK(!paths.send(Route{peer_ep, true}, bytes("x"), 1));  // no relay yet
+  CHECK((Route{peer_ep, true}).to_string() == peer_ep.to_string() + " through the relay");
+  CHECK((Route{peer_ep, false}) != (Route{peer_ep, true}));
+
+  test::SimTurn server("alice", "secret");
+  server.start();
+  paths.enable_relay(server.endpoint(), "alice", "secret");
+  struct Received {
+    Route from;
+    std::size_t size;
+    std::string text;
+  };
+  std::vector<Received> received;
+  auto pump = [&](const std::function<bool()>& done) {
+    const Nanos deadline = monotonic_now() + 2 * kNanosPerSecond;
+    while (!done() && monotonic_now() < deadline) {
+      paths.service(monotonic_now());
+      paths.wait_readable(kNanosPerMilli);
+      std::uint8_t buf[16];
+      Route from;
+      while (const auto n = paths.recv(buf, sizeof buf, &from)) {
+        received.push_back({from, *n, std::string(reinterpret_cast<char*>(buf),
+                                                  std::min(*n, sizeof buf))});
+      }
+    }
+    return done();
+  };
+  REQUIRE(pump([&] { return paths.turn()->allocated(); }));
+  const Endpoint relayed = paths.turn()->relayed();
+  // What the TURN client received was its own: nothing was handed out.
+  CHECK(received.empty());
+
+  // Directly, both ways.
+  Endpoint from;
+  CHECK(paths.send(Route{peer_ep, false}, bytes("a"), 1));
+  CHECK(receive(peer, &from) == "a");
+  CHECK(from == direct.local_endpoint());
+  peer.send_to(direct.local_endpoint(), bytes("b"), 1);
+  REQUIRE(pump([&] { return received.size() == 1; }));
+  CHECK(received[0].from == (Route{peer_ep, false}) && received[0].text == "b");
+
+  // Through the relay: the first datagram asks for the permission and the
+  // channel, which go ahead of it, so that the server passes it on.
+  CHECK(paths.send(Route{peer_ep, true}, bytes("c"), 1));
+  CHECK(receive(peer, &from) == "c");
+  CHECK(from == relayed);
+  // The server counts what it passed on once it has.
+  REQUIRE(pump([&] { return server.sent_indications() == 1; }));
+  CHECK(server.permissions() == 1);
+  peer.send_to(relayed, bytes("d"), 1);
+  REQUIRE(pump([&] { return received.size() == 2; }));
+  CHECK(received[1].from == (Route{peer_ep, true}) && received[1].text == "d");
+  REQUIRE(pump([&] { return paths.turn()->channel_bound(peer_ep); }));
+  CHECK(paths.send(Route{peer_ep, true}, bytes("e"), 1));
+  CHECK(receive(peer, &from) == "e");
+  CHECK(pump([&] { return server.sent_channel_data() == 1; }));
+
+  // Too long for the buffer, either way: its size is capacity + 1.
+  const std::string longer(40, 'z');
+  peer.send_to(relayed, bytes(longer.c_str()), longer.size());
+  peer.send_to(direct.local_endpoint(), bytes(longer.c_str()), longer.size());
+  REQUIRE(pump([&] { return received.size() == 4; }));
+  CHECK(received[2].size == 17 && received[3].size == 17);
+  CHECK(received[2].text == std::string(16, 'z'));
+
+  // Permissions given ahead of any datagram, for a peer that sends first.
+  UdpSocket other(*Endpoint::resolve("127.0.0.1", 0));
+  paths.permit({other.local_endpoint()});
+  REQUIRE(pump([&] { return paths.turn()->permitted(other.local_endpoint()); }));
+  other.send_to(relayed, bytes("f"), 1);
+  REQUIRE(pump([&] { return received.size() == 5; }));
+  CHECK(received[4].from == (Route{other.local_endpoint(), true}));
 }

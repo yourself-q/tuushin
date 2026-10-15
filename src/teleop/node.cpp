@@ -31,29 +31,31 @@ namespace {
 
 constexpr std::size_t kSeriesLimit = std::size_t{1} << 22;
 
-// Waits until `deadline`, handing every datagram that arrives to `on_rx` and
-// releasing the link's emulated datagrams on time. Returns the time it
-// returned at, which is the sample time of the tick that follows.
+// Waits until `deadline`, handing every datagram that arrives either way to
+// `on_rx`, releasing the link's emulated datagrams on time and keeping the
+// relay, if any, served. Returns the time it returned at, which is the
+// sample time of the tick that follows.
 template <class OnRx>
-Nanos serve_until(net::UdpSocket& sock, HapticLink* link, Nanos deadline,
+Nanos serve_until(net::Paths& paths, HapticLink* link, Nanos deadline,
                   std::vector<std::uint8_t>& buf, OnRx&& on_rx) {
   for (;;) {
     for (;;) {
-      net::Endpoint from;
+      net::Route from;
       Nanos rx = 0;
-      const auto n = sock.recv_from(buf.data(), buf.size(), &from, &rx);
+      const auto n = paths.recv(buf.data(), buf.size(), &from, &rx);
       if (!n) break;
       if (*n > wire::kMaxDatagram) continue;  // truncated: not ours
       on_rx(buf.data(), *n, from, rx);
     }
     const Nanos now = monotonic_now();
     if (link) link->pump(now);
+    paths.service(now);
     if (now >= deadline) return now;
-    Nanos wake = deadline;
+    Nanos wake = std::min(deadline, paths.next_due());
     if (link) {
       if (const auto r = link->next_release()) wake = std::min(wake, *r);
     }
-    if (wake > now) sock.wait_readable(wake - now);
+    if (wake > now) paths.wait_readable(wake - now);
   }
 }
 
@@ -138,24 +140,61 @@ bool prime(net::UdpSocket& socket, const std::vector<net::Endpoint>& to, int hop
   return any;
 }
 
+// Keeps this end's relayed address announced through the rendezvous: the
+// new one after every allocation, none while there is none.
+class RelayAnnouncer {
+ public:
+  // Returns a line for the log if anything changed.
+  std::optional<std::string> update(const net::Paths& paths, net::RendezvousClient& rv) {
+    const net::TurnClient* turn = paths.turn();
+    if (!turn) return std::nullopt;
+    if (turn->allocated() && turn->allocations() != allocations_) {
+      allocations_ = turn->allocations();
+      rv.set_relays({turn->relayed()});
+      return "relay allocated at " + turn->relayed().to_string() + " on " +
+             turn->server().to_string() + ", which sees this end at " +
+             turn->mapped().to_string();
+    }
+    if (!turn->allocated() && !rv.relays().empty()) {
+      rv.set_relays({});
+      return "relay lost (" + turn->last_error() + "); allocating again";
+    }
+    if (turn->failed() && !failed_) {
+      failed_ = true;
+      return "relay refused: " + turn->last_error();
+    }
+    return std::nullopt;
+  }
+
+ private:
+  std::uint64_t allocations_ = 0;
+  bool failed_ = false;
+};
+
 // The rendezvous during a session (RendezvousConfig::rejoin_after): looks
 // for an end that has moved when the other end falls silent, and punches
 // towards the other end's new address when the server announces one.
 class SessionRejoin {
  public:
   SessionRejoin(net::RendezvousClient& rv, const net::Endpoint& server,
-                const RendezvousConfig& cfg, net::UdpSocket& socket)
-      : rv_(rv), server_(server), cfg_(cfg), socket_(socket), changes_(rv.peer_changes()),
-        punch_(punch_datagram()) {}
+                const RendezvousConfig& cfg, net::Paths& paths)
+      : rv_(rv), server_(server), cfg_(cfg), paths_(paths), socket_(paths.direct()),
+        changes_(rv.peer_changes()), punch_(punch_datagram()) {}
 
   // True for the server's datagrams, which are taken here.
-  bool on_datagram(const std::uint8_t* data, std::size_t n, const net::Endpoint& from,
+  bool on_datagram(const std::uint8_t* data, std::size_t n, const net::Route& from,
                    Nanos now) {
-    if (!rv_.on_datagram(data, n, from, now)) return false;
+    if (from.relayed || !rv_.on_datagram(data, n, from.peer, now)) return false;
     if (rv_.peer_changes() != changes_) {
       changes_ = rv_.peer_changes();
       ++rejoins_;
+      // The relayed addresses too: a relay that allocated anew sends from
+      // a new address, which this end's NAT lets in only after a punch.
       to_ = net::sendable(rv_.peer(), socket_);
+      for (const auto& r : net::sendable(rv_.peer_relays(), socket_)) {
+        if (std::find(to_.begin(), to_.end(), r) == to_.end()) to_.push_back(r);
+      }
+      paths_.permit(rv_.peer());
       punch_until_ = now + cfg_.rejoin_punch;
       next_punch_ = now;
       // The moved end is sending already, so there is nothing to order:
@@ -191,6 +230,7 @@ class SessionRejoin {
   net::RendezvousClient& rv_;
   net::Endpoint server_;
   const RendezvousConfig& cfg_;
+  net::Paths& paths_;
   net::UdpSocket& socket_;
   std::uint64_t changes_;
   std::uint64_t rejoins_ = 0;
@@ -208,7 +248,10 @@ class SessionRejoin {
 // never saw, and only the slave can make a reply that authenticates. The
 // candidates get hellos only once the slave is ready (or ready_wait after
 // the announcement); the master primes its own NAT before it says it is
-// ready, or, where it cannot, says so after its first hellos.
+// ready, or, where it cannot, says so after its first hellos. The slave's
+// relayed addresses get hellos relay_delay after its own candidates; they
+// need no priming, since the relay sends to this end only once it has
+// heard from it.
 struct Handshake {
   crypto::SessionKeys keys;
   net::Endpoint slave;
@@ -238,10 +281,12 @@ std::optional<Handshake> master_handshake(net::UdpSocket& socket, const net::End
   // A slave address given directly, in the form this socket sends to.
   std::optional<net::Endpoint> direct;
   if (slave.valid()) direct = slave.for_family(socket.is_ipv6());
-  // The rendezvous candidates, apart from `direct`.
-  std::vector<net::Endpoint> targets;
+  // The rendezvous candidates, apart from `direct`, and the relayed ones
+  // apart from both.
+  std::vector<net::Endpoint> targets, relays;
   std::uint64_t peer_changes = 0;
   Nanos announced = -1;  // when the server last announced the slave
+  Nanos targets_since = -1;  // when the candidates got their first hellos
   bool primed = false, slave_ready = false;
   const auto punch = punch_datagram();
 
@@ -277,6 +322,10 @@ std::optional<Handshake> master_handshake(net::UdpSocket& socket, const net::End
         for (const auto& t : targets) send_hello(t);
         // Unprimed, this end's NAT expects the slave from now on.
         if (!primed) rv->set_ready(true);
+        if (targets_since < 0) targets_since = now;
+        if (now - targets_since >= cfg.rendezvous->relay_delay) {
+          for (const auto& r : relays) send_hello(r);
+        }
       }
       next_hello = now + cfg.hello_interval;
     }
@@ -295,9 +344,16 @@ std::optional<Handshake> master_handshake(net::UdpSocket& socket, const net::End
         if (rv->peer_changes() != peer_changes) {
           peer_changes = rv->peer_changes();
           rep.candidates = rv->peer();
+          rep.relays = rv->peer_relays();
           targets = net::sendable(rv->peer(), socket);
           if (direct) targets.erase(std::remove(targets.begin(), targets.end(), *direct),
                                     targets.end());
+          relays.clear();
+          for (const auto& r : net::sendable(rv->peer_relays(), socket)) {
+            if (r != direct && std::find(targets.begin(), targets.end(), r) == targets.end()) {
+              relays.push_back(r);
+            }
+          }
           announced = t;
           primed = prime(socket, targets, cfg.rendezvous->prime_hops, punch);
           if (primed) rv->set_ready(true);
@@ -317,6 +373,7 @@ std::optional<Handshake> master_handshake(net::UdpSocket& socket, const net::End
         continue;
       }
       if (hs.read_message(buf.data() + wire::kHeaderSize, rh->payload_len)) {
+        rep.relayed = std::find(relays.begin(), relays.end(), from) != relays.end();
         return Handshake{hs.split(), from};
       }
     }
@@ -384,7 +441,9 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
     keys = hs->keys;
     rep.slave = hs->slave;
   }
-  HapticLink link(socket, rep.session, rep.slave, cfg.control.passivity);
+  // The master has no relay of its own: a relay at the slave suffices.
+  net::Paths paths(socket);
+  HapticLink link(paths, rep.session, net::Route{rep.slave, false}, cfg.control.passivity);
   if (keys) {
     link.set_keys(*keys);
     rep.authenticated = true;
@@ -395,14 +454,14 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
   std::optional<SessionRejoin> rejoin;
   std::optional<net::Endpoint> server;
   if (rv) server = cfg.rendezvous->server.for_family(socket.is_ipv6());
-  if (rv && server) rejoin.emplace(*rv, *server, *cfg.rendezvous, socket);
+  if (rv && server) rejoin.emplace(*rv, *server, *cfg.rendezvous, paths);
 
   std::vector<std::pair<Nanos, double>> own;     // (master time, master net) per tick
   std::vector<std::pair<Nanos, double>> remote;  // (slave time, slave net) per sample
   Nanos newest_remote = INT64_MIN;
   Nanos slave_final_at = -1;
   Nanos last_rx = monotonic_now();
-  auto on_rx = [&](const std::uint8_t* data, std::size_t n, const net::Endpoint& from, Nanos rx) {
+  auto on_rx = [&](const std::uint8_t* data, std::size_t n, const net::Route& from, Nanos rx) {
     if (rejoin && rejoin->on_datagram(data, n, from, monotonic_now())) return;
     if (is_punch(data, n)) return;
     const auto r = link.on_datagram(data, n, from, rx);
@@ -427,7 +486,7 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
   Nanos ending_since = -1;
   std::uint64_t pc_count = 0;
   for (;;) {
-    const Nanos now = serve_until(socket, &link, ticker.due(), buf, on_rx);
+    const Nanos now = serve_until(paths, &link, ticker.due(), buf, on_rx);
     if (ending_since < 0 && (now >= end || (stop && stop->load()) || slave_final_at >= 0)) {
       ending_since = now;
       rep.ended_by_slave = slave_final_at >= 0;
@@ -562,6 +621,14 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
                net::host_addresses(socket));
     rv_server = cfg.rendezvous->server.for_family(socket.is_ipv6());
   }
+  // The relay: allocated at once and kept, so that its address is in every
+  // registration; the masters the server announces get permissions on it.
+  net::Paths paths(socket);
+  RelayAnnouncer relay_announcer;
+  if (cfg.relay) {
+    if (!cfg.rendezvous) throw std::invalid_argument("run_slave_node: a relay needs a rendezvous");
+    paths.enable_relay(cfg.relay->server, cfg.relay->username, cfg.relay->password);
+  }
   bool rv_answered = false;
   std::uint64_t rv_changes = 0;
   std::vector<net::Endpoint> punch_to;
@@ -578,7 +645,7 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
     device.command_force(0.0);
     struct First {
       wire::Header h;
-      net::Endpoint from;
+      net::Route from;
       std::vector<std::uint8_t> bytes;
       Nanos rx;
       Passivity scheme;
@@ -601,11 +668,14 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
         }
         if (rv) wake = std::min(wake, rv->next_due());
         if (punch_until > t) wake = std::min(wake, next_punch);
-        if (wake > t) socket.wait_readable(wake - t);
+        wake = std::min(wake, paths.next_due());
+        if (wake > t) paths.wait_readable(wake - t);
       }
       const Nanos now = monotonic_now();
       device.read_position(now);
+      paths.service(now);
       if (rv) {
+        if (const auto line = relay_announcer.update(paths, *rv)) tell(*line);
         if (const auto reg = rv->poll(now); reg && rv_server) {
           socket.send_to(*rv_server, reg->data(), reg->size());
         }
@@ -620,12 +690,12 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
                                    }),
                     pending.end());
       for (;;) {
-        net::Endpoint from;
+        net::Route from;
         Nanos rx = 0;
-        const auto n = socket.recv_from(buf.data(), buf.size(), &from, &rx);
+        const auto n = paths.recv(buf.data(), buf.size(), &from, &rx);
         if (!n) break;
         if (*n > wire::kMaxDatagram) continue;
-        if (rv && rv->on_datagram(buf.data(), *n, from, now)) {
+        if (rv && !from.relayed && rv->on_datagram(buf.data(), *n, from.peer, now)) {
           if (!rv_answered) {
             rv_answered = true;
             tell("registered at " + rv->server().to_string() + ", which sees this end at " +
@@ -634,6 +704,9 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
           if (rv->peer_changes() != rv_changes) {
             rv_changes = rv->peer_changes();
             punch_to = net::sendable(rv->peer(), socket);
+            // The master's NAT gives it the same address towards the relay
+            // as towards the server, whatever port (RFC 4787, REQ-2).
+            paths.permit(rv->peer());
             announced = now;
             punch_until = -1;
             if (!prime(socket, punch_to, cfg.rendezvous->prime_hops, punch)) {
@@ -656,7 +729,7 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
         const auto scheme = scheme_of(*h);
         if (!scheme) continue;
         if (*scheme != cfg.control.passivity && !cfg.adopt_scheme) {
-          refuse(h->session, "session from " + from.canonical().to_string() +
+          refuse(h->session, "session from " + from.to_string() +
                                  " runs another passivity scheme; refused");
           continue;
         }
@@ -664,7 +737,7 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
 
         if (h->type == wire::PacketType::kHello) {
           if (!cfg.psk) {
-            refuse(h->session, "session from " + from.canonical().to_string() +
+            refuse(h->session, "session from " + from.to_string() +
                                    " wants authentication, but this slave has no key; refused");
             continue;
           }
@@ -676,7 +749,7 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
                                                               h->payload_len) == 0;
                                          });
           if (same != pending.end()) {  // resent because our reply was lost, or a copy
-            socket.send_to(from, same->reply.data(), same->reply.size());
+            paths.send(from, same->reply.data(), same->reply.size());
             continue;
           }
           const auto prologue = handshake_prologue(h->session, *scheme);
@@ -684,18 +757,18 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
                                  prologue.data(), prologue.size());
           const auto hello = hs.read_message(payload, h->payload_len);
           if (!hello) {
-            refuse(h->session, "handshake from " + from.canonical().to_string() +
+            refuse(h->session, "handshake from " + from.to_string() +
                                    " does not authenticate (another key?); refused");
             continue;
           }
           const auto stamp = hello_time(*hello);
           if (!stamp) {
-            refuse(h->session, "handshake from " + from.canonical().to_string() +
+            refuse(h->session, "handshake from " + from.to_string() +
                                    " carries no time (another version?); refused");
             continue;
           }
           if (*stamp <= newest_hello) {
-            refuse(h->session, "handshake from " + from.canonical().to_string() +
+            refuse(h->session, "handshake from " + from.to_string() +
                                    " is not newer than the last one answered (replayed?); refused");
             continue;
           }
@@ -712,7 +785,7 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
           PendingHandshake p{h->session, std::vector<std::uint8_t>(payload, payload + h->payload_len),
                              hs.split(), {}, rh.send_time};
           wire::encode_raw(rh, msg2.data(), msg2.size(), p.reply);
-          socket.send_to(from, p.reply.data(), p.reply.size());
+          paths.send(from, p.reply.data(), p.reply.size());
           if (pending.size() == kMaxPending) pending.erase(pending.begin());
           pending.push_back(std::move(p));
           continue;
@@ -727,7 +800,7 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
         if (cfg.psk) {
           if (!(h->flags & wire::kFlagSealed)) {
             refuse(h->session,
-                   "unauthenticated session from " + from.canonical().to_string() + " refused");
+                   "unauthenticated session from " + from.to_string() + " refused");
             continue;
           }
           for (const auto& p : pending) {
@@ -755,12 +828,13 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
 
     SlaveSessionReport rep;
     rep.session = first->h.session;
-    rep.master = first->from;
+    rep.master = first->from.peer;
+    rep.relayed = first->from.relayed;
     rep.scheme = first->scheme;
     rep.authenticated = first->keys.has_value();
     SlaveConfig sc = cfg.control;
     sc.passivity = first->scheme;
-    HapticLink link(socket, rep.session, first->from, sc.passivity);
+    HapticLink link(paths, rep.session, first->from, sc.passivity);
     if (first->keys) link.set_keys(*first->keys);
     const Nanos start = monotonic_now();
     if (hooks.emulation) link.set_emulation(hooks.emulation(start));
@@ -778,8 +852,8 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
     Nanos last_rx = first->rx;
     Nanos master_final_at = -1;
     std::optional<SessionRejoin> rejoin;
-    if (rv && rv_server) rejoin.emplace(*rv, *rv_server, *cfg.rendezvous, socket);
-    auto on_rx = [&](const std::uint8_t* data, std::size_t n, const net::Endpoint& from, Nanos rx) {
+    if (rv && rv_server) rejoin.emplace(*rv, *rv_server, *cfg.rendezvous, paths);
+    auto on_rx = [&](const std::uint8_t* data, std::size_t n, const net::Route& from, Nanos rx) {
       if (rejoin && rejoin->on_datagram(data, n, from, monotonic_now())) return;
       if (is_punch(data, n)) return;
       const auto r = link.on_datagram(data, n, from, rx);
@@ -794,7 +868,7 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
     Nanos stop_since = -1;
     std::uint64_t pc_count = 0;
     for (;;) {
-      const Nanos now = serve_until(socket, &link, ticker.due(), buf, on_rx);
+      const Nanos now = serve_until(paths, &link, ticker.due(), buf, on_rx);
       if (now - last_rx > cfg.idle_timeout) break;
       if (master_final_at >= 0 && now >= master_final_at + cfg.final_linger) {
         rep.ended_by_final = true;
@@ -805,6 +879,9 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
       const Nanos late = now - ticker.due();
       ticker.taken(now);
       if (rejoin) rejoin->tick(now, last_rx);
+      if (rv) {
+        if (const auto line = relay_announcer.update(paths, *rv)) tell(*line);
+      }
 
       const double x = device.read_position(now);
       const double fc = device.contact_force();
@@ -861,6 +938,12 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
     if (cfg.once) break;
   }
   device.command_force(0.0);
+  // Frees the relay at the server at once instead of at the end of its
+  // lifetime; the answer is not waited for.
+  if (net::TurnClient* turn = paths.turn()) {
+    turn->release();
+    paths.service(monotonic_now());
+  }
   return reports;
 }
 

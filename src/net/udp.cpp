@@ -431,36 +431,50 @@ std::optional<std::size_t> UdpSocket::recv_from(std::uint8_t* buffer, std::size_
 }
 
 bool UdpSocket::wait_readable(Nanos timeout) {
+  UdpSocket* const self = this;
+  return wait_any_readable(&self, 1, timeout);
+}
+
+bool wait_any_readable(UdpSocket* const* sockets, std::size_t count, Nanos timeout) {
   if (timeout < 0) timeout = 0;
   // An interrupted wait returns false like a timeout; callers loop on the
   // clock anyway, and retrying with the full timeout would overshoot.
+  constexpr std::size_t kMax = 8;
+  pollfd fds[kMax];
+  nfds_t n = 0;
+  int highest = -1;
+  for (std::size_t i = 0; i < count && n < kMax; ++i) {
+    if (sockets[i] == nullptr) continue;
+    fds[n].fd = sockets[i]->native_handle();
+    fds[n].events = POLLIN;
+    fds[n].revents = 0;
+    highest = std::max(highest, fds[n].fd);
+    ++n;
+  }
 #if defined(__linux__)
-  pollfd p{};
-  p.fd = fd_;
-  p.events = POLLIN;
+  (void)highest;
   timespec ts{};
   ts.tv_sec = static_cast<time_t>(timeout / kNanosPerSecond);
   ts.tv_nsec = static_cast<long>(timeout % kNanosPerSecond);
-  const int r = ::ppoll(&p, 1, &ts, nullptr);
-  return r > 0 && (p.revents & POLLIN) != 0;
+  if (::ppoll(fds, n, &ts, nullptr) <= 0) return false;
 #else
-  if (fd_ < FD_SETSIZE) {
+  if (highest < FD_SETSIZE) {
     fd_set set;
     FD_ZERO(&set);
-    FD_SET(fd_, &set);
+    for (nfds_t i = 0; i < n; ++i) FD_SET(fds[i].fd, &set);
     const Nanos us = (timeout + 999) / 1000;
     timeval tv{};
     tv.tv_sec = static_cast<time_t>(us / 1'000'000);
     tv.tv_usec = static_cast<suseconds_t>(us % 1'000'000);
-    return ::select(fd_ + 1, &set, nullptr, nullptr, &tv) > 0;
+    return ::select(highest + 1, &set, nullptr, nullptr, &tv) > 0;
   }
-  pollfd p{};
-  p.fd = fd_;
-  p.events = POLLIN;
   const int ms = static_cast<int>((timeout + kNanosPerMilli - 1) / kNanosPerMilli);
-  const int r = ::poll(&p, 1, ms);
-  return r > 0 && (p.revents & POLLIN) != 0;
+  if (::poll(fds, n, ms) <= 0) return false;
 #endif
+  for (nfds_t i = 0; i < n; ++i) {
+    if ((fds[i].revents & POLLIN) != 0) return true;
+  }
+  return false;
 }
 
 std::vector<Endpoint> host_addresses(const UdpSocket& socket, std::size_t limit) {

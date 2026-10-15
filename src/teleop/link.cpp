@@ -48,7 +48,12 @@ SeqWindow::Verdict SeqWindow::accept(std::uint32_t seq) {
 
 HapticLink::HapticLink(net::UdpSocket& socket, std::uint32_t session, const net::Endpoint& peer,
                        Passivity scheme)
-    : socket_(socket), session_(session), peer_(peer), scheme_(scheme) {}
+    : own_paths_(std::make_unique<net::Paths>(socket)), paths_(own_paths_.get()),
+      session_(session), route_{peer, false}, scheme_(scheme) {}
+
+HapticLink::HapticLink(net::Paths& paths, std::uint32_t session, const net::Route& peer,
+                       Passivity scheme)
+    : paths_(&paths), session_(session), route_(peer), scheme_(scheme) {}
 
 void HapticLink::set_keys(const crypto::SessionKeys& keys) {
   keys_ = keys;
@@ -106,7 +111,7 @@ void HapticLink::send(Nanos now, const Sample& s, double monitor, bool final) {
 }
 
 void HapticLink::transmit(const std::vector<std::uint8_t>& datagram) {
-  if (!socket_.send_to(peer_, datagram.data(), datagram.size())) ++counters_.send_failed;
+  if (!paths_->send(route_, datagram.data(), datagram.size())) ++counters_.send_failed;
 }
 
 void HapticLink::pump(Nanos now) {
@@ -123,11 +128,11 @@ std::optional<Nanos> HapticLink::next_release() const {
 
 std::optional<HapticLink::Received> HapticLink::on_datagram(const std::uint8_t* data,
                                                             std::size_t size,
-                                                            const net::Endpoint& from,
+                                                            const net::Route& from,
                                                             Nanos rx_time) {
   const auto h = wire::decode_header(data, size);
   // Only a sealed link may hear its peer at another address.
-  const bool elsewhere = from != peer_;
+  const bool elsewhere = from != route_;
   if (!h || h->type != wire::PacketType::kHaptic || h->session != session_ ||
       (elsewhere && !sealed_) ||
       ((h->flags & wire::kSchemeMask) >> wire::kSchemeShift) != static_cast<unsigned>(scheme_)) {
@@ -164,7 +169,7 @@ std::optional<HapticLink::Received> HapticLink::on_datagram(const std::uint8_t* 
     highest_rx_time_ = rx_time;
     if (elsewhere) {
       // The newest authentic datagram says where the peer is now.
-      peer_ = from;
+      route_ = from;
       ++counters_.moved;
     }
   }

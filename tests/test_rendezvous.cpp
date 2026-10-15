@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "sim_nat.hpp"
+#include "sim_turn.hpp"
 #include "test.hpp"
 #include "tuushin/crypto/noise.hpp"
 #include "tuushin/net/rendezvous.hpp"
@@ -79,6 +80,22 @@ TEST_CASE(rendezvous_messages_round_trip_and_reject_malformed) {
   CHECK(decode_rendezvous(encode_rendezvous(many).data(), kRendezvousMessageSize)
             ->candidates.size() == kRendezvousMaxCandidates);
 
+  // Relayed addresses follow the end's own, marked as such, and take
+  // their slots before the end's own beyond what fits.
+  RendezvousMessage relayed = m;
+  relayed.relays = {ep("192.0.2.50", 49152)};
+  const auto rb = encode_rendezvous(relayed);
+  const auto rd = decode_rendezvous(rb.data(), rb.size());
+  REQUIRE(rd);
+  CHECK(rd->candidates == m.candidates && rd->relays == relayed.relays);
+  CHECK(rb[7] == 4 && rb[56 + 20 * 3 + 1] == 1);
+  many.relays = {ep("192.0.2.50", 49152), ep("192.0.2.51", 49153), ep("192.0.2.52", 49154)};
+  const auto mr = decode_rendezvous(encode_rendezvous(many).data(), kRendezvousMessageSize);
+  REQUIRE(mr);
+  CHECK(mr->relays.size() == kRendezvousMaxRelays);
+  CHECK(mr->candidates.size() == kRendezvousMaxCandidates - kRendezvousMaxRelays);
+  CHECK(mr->candidates[0] == m.candidates[0]);
+
   auto mutated = [&](std::size_t at, std::uint8_t v) {
     auto x = b;
     x[at] = v;
@@ -94,9 +111,13 @@ TEST_CASE(rendezvous_messages_round_trip_and_reject_malformed) {
   CHECK(!mutated(8, 4));              // an undefined flag
   CHECK(!mutated(9, 1) && !mutated(11, 1));  // reserved bytes
   CHECK(!mutated(56, 5));             // address family
-  CHECK(!mutated(57, 1));             // reserved byte
+  CHECK(!mutated(57, 2));             // an undefined kind
+  CHECK(!mutated(57, 1));             // a relayed address before the end's own
+  CHECK(!mutated(37, 1));             // the observed address marked relayed
   CHECK(!mutated(56 + 4 + 4, 1));     // IPv4 address with a non-zero tail
-  CHECK(mutated(7, 2));               // fewer candidates is still well-formed
+  CHECK(!mutated(7, 2));              // a slot not counted, but not empty
+  CHECK(!mutated(56 + 20 * 5 + 1, 1));  // an empty slot with a kind
+  CHECK(mutated(56 + 20 * 2 + 1, 1));   // the last address relayed instead
   auto unready = b;
   unready[8] = 0;
   const auto u = decode_rendezvous(unready.data(), unready.size());
@@ -306,6 +327,63 @@ TEST_CASE(rendezvous_client_registers_retries_and_learns_the_peer) {
   bytes = encode_rendezvous(pr);
   CHECK(c.on_datagram(bytes.data(), bytes.size(), server, t + 7));
   CHECK(c.peer_changes() == 3 && !c.ready() && c.peer() == pr.candidates);
+
+  // And a peer with a new relay.
+  pr.relays = {ep("192.0.2.50", 49152)};
+  bytes = encode_rendezvous(pr);
+  CHECK(c.on_datagram(bytes.data(), bytes.size(), server, t + 8));
+  CHECK(c.peer_changes() == 4 && c.peer_relays() == pr.relays && c.peer() == pr.candidates);
+}
+
+TEST_CASE(rendezvous_carries_relayed_addresses) {
+  // A slave that allocated a relay registers it; the server announces it
+  // to the master apart from the slave's own addresses, and announces it
+  // again when it changes, as it does a move.
+  RendezvousServer server(30 * kNanosPerSecond);
+  const auto id = id_of(3);
+  const Endpoint a = ep("203.0.113.1", 1111), b = ep("198.51.100.2", 2222);
+  const Endpoint relay = ep("192.0.2.50", 49152), relay2 = ep("192.0.2.50", 49153);
+  feed(server, registration(id, RendezvousRole::kMaster, 11), a, 0);
+  const Endpoint srv = ep("203.0.113.9", 47200);
+  RendezvousClient slave(srv, id, RendezvousRole::kSlave, {});
+  slave.set_relays({relay});
+  CHECK(slave.relays() == std::vector<Endpoint>{relay});
+  const auto reg = slave.poll(0);
+  REQUIRE(reg);
+  std::vector<RendezvousServer::Out> out;
+  CHECK(server.on_datagram(reg->data(), reg->size(), b, kNanosPerSecond, out));
+  REQUIRE(out.size() == 2 && out[1].to == a);
+  auto p = decoded(out[1]);
+  CHECK(p.candidates == std::vector<Endpoint>{b});
+  CHECK(p.relays == std::vector<Endpoint>{relay});
+  CHECK(slave.on_datagram(out[0].bytes.data(), out[0].bytes.size(), srv, kNanosPerSecond));
+  CHECK(slave.peer_relays().empty());  // the master has none
+
+  // The same registration again changes nothing.
+  out.clear();
+  CHECK(!server.on_datagram(reg->data(), reg->size(), b, 2 * kNanosPerSecond, out));
+  CHECK(out.size() == 1);
+
+  // A new relay registers at once, and the master hears of it.
+  CHECK(!slave.poll(2 * kNanosPerSecond));
+  slave.set_relays({relay2});
+  const auto reg2 = slave.poll(2 * kNanosPerSecond);
+  REQUIRE(reg2);
+  out.clear();
+  CHECK(server.on_datagram(reg2->data(), reg2->size(), b, 3 * kNanosPerSecond, out));
+  REQUIRE(out.size() == 2);
+  CHECK(decoded(out[1]).relays == std::vector<Endpoint>{relay2});
+  // And so does the loss of it.
+  slave.set_relays({});
+  const auto reg3 = slave.poll(3 * kNanosPerSecond);
+  REQUIRE(reg3);
+  out.clear();
+  CHECK(server.on_datagram(reg3->data(), reg3->size(), b, 4 * kNanosPerSecond, out));
+  REQUIRE(out.size() == 2);
+  CHECK(decoded(out[1]).relays.empty());
+  // Setting the same relays again is no news.
+  slave.set_relays({});
+  CHECK(!slave.poll(4 * kNanosPerSecond));
 }
 
 TEST_CASE(rendezvous_id_depends_only_on_the_key) {
@@ -638,9 +716,9 @@ Rebound rebound(Nanos rejoin_after) {
   std::thread srv([&] { run_rendezvous_server(server_sock, &stop_server); });
 
   UdpSocket master_sock(ep("127.0.0.1", 0)), slave_sock(ep("127.0.0.1", 0));
-  SimNat master_nat(master_sock.local_endpoint(), server, SimNat::Mapping::kEndpointIndependent,
+  SimNat master_nat(server, SimNat::Mapping::kEndpointIndependent,
                     SimNat::Filtering::kAddressPortDependent);
-  SimNat slave_nat(slave_sock.local_endpoint(), server, SimNat::Mapping::kEndpointIndependent,
+  SimNat slave_nat(server, SimNat::Mapping::kEndpointIndependent,
                    SimNat::Filtering::kAddressPortDependent);
   const crypto::Key psk = crypto::random_key();
   RendezvousConfig rc;
@@ -729,4 +807,113 @@ TEST_CASE(session_is_lost_to_a_rebinding_nat_without_the_rejoin) {
   CHECK(r.master.link.received < 600);
   REQUIRE(r.slave.size() == 1);
   CHECK(!r.slave[0].ended_by_final);
+}
+
+namespace {
+
+struct Symmetric {
+  MasterNodeReport master;
+  std::vector<SlaveSessionReport> slave;
+  std::vector<std::string> slave_events;
+  std::uint64_t relayed_datagrams = 0;  // passed on by the TURN server to the master
+};
+
+// A master and a slave, each behind a NAT that picks a new outside port for
+// every destination and filters by address and port: the server announces
+// to each end the port the other's NAT uses towards the server, and no
+// other datagram is let in there, so no direct path opens. With `turn`, the
+// slave allocates a relay on a TURN server outside both NATs, and the
+// server announces its address to the master.
+Symmetric symmetric(bool turn) {
+  using test::SimNat;
+  UdpSocket server_sock(ep("127.0.0.1", 0));
+  const Endpoint server = ep("127.0.0.1", server_sock.local_endpoint().port());
+  std::atomic<bool> stop_server{false}, stop_slave{false};
+  std::thread srv([&] { run_rendezvous_server(server_sock, &stop_server); });
+  test::SimTurn turn_server("tuushin", "relay-secret");
+  turn_server.start();
+
+  UdpSocket master_sock(ep("127.0.0.1", 0)), slave_sock(ep("127.0.0.1", 0));
+  SimNat master_nat(server, SimNat::Mapping::kAddressPortDependent,
+                    SimNat::Filtering::kAddressPortDependent);
+  SimNat slave_nat(server, SimNat::Mapping::kAddressPortDependent,
+                   SimNat::Filtering::kAddressPortDependent);
+  const crypto::Key psk = crypto::random_key();
+  RendezvousConfig rc;
+  rc.id = crypto::rendezvous_id(psk);
+  rc.wait = 2 * kNanosPerSecond;
+  rc.ready_wait = 200 * kNanosPerMilli;
+  rc.relay_delay = 300 * kNanosPerMilli;
+  RendezvousConfig master_rc = rc, slave_rc = rc;
+  master_rc.server = master_nat.proxy(server);
+  slave_rc.server = slave_nat.proxy(server);
+  const Endpoint turn_at = slave_nat.proxy(turn_server.endpoint());
+  master_nat.start();
+  slave_nat.start();
+
+  Symmetric out;
+  std::mutex mu;
+  const Nanos period = kNanosPerMilli;
+  SimulatedSlave slave_dev(1.0, 2.0, WallParams{}, period, 10, monotonic_now(), 0.0);
+  slave_dev.set_watchdog(2 * period);
+  SlaveNodeConfig scfg;
+  scfg.control.dt = period;
+  scfg.control.hold_after = 150 * kNanosPerMilli;
+  scfg.once = true;
+  scfg.psk = psk;
+  scfg.rendezvous = slave_rc;
+  if (turn) scfg.relay = RelayConfig{turn_at, "tuushin", "relay-secret"};
+  SlaveNodeHooks hooks;
+  hooks.on_rendezvous = [&](const std::string& what) {
+    std::lock_guard<std::mutex> lock(mu);
+    out.slave_events.push_back(what);
+  };
+  std::thread slave([&] { out.slave = run_slave_node(slave_sock, slave_dev, scfg, hooks, &stop_slave); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  SimulatedMaster master_dev(0.2, 0.5, OperatorParams{}, period, 10, monotonic_now());
+  master_dev.set_watchdog(2 * period);
+  MasterNodeConfig mcfg;
+  mcfg.control.dt = period;
+  mcfg.control.model_mass = 0.2;
+  mcfg.duration = 600 * kNanosPerMilli;
+  mcfg.psk = psk;
+  mcfg.hello_interval = 50 * kNanosPerMilli;
+  mcfg.handshake_timeout = 1500 * kNanosPerMilli;
+  mcfg.rendezvous = master_rc;
+  out.master = run_master_node(master_sock, Endpoint{}, master_dev, mcfg);
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  stop_slave.store(true);
+  slave.join();
+  out.relayed_datagrams = turn_server.data_indications() + turn_server.channel_data();
+  stop_server.store(true);
+  srv.join();
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE(session_runs_through_the_relay_between_symmetric_nats) {
+  const auto r = symmetric(true);
+  REQUIRE(!r.master.rendezvous_failed && !r.master.handshake_failed);
+  CHECK(any_contains(r.slave_events, "relay allocated at"));
+  REQUIRE(r.master.relays.size() == 1);
+  CHECK(r.master.relayed && r.master.slave == r.master.relays[0]);
+  CHECK(r.master.authenticated && r.master.slave_answered && r.master.slave_final);
+  CHECK(r.master.link.received > 400);
+  CHECK(r.relayed_datagrams > 400);
+  REQUIRE(r.slave.size() == 1);
+  CHECK(r.slave[0].relayed && r.slave[0].authenticated && r.slave[0].ended_by_final);
+  CHECK(r.slave[0].link.received > 400);
+  CHECK(r.slave[0].link.foreign == 0 && r.master.link.foreign == 0);
+}
+
+TEST_CASE(symmetric_nats_meet_but_cannot_open_a_path_without_a_relay) {
+  // The control: the same NATs and no relay. Both ends learn each other,
+  // and every hello stops at the slave's NAT.
+  const auto r = symmetric(false);
+  CHECK(!r.master.rendezvous_failed);
+  CHECK(r.master.candidates.size() == 1 && r.master.relays.empty());
+  CHECK(r.master.handshake_failed && !r.master.authenticated);
+  CHECK(r.slave.empty());
 }

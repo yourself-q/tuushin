@@ -10,6 +10,7 @@
 #include "tuushin/crypto/noise.hpp"
 #include "tuushin/net/channel.hpp"
 #include "tuushin/net/clock_sync.hpp"
+#include "tuushin/net/paths.hpp"
 #include "tuushin/net/udp.hpp"
 #include "tuushin/teleop/controller.hpp"
 #include "tuushin/time.hpp"
@@ -61,7 +62,8 @@ class SeqWindow {
 // from moving the link; a party on the path that forwards a fresh copy
 // faster than the original moves it until the next genuine datagram, but
 // could drop the traffic anyway. An open link stays with the address it
-// was made with.
+// was made with. The link follows a Route (net/paths.hpp), so a session
+// also moves between the direct path and this end's relay.
 //
 // An optional ChannelModel impairs outgoing datagrams in-process before they
 // reach the socket, so that a path with a given delay, jitter, loss or a
@@ -70,8 +72,11 @@ class SeqWindow {
 // the network had caused it.
 class HapticLink {
  public:
-  // `scheme` goes into every datagram (wire::kSchemeMask).
+  // `scheme` goes into every datagram (wire::kSchemeMask). The first form
+  // sends from `socket` only, the second along routes of `paths`.
   HapticLink(net::UdpSocket& socket, std::uint32_t session, const net::Endpoint& peer,
+             Passivity scheme);
+  HapticLink(net::Paths& paths, std::uint32_t session, const net::Route& peer,
              Passivity scheme);
 
   void set_emulation(std::unique_ptr<net::ChannelModel> model) { emulation_ = std::move(model); }
@@ -106,7 +111,12 @@ class HapticLink {
   // if it belongs to this session and peer and is not a duplicate; on a
   // sealed link the peer may be at a new address (see above).
   std::optional<Received> on_datagram(const std::uint8_t* data, std::size_t size,
-                                      const net::Endpoint& from, Nanos rx_time);
+                                      const net::Route& from, Nanos rx_time);
+  // A datagram that came directly from `from`.
+  std::optional<Received> on_datagram(const std::uint8_t* data, std::size_t size,
+                                      const net::Endpoint& from, Nanos rx_time) {
+    return on_datagram(data, size, net::Route{from, false}, rx_time);
+  }
 
   struct Counters {
     std::uint64_t sent = 0;           // samples handed to send()
@@ -119,7 +129,7 @@ class HapticLink {
     std::uint64_t unauthentic = 0;    // this session and peer, but not sealed or
                                       // failing authentication (sealed links)
     std::uint64_t missing = 0;        // never arrived (so far)
-    std::uint64_t moved = 0;          // the peer came from a new address
+    std::uint64_t moved = 0;          // the peer came from a new address or route
   };
   Counters counters() const;
 
@@ -130,7 +140,8 @@ class HapticLink {
   const std::vector<net::TimestampSample>& exchanges() const { return exchanges_; }
 
   std::uint32_t session() const { return session_; }
-  const net::Endpoint& peer() const { return peer_; }
+  const net::Endpoint& peer() const { return route_.peer; }
+  const net::Route& route() const { return route_; }
 
   // Caps the number of exchanges kept (each 32 bytes), so that a run of
   // hours stays bounded; later exchanges are dropped.
@@ -139,9 +150,10 @@ class HapticLink {
  private:
   void transmit(const std::vector<std::uint8_t>& datagram);
 
-  net::UdpSocket& socket_;
+  std::unique_ptr<net::Paths> own_paths_;  // for the socket-only form
+  net::Paths* paths_;
   std::uint32_t session_;
-  net::Endpoint peer_;
+  net::Route route_;
   Passivity scheme_;
   std::uint32_t next_seq_ = 1;
   std::vector<std::uint8_t> buf_;

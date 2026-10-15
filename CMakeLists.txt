@@ -24,6 +24,7 @@ add_library(tuushin
   src/crypto/noise.cpp
   src/net/channel.cpp
   src/net/clock_sync.cpp
+  src/net/paths.cpp
   src/net/probe.cpp
   src/net/rendezvous.cpp
   src/net/stun.cpp

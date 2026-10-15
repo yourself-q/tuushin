@@ -35,12 +35,17 @@ namespace tuushin::net {
 // signalling channel, check which pairs connect.
 //
 // Simplified against ICE:
-//  * The candidates are the server-reflexive address and the host's own
-//    addresses (for two ends on one LAN, whose router may not hairpin).
-//    There are no relayed candidates (TURN): where both NATs pick a new
-//    outside port for every destination ("symmetric" NATs, endpoint-
-//    dependent mapping), the address the server saw is useless to the
-//    other end and the ends do not connect.
+//  * The candidates are the server-reflexive address, the host's own
+//    addresses (for two ends on one LAN, whose router may not hairpin),
+//    and a relayed address on a TURN server if the end has one
+//    (net/turn.hpp, net/paths.hpp). Where both NATs pick a new outside
+//    port for every destination ("symmetric" NATs, endpoint-dependent
+//    mapping), the address the server saw is useless to the other end and
+//    only the relay connects them. Only the slave allocates one: a relay at
+//    one end suffices, since to the other end the relayed address is an
+//    ordinary public one. The master tries it last (RendezvousConfig in
+//    teleop/node.hpp), as ICE pairs relayed candidates last, because the
+//    detour through the server adds to every datagram's delay.
 //  * The connectivity check is the haptic handshake itself. The master
 //    sends its hello to every candidate of the slave and takes the first
 //    reply that authenticates, from wherever it comes; the slave sends
@@ -69,7 +74,8 @@ namespace tuushin::net {
 //        6    1 role        RendezvousRole: the sender's in a registration,
 //                           the registrant's echoed in kWaiting, the peer's
 //                           in kPeer
-//        7    1 count       candidates, 0..kRendezvousMaxCandidates
+//        7    1 count       addresses in the candidates field,
+//                           0..kRendezvousMaxCandidates
 //        8    1 flags       bit 0 ready: the sender's in a registration,
 //                           the peer's in kPeer, zero in kWaiting;
 //                           bit 1 in replies: the recipient's own ready
@@ -78,11 +84,14 @@ namespace tuushin::net {
 //       12   16 id          the meeting's identifier
 //       28    8 txid        the registration's, echoed in the replies
 //       36   20 observed    replies: the address the registration came from
-//       56 20*8 candidates  registration: the sender's host addresses;
-//                           kPeer: the peer's, its observed address first
+//       56 20*8 candidates  registration: the sender's host addresses,
+//                           then its relayed ones; kPeer: the peer's, its
+//                           observed address first, then its relayed ones
 //
-// An address is 20 bytes: family (0 none, 4, 6), a zero byte, the port,
-// and 16 address bytes (IPv4 in the first 4). Unused slots are zero.
+// An address is 20 bytes: family (0 none, 4, 6), its kind (0 an address of
+// the end itself, 1 a relayed address; 0 in the observed field), the port,
+// and 16 address bytes (IPv4 in the first 4). Unused slots are zero. An
+// end without a relay sends what the format without kinds did.
 //
 // The ready flag orders the first datagrams. A NAT that sees a datagram
 // arrive for one of its outside ports before the inside socket has sent
@@ -110,7 +119,8 @@ using RendezvousId = std::array<std::uint8_t, 16>;
 
 enum class RendezvousRole : std::uint8_t { kMaster = 1, kSlave = 2 };
 
-constexpr std::size_t kRendezvousMaxCandidates = 8;
+constexpr std::size_t kRendezvousMaxCandidates = 8;  // relayed ones included
+constexpr std::size_t kRendezvousMaxRelays = 2;
 constexpr std::size_t kRendezvousMessageSize = 56 + 20 * kRendezvousMaxCandidates;
 
 struct RendezvousMessage {
@@ -127,11 +137,13 @@ struct RendezvousMessage {
   std::uint64_t txid = 0;
   Endpoint observed;
   std::vector<Endpoint> candidates;  // canonical (Endpoint::canonical) forms
+  std::vector<Endpoint> relays;      // relayed addresses, likewise
 };
 
-// Encodes `m` into exactly kRendezvousMessageSize bytes; candidates beyond
-// the limit are dropped. Decoding returns nullopt for anything malformed and
-// never throws.
+// Encodes `m` into exactly kRendezvousMessageSize bytes. Relays beyond
+// kRendezvousMaxRelays are dropped, then candidates beyond what is left of
+// kRendezvousMaxCandidates. Decoding returns nullopt for anything malformed
+// and never throws.
 std::vector<std::uint8_t> encode_rendezvous(const RendezvousMessage& m);
 std::optional<RendezvousMessage> decode_rendezvous(const std::uint8_t* data, std::size_t size);
 
@@ -168,6 +180,7 @@ class RendezvousServer {
     bool present = false;
     Endpoint from;  // canonical
     std::vector<Endpoint> host;
+    std::vector<Endpoint> relays;
     std::uint64_t txid = 0;
     bool ready = false;
     Nanos seen = 0;
@@ -209,6 +222,11 @@ class RendezvousClient {
   // When poll() will next return a registration.
   Nanos next_due() const { return next_; }
 
+  // Sets this end's relayed addresses (none by default); a change makes the
+  // next poll() due at once, and the server announces them to the peer.
+  void set_relays(std::vector<Endpoint> relays);
+  const std::vector<Endpoint>& relays() const { return relays_; }
+
   // Sets this end's ready flag; a change makes the next poll() due at once,
   // and registrations are then retried until the server confirms it. An
   // announcement that counts in peer_changes() clears it.
@@ -227,10 +245,12 @@ class RendezvousClient {
   // The peer's candidates, its server-reflexive address first; empty until
   // the server has announced a peer.
   const std::vector<Endpoint>& peer() const { return peer_; }
+  // The peer's relayed addresses, as last announced.
+  const std::vector<Endpoint>& peer_relays() const { return peer_relays_; }
   // Counts the announcements after which this end should open its NAT
-  // towards the peer again: a changed peer(), or a peer that registered
-  // anew (the server then no longer holds this end ready, after it had
-  // confirmed it).
+  // towards the peer again: a changed peer() or peer_relays(), or a peer
+  // that registered anew (the server then no longer holds this end ready,
+  // after it had confirmed it).
   std::uint64_t peer_changes() const { return peer_changes_; }
   // The peer's ready flag, as last announced.
   bool peer_ready() const { return peer_ready_; }
@@ -240,6 +260,7 @@ class RendezvousClient {
   RendezvousId id_;
   RendezvousRole role_;
   std::vector<Endpoint> host_;
+  std::vector<Endpoint> relays_;
   std::uint64_t txid_;
   Nanos next_ = 0;
   bool started_ = false;
@@ -248,6 +269,7 @@ class RendezvousClient {
   bool confirmed_ = true;  // the server holds ready_ as it is
   Endpoint observed_;
   std::vector<Endpoint> peer_;
+  std::vector<Endpoint> peer_relays_;
   std::uint64_t peer_changes_ = 0;
   bool peer_ready_ = false;
 };

@@ -19,20 +19,24 @@ constexpr std::size_t kObservedAt = 36;
 constexpr std::size_t kCandidatesAt = 56;
 constexpr std::uint8_t kReadyFlag = 1;
 constexpr std::uint8_t kRecipientReadyFlag = 2;
+constexpr std::uint8_t kKindOwn = 0;
+constexpr std::uint8_t kKindRelayed = 1;
 
-void put_address(std::uint8_t* p, const Endpoint& e) {
+void put_address(std::uint8_t* p, const Endpoint& e, std::uint8_t kind = kKindOwn) {
   std::memset(p, 0, kAddressSize);
   const auto a = e.address();
   if (a.size() != 4 && a.size() != 16) return;
   p[0] = a.size() == 4 ? 4 : 6;
+  p[1] = kind;
   p[2] = static_cast<std::uint8_t>(e.port());
   p[3] = static_cast<std::uint8_t>(e.port() >> 8);
   std::memcpy(p + 4, a.data(), a.size());
 }
 
-// nullopt if malformed; an invalid Endpoint for an empty slot.
+// nullopt if malformed; an invalid Endpoint for an empty slot. The kind
+// byte is the caller's to check.
 std::optional<Endpoint> get_address(const std::uint8_t* p) {
-  if (p[1] != 0) return std::nullopt;
+  if (p[0] == 0 && p[1] != 0) return std::nullopt;
   const std::uint16_t port = static_cast<std::uint16_t>(p[2] | (p[3] << 8));
   if (p[0] == 0) return Endpoint{};
   if (p[0] == 4) {
@@ -64,12 +68,21 @@ std::vector<std::uint8_t> encode_rendezvous(const RendezvousMessage& m) {
   out[4] = kVersion;
   out[5] = static_cast<std::uint8_t>(m.type);
   out[6] = static_cast<std::uint8_t>(m.role);
+  std::size_t relays = 0;
+  for (const auto& r : m.relays) relays += r.valid() && relays < kRendezvousMaxRelays ? 1 : 0;
   std::size_t n = 0;
   for (const auto& c : m.candidates) {
-    if (n == kRendezvousMaxCandidates) break;
+    if (n == kRendezvousMaxCandidates - relays) break;
     if (!c.valid()) continue;
     put_address(out.data() + kCandidatesAt + kAddressSize * n, c);
     ++n;
+  }
+  for (const auto& r : m.relays) {
+    if (relays == 0) break;
+    if (!r.valid()) continue;
+    put_address(out.data() + kCandidatesAt + kAddressSize * n, r, kKindRelayed);
+    ++n;
+    --relays;
   }
   out[7] = static_cast<std::uint8_t>(n);
   out[kFlagsAt] = static_cast<std::uint8_t>((m.ready ? kReadyFlag : 0) |
@@ -98,12 +111,26 @@ std::optional<RendezvousMessage> decode_rendezvous(const std::uint8_t* data, std
   std::memcpy(m.id.data(), data + kIdAt, m.id.size());
   for (int i = 0; i < 8; ++i) m.txid |= static_cast<std::uint64_t>(data[kTxidAt + i]) << (8 * i);
   const auto observed = get_address(data + kObservedAt);
-  if (!observed) return std::nullopt;
+  if (!observed || data[kObservedAt + 1] != kKindOwn) return std::nullopt;
   m.observed = *observed;
   for (std::size_t i = 0; i < n; ++i) {
-    const auto c = get_address(data + kCandidatesAt + kAddressSize * i);
+    const std::uint8_t* p = data + kCandidatesAt + kAddressSize * i;
+    const auto c = get_address(p);
     if (!c || !c->valid()) return std::nullopt;
-    m.candidates.push_back(*c);
+    if (p[1] == kKindOwn) {
+      if (!m.relays.empty()) return std::nullopt;  // relayed ones come last
+      m.candidates.push_back(*c);
+    } else if (p[1] == kKindRelayed && m.relays.size() < kRendezvousMaxRelays) {
+      m.relays.push_back(*c);
+    } else {
+      return std::nullopt;
+    }
+  }
+  for (std::size_t i = n; i < kRendezvousMaxCandidates; ++i) {
+    const std::uint8_t* p = data + kCandidatesAt + kAddressSize * i;
+    if (std::any_of(p, p + kAddressSize, [](std::uint8_t b) { return b != 0; })) {
+      return std::nullopt;
+    }
   }
   return m;
 }
@@ -123,9 +150,10 @@ RendezvousMessage RendezvousServer::peer_message(const RendezvousId& id, const E
   m.id = id;
   m.txid = to.txid;
   m.observed = to.from;
+  m.relays = peer.relays;
   m.candidates.push_back(peer.from);
   for (const auto& h : peer.host) {
-    if (m.candidates.size() == kRendezvousMaxCandidates) break;
+    if (m.candidates.size() + m.relays.size() == kRendezvousMaxCandidates) break;
     if (h != peer.from) m.candidates.push_back(h);
   }
   return m;
@@ -153,13 +181,18 @@ bool RendezvousServer::on_datagram(const std::uint8_t* data, std::size_t size,
   if (peer.present && now - peer.seen > expiry_) peer = End{};
 
   const Endpoint source = from.canonical();
-  std::vector<Endpoint> host;
-  for (const auto& c : m->candidates) {
-    const Endpoint h = c.canonical();
-    if (std::find(host.begin(), host.end(), h) == host.end()) host.push_back(h);
-  }
-  const bool moved =
-      !me.present || me.from != source || me.host != host || me.txid != m->txid;
+  auto unique = [](const std::vector<Endpoint>& v) {
+    std::vector<Endpoint> out;
+    for (const auto& c : v) {
+      const Endpoint e = c.canonical();
+      if (std::find(out.begin(), out.end(), e) == out.end()) out.push_back(e);
+    }
+    return out;
+  };
+  std::vector<Endpoint> host = unique(m->candidates);
+  std::vector<Endpoint> relays = unique(m->relays);
+  const bool moved = !me.present || me.from != source || me.host != host ||
+                     me.relays != relays || me.txid != m->txid;
   const bool changed = moved || me.ready != m->ready;
   // The peer's ready was about this end's previous addresses or
   // registration.
@@ -167,6 +200,7 @@ bool RendezvousServer::on_datagram(const std::uint8_t* data, std::size_t size,
   me.present = true;
   me.from = source;
   me.host = std::move(host);
+  me.relays = std::move(relays);
   me.txid = m->txid;
   me.ready = m->ready;
   me.seen = now;
@@ -208,7 +242,16 @@ std::optional<std::vector<std::uint8_t>> RendezvousClient::poll(Nanos now) {
   m.id = id_;
   m.txid = txid_;
   m.candidates = host_;
+  m.relays = relays_;
   return encode_rendezvous(m);
+}
+
+void RendezvousClient::set_relays(std::vector<Endpoint> relays) {
+  for (auto& r : relays) r = r.canonical();
+  if (relays.size() > kRendezvousMaxRelays) relays.resize(kRendezvousMaxRelays);
+  if (relays == relays_) return;
+  relays_ = std::move(relays);
+  next_ = 0;
 }
 
 void RendezvousClient::set_ready(bool ready) {
@@ -232,8 +275,9 @@ bool RendezvousClient::on_datagram(const std::uint8_t* data, std::size_t size,
   observed_ = m->observed;
   bool again = false;
   if (m->type == RendezvousMessage::Type::kPeer) {
-    if (m->candidates != peer_) {
+    if (m->candidates != peer_ || m->relays != peer_relays_) {
       peer_ = m->candidates;
+      peer_relays_ = m->relays;
       again = true;
     }
     peer_ready_ = m->ready;
@@ -280,7 +324,9 @@ void run_rendezvous_server(UdpSocket& socket, const std::atomic<bool>* stop,
         const bool met = reply && reply->type == RendezvousMessage::Type::kPeer;
         log(std::string(m->role == RendezvousRole::kMaster ? "master" : "slave") + " at " +
             from.canonical().to_string() + " with " + std::to_string(m->candidates.size()) +
-            " host addresses" + (m->ready ? ", ready" : "") + ": " +
+            " host addresses" +
+            (m->relays.empty() ? "" : ", relayed at " + m->relays[0].to_string()) +
+            (m->ready ? ", ready" : "") + ": " +
             (met ? "peer announced" : "waiting for its peer"));
       }
     }

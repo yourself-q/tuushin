@@ -11,6 +11,7 @@
 #include "tuushin/crypto/noise.hpp"
 #include "tuushin/net/channel.hpp"
 #include "tuushin/net/clock_sync.hpp"
+#include "tuushin/net/paths.hpp"
 #include "tuushin/net/probe.hpp"
 #include "tuushin/net/rendezvous.hpp"
 #include "tuushin/net/udp.hpp"
@@ -99,6 +100,19 @@ struct RendezvousConfig {
   // one moved: each only hears nothing.
   Nanos rejoin_after = 100 * kNanosPerMilli;
   Nanos rejoin_punch = kNanosPerSecond;
+  // Master: how long after its first hellos to the slave's own candidates
+  // it also sends hellos to the slave's relayed address (SlaveNodeConfig::
+  // relay). A direct path that opens answers within a round trip or two of
+  // the hellos, before the relay is tried; the master takes the first
+  // reply that authenticates, and the session stays on its path.
+  Nanos relay_delay = kNanosPerSecond;
+};
+
+// A relay on a TURN server (net/turn.hpp), with long-term credentials.
+struct RelayConfig {
+  net::Endpoint server;
+  std::string username;
+  std::string password;
 };
 
 struct MasterNodeConfig {
@@ -130,6 +144,8 @@ struct MasterNodeReport {
   bool rendezvous_failed = false;  // the server announced no slave in time
   net::Endpoint observed;          // this end's address as the server saw it
   std::vector<net::Endpoint> candidates;  // the slave's, as the server announced them
+  std::vector<net::Endpoint> relays;      // the slave's relayed addresses, likewise
+  bool relayed = false;  // the session ran to one of the relays
   std::uint64_t rejoins = 0;  // the slave announced anew during the session
   std::uint64_t ticks = 0, skipped = 0;
   net::DelayStats lateness;  // ns
@@ -200,11 +216,18 @@ struct SlaveNodeConfig {
   // Register with a rendezvous server while idle, and punch towards every
   // master it announces; needs psk.
   std::optional<RendezvousConfig> rendezvous;
+  // Allocate a relay and announce its address through the rendezvous, for
+  // masters that cannot reach this end directly (net/paths.hpp); needs
+  // rendezvous. Every master the server announces gets a permission on the
+  // relay for its addresses. The allocation is kept for as long as the
+  // node runs.
+  std::optional<RelayConfig> relay;
 };
 
 struct SlaveSessionReport {
   std::uint32_t session = 0;
   net::Endpoint master;
+  bool relayed = false;  // the session started through this end's relay
   Passivity scheme = Passivity::kNone;
   bool authenticated = false;
   std::uint64_t ticks = 0, skipped = 0;
@@ -227,8 +250,8 @@ struct SlaveNodeHooks {
   // Called when a session or a handshake is refused (scheme mismatch, a key
   // on one end only, a hello that does not authenticate), with a reason.
   std::function<void(const std::string&)> on_refused;
-  // Called with what the rendezvous server said: this end's address as it
-  // saw it, and every master it announced.
+  // Called with what the rendezvous server said (this end's address as it
+  // saw it, and every master it announced) and what became of the relay.
   std::function<void(const std::string&)> on_rendezvous;
 };
 
