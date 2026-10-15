@@ -66,9 +66,12 @@ class EnergyPort {
 
   // Energy that may still leave the channel here without violating passivity.
   double budget() const {
-    const double b = remote_in_ + covered_ - out_;
+    const double b = balance();
     return b > 0.0 ? b : 0.0;
   }
+  // budget() without its floor: negative by the debt while the outputs
+  // exceed what covers them, which the next input pays.
+  double balance() const { return remote_in_ + covered_ - out_; }
 
   // Books one sample of power flowing into the channel (W, positive = input).
   void account(double power, double dt) { account_energy(power * dt); }

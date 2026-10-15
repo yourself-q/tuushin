@@ -71,6 +71,12 @@ class VelocityFilter {
   // A displacement of dtheta (rad) over dt (s).
   float update(float dtheta, float dt);
   float value() const { return v_; }
+  // The standard deviation of value() at rest, for readings whose errors
+  // are independent with standard deviation `reading_sd` (rad), updated
+  // every dt: a reading error enters one difference and leaves through
+  // the next, and the filter's gain a passes a^2 * 2 / (2 - a) of the
+  // variance of their sum.
+  float spread(float reading_sd, float dt) const;
   void reset() { v_ = 0.0f; }
   void set_cutoff(float hz) { cutoff_ = hz; }
 

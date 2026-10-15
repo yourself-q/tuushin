@@ -1,5 +1,6 @@
 #include "tuushin/fw/core.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -19,6 +20,16 @@ constexpr std::uint32_t kSettle0Us = 700000;  // the first 200 ms ramp the volta
 constexpr std::uint32_t kRampUs = 200000;
 constexpr std::uint32_t kSweepUs = 800000;
 constexpr std::uint32_t kSettleUs = 400000;
+
+// How long a rise of the torque under a work cap may take to repay its
+// tax (keep_to_cap): a host's command period, over which the host's own
+// books trust their prediction of the shaft.
+constexpr float kTaxHorizonUs = 1000.0f;
+// How many standard deviations of the velocity estimate a rise takes off
+// the work it predicts it takes out, and over how long the encoder's
+// reading errors are measured (keep_to_cap).
+constexpr float kRiseConfidence = 4.0f;
+constexpr float kReadingNoiseUs = 100000.0f;
 
 std::uint16_t saturate16(std::uint32_t v) {
   return v > 0xFFFF ? 0xFFFF : static_cast<std::uint16_t>(v);
@@ -105,8 +116,12 @@ void DeviceCore::tick() {
     if (std::fabs(static_cast<float>(step)) > most) latch(Fault::kEncoderJump);
     const float dtheta = static_cast<float>(step) * count_to_rad;
     work_ += static_cast<double>(applied_) * static_cast<double>(dtheta);
-    dtheta_ = dtheta;
     vel_.update(dtheta, dt);
+    // The second difference of the readings: of their errors, 6 times
+    // their variance, and of the shaft's motion, its acceleration.
+    const float d2 = static_cast<float>(step - step_);
+    step_ = step;
+    reading_var_ += std::min(1.0f, dt * 1e6f / kReadingNoiseUs) * (d2 * d2 / 6.0f - reading_var_);
   }
 
   // The host's messages: a new command takes effect in this tick.
@@ -157,7 +172,7 @@ void DeviceCore::tick() {
     // the one before, in the tick it takes effect.
     const float taxed =
         fresh ? growth(clampf(prev_cmd_, -torque_limit_, torque_limit_), host) : 0.0f;
-    if (host != 0.0f && capped) host = keep_to_cap(host, dt, before, taxed);
+    if (host != 0.0f && capped) host = keep_to_cap(host, dt, before, taxed, omega);
     asked_ = host;
     if (host == 0.0f && damping_ == 0.0f) {
       // No torque to make: open the windings, which then carry no current
@@ -433,11 +448,17 @@ void DeviceCore::foc(float host, float omega, float vbus) {
 // before they knew (README, "Known issues"). The cap is the books' limit
 // on the device's side, where the work is measured.
 //
-// The shaft is taken to turn in the coming tick by its last step again,
-// plus what the torque itself adds over the tick from the moving parts'
-// inertia: a fraction l of the torque tau then does the work
+// The shaft is taken to turn on at its filtered velocity omega, plus what
+// the torque itself adds from the moving parts' inertia J: a fraction l
+// of the torque tau held for n ticks of dt then does the work
 //
-//   w(l) = l tau dtheta + (l tau dt)^2 / (2 J).
+//   w_n(l) = l tau omega n dt + (l tau n dt)^2 / (2 J).
+//
+// The velocity, not the last step: at a few counts a tick the step is 0
+// one tick and 2 the next, and a torque taking energy out of a knob a
+// hand turns slowly looked, on the steps, as if it would push a shaft at
+// rest, was cut, and came back on the next step: 400 cuts in 0.2 s at
+// 1.5 rad/s, which the tax below made cost twice what the torque took out.
 //
 // Raising the torque costs besides: the work is counted in whole counts,
 // and summed by parts the count is off by up to half a count q against
@@ -447,34 +468,84 @@ void DeviceCore::foc(float host, float omega, float vbus) {
 // books a count's worth of work each time the device lets the torque back
 // on for the step that went the torque's way: 0.5 mJ in a second, held by
 // a hand, that the motor never did. So the device pays q times the rise
-// beyond what the last tick kept and the host taxed, c(l) = w(l) +
-// q max(0, l |tau| - free), and takes the largest l in [0, 1] whose cost
-// the cap's room (none, once it is spent) covers. c is convex and
-// c(0) = 0, so every smaller fraction keeps to the cap too, as when the
-// voltage limit clamps the torque further. A torque against the motion
-// passes once the work it takes out pays its tax; one that would
-// accelerate a shaft at rest needs room. The step misses what the hand or
-// a wall does to the shaft within the tick, so the cap can be overrun by
-// about the torque times a few counts, once: the cap is on the total, so
-// the next tick finds no room left.
-float DeviceCore::keep_to_cap(float tau, float dt, float before, float taxed) {
-  const double left = cmd_.work_cap - (work_ + tax_);
-  const float room = left > 0.0 ? static_cast<float>(left) : 0.0f;
+// beyond what the last tick kept and the host taxed.
+//
+// It then keeps two limits, as the host's predictive PC does
+// (control/predictive_pc.hpp, "Repaying the tax"):
+//  - the coming tick's work, w_1(l), within the cap's room (none, once it
+//    is spent, however far): the torque held may stay while it does no
+//    work. w_1 is convex and w_1(0) = 0, so every smaller fraction keeps
+//    to it too, as when the voltage limit clamps the torque further;
+//  - a rise repays its tax, and the work beyond the cap, from the work it
+//    is predicted to take out over up to kTaxHorizonUs: the largest
+//    -w_n(l), n within the horizon, which for a shaft the torque would
+//    stop sooner is its kinetic energy J omega^2 / 2. Paid within the
+//    tick it needs the shaft to move a count a tick against the torque,
+//    1.9 rad/s, and a torque cut on a slower one never came back.
+//    The prediction takes kRiseConfidence standard deviations of the
+//    velocity estimate off: at rest, with an encoder dithering half a
+//    count, the estimate strays 0.38 rad/s rms and up to 1.5 rad/s, and
+//    each stray against the torque let it rise, pay its tax and be cut
+//    again as the readings came back: 270 cuts in 0.2 s. The spread
+//    follows from the readings' errors (VelocityFilter::spread), whose
+//    variance the device measures from the second differences of its
+//    counts, since a real encoder's noise grows with the bridge's.
+// The hold is on the estimate itself: a stray cuts a held torque, which
+// then stays off, rather than letting it do work.
+// The prediction misses what the hand or a wall does to the shaft, so
+// the cap can be overrun by about the torque times a few counts.
+float DeviceCore::keep_to_cap(float tau, float dt, float before, float taxed, float omega) {
+  const float left = static_cast<float>(cmd_.work_cap - (work_ + tax_));
+  const float room = left > 0.0f ? left : 0.0f;
   const float q = kTwoPi / static_cast<float>(cfg_.counts_per_rev);
   const float mag = std::fabs(tau);
-  const float a = tau * dtheta_;
+  const float a = tau * omega * dt;
   const float b = cfg_.inertia > 0.0f ? tau * tau * dt * dt / (2.0f * cfg_.inertia) : 0.0f;
   const float free = (before * tau > 0.0f ? std::fabs(before) : 0.0f) + taxed;
   const float l0 = free / mag;  // where the tax starts
-  auto cost = [&](float l) {
-    const float rise = l * mag - free;
-    return a * l + b * l * l + (rise > 0.0f ? q * rise : 0.0f);
+  const float horizon = std::max(1.0f, kTaxHorizonUs * 1e-6f / dt);  // ticks
+
+  // The tick's work.
+  const float held = a + b <= room ? 1.0f : clampf(largest_root(b, a, room), 0.0f, 1.0f);
+  if (held * mag <= free) {
+    if (held < 1.0f) capped_ = true;
+    return held * tau;
+  }
+  // The rise's tax less the most work it takes out within the horizon,
+  // on the velocity less kRiseConfidence of its estimate's spread at rest
+  // the torque's way. The readings' errors are rounding, at least, and
+  // independent from one reading to the next.
+  const float reading_sd = std::sqrt(std::max(reading_var_, 1.0f / 12.0f)) * q;
+  const float sure = a + mag * kRiseConfidence * vel_.spread(reading_sd, dt) * dt;
+  auto due = [&](float l) {
+    float n = sure < 0.0f ? horizon : 1.0f;
+    if (sure < 0.0f && b > 0.0f) n = clampf(-sure / (2.0f * b * l), 1.0f, horizon);
+    return q * (l * mag - free) + (sure * n * l + b * n * n * l * l);
   };
-  if (cost(1.0f) <= room) return tau;
+  if (due(held) <= room) {
+    if (held < 1.0f) capped_ = true;
+    return held * tau;
+  }
   capped_ = true;
-  const float l = l0 < 1.0f && cost(l0) <= room ? largest_root(b, a + q * mag, room + q * free)
-                                                : largest_root(b, a, room);
-  return clampf(l, 0.0f, 1.0f) * tau;
+  // due is falling and then rising over [l0, held]: the work taken out
+  // over the whole horizon grows with l faster than the tax, at first,
+  // up to where the torque would stop the shaft within it.
+  float low = l0;
+  if (sure < 0.0f && b > 0.0f) {
+    const float fall = -(q * mag + sure * horizon) / (2.0f * b * horizon * horizon);
+    low = clampf(fall, l0, std::max(l0, std::min(-sure / (2.0f * b * horizon), held)));
+  }
+  if (due(low) > room) return l0 * tau;
+  float high = held;
+  for (int k = 0; k < 20; ++k) {
+    const float mid = 0.5f * (low + high);
+    if (due(mid) <= room) {
+      low = mid;
+    } else {
+      high = mid;
+    }
+  }
+  return low * tau;
 }
 
 void DeviceCore::drive(bool on) {

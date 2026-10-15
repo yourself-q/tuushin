@@ -313,7 +313,11 @@ MasterController::Step MasterController::step(Nanos now, Nanos sampled, double p
   f_display_ = out.display_force;
   model_.command(now, f_display_);
   if (cfg_.passivity != Passivity::kNone && port_work_) {
-    out.work_cap = *port_work_ + port_.budget();
+    // With the port in debt the cap is below the work: the device takes
+    // the debt back out before its force does work again. A cap at the
+    // work would let it spend again what paid the debt, and each overrun
+    // the device's own misprediction makes would stay owed.
+    out.work_cap = *port_work_ + port_.balance();
   }
   // The device may take the port's work up to the largest cap it still
   // holds, and an input booked since that cap was sent lowered the work
@@ -489,9 +493,11 @@ SlaveController::Step SlaveController::step(Nanos now, Nanos sampled, double pos
       // beyond, which the master then cannot be granted while the cap is
       // in effect. Without the share a misprediction would scale the
       // force down at once; with all of it the master would get nothing.
-      const double spare = std::max(0.0, store_.level());
+      // A store in deficit puts the cap below the work, as at the master.
+      const double level = store_.level();
+      const double spare = std::max(0.0, level);
       const double own = std::clamp(grant.slave - tax, 0.0, spare);
-      out.work_cap = *port_work_ + own + kCapSpareShare * (spare - own);
+      out.work_cap = *port_work_ + std::min(0.0, level) + own + kCapSpareShare * (spare - own);
     }
   }
   model_.command(now, -f_ctrl_);

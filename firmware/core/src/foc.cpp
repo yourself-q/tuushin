@@ -65,6 +65,12 @@ float VelocityFilter::update(float dtheta, float dt) {
   return v_;
 }
 
+float VelocityFilter::spread(float reading_sd, float dt) const {
+  if (dt <= 0.0f) return 0.0f;
+  const float a = 1.0f - std::exp(-kTwoPi * cutoff_ * dt);
+  return reading_sd / dt * a * std::sqrt(2.0f / (2.0f - a));
+}
+
 std::int32_t TurnCounter::update(std::uint32_t raw) {
   if (!started_) {
     reset(raw);

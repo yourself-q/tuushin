@@ -122,7 +122,7 @@ class DeviceCore {
   // The bridge: driving the windings, or open (no current).
   void drive(bool on);
   void foc(float host, float omega, float vbus);
-  float keep_to_cap(float host, float dt, float before, float taxed);
+  float keep_to_cap(float host, float dt, float before, float taxed, float omega);
   void send(const std::uint8_t* frame, std::size_t n);
   void log(const char* text);
   void send_state(std::uint32_t now);
@@ -158,7 +158,10 @@ class DeviceCore {
   bool capped_ = false;  // in some tick since the last State
   double work_ = 0.0;
   double tax_ = 0.0;  // State::tax
-  float dtheta_ = 0.0f;  // the shaft's last step (rad)
+  std::int32_t step_ = 0;  // the shaft's last step (counts)
+  // The variance of the encoder's reading errors (counts^2), measured
+  // (keep_to_cap); a cautious count until it is.
+  float reading_var_ = 1.0f;
   float prev_cmd_ = 0.0f;  // the torque of the command before this one
   bool fresh_cmd_ = false;  // the command came since the last tick
 

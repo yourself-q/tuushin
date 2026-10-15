@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <future>
+#include <limits>
 #include <optional>
 #include <random>
 #include <stdexcept>
@@ -90,6 +91,11 @@ std::uint32_t random_session() {
   std::uint32_t s = 0;
   while (s == 0) s = rd();
   return s;
+}
+
+// A log column for a value a device or a controller may not have.
+double or_nan(const std::optional<double>& v) {
+  return v ? *v : std::numeric_limits<double>::quiet_NaN();
 }
 
 double transmitted_energy(const SlaveController& ctl, Passivity scheme) {
@@ -558,7 +564,9 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
   }
   if (emulation) link.set_emulation(std::move(emulation));
   MasterController ctl(cfg.control);
-  CsvLog log(cfg.log_path, "t,late_us,x_m,v_m,f_display,ein,eout,granted,pc,sent,rx,rtt_us,age_us\n");
+  CsvLog log(cfg.log_path,
+             "t,late_us,x_m,v_m,f_display,ein,eout,granted,pc,sent,rx,rtt_us,age_us,work,reserved,"
+             "cap\n");
   std::optional<SessionRejoin> rejoin;
   std::optional<net::Endpoint> server;
   if (rv) server = cfg.rendezvous->server.for_family(socket.is_ipv6());
@@ -620,9 +628,10 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
     // longer steps, so the port's books stay as they are and every final
     // sample carries the same, final, figures.
     MasterController::Step st;
+    const auto work = device.port_work();
+    const auto reserved = device.work_reserved();
     if (!final) {
-      st = ctl.step(now, device.sampled_at(now), x, device.force_cut_after(), device.port_work(),
-                    device.work_reserved());
+      st = ctl.step(now, device.sampled_at(now), x, device.force_cut_after(), work, reserved);
       if (st.work_cap) {
         device.command_force_capped(-st.display_force, *st.work_cap);
       } else {
@@ -644,13 +653,15 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
     rep.max_force = std::max(rep.max_force, std::fabs(st.display_force));
     if (log.get()) {
       const auto& rtts = link.rtts();
-      std::fprintf(log.get(), "%.6f,%.1f,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%d,%d,%llu,%.1f,%.1f\n",
+      std::fprintf(log.get(),
+                   "%.6f,%.1f,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%d,%d,%llu,%.1f,%.1f,%.9g,%.9g,%.9g\n",
                    to_seconds(now - start), static_cast<double>(late) / 1e3, x, device.velocity(),
                    st.display_force, port.input_energy(), port.output_energy(),
                    port.remote_input_energy(), st.pc_active ? 1 : 0, st.send || final ? 1 : 0,
                    static_cast<unsigned long long>(link.counters().received),
                    rtts.empty() ? -1.0 : rtts.back() / 1e3,
-                   static_cast<double>(now - device.sampled_at(now)) / 1e3);
+                   static_cast<double>(now - device.sampled_at(now)) / 1e3, or_nan(work),
+                   or_nan(reserved), or_nan(st.work_cap));
     }
   }
   device.command_force(0.0);
@@ -995,7 +1006,7 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
     }
     CsvLog log(log_path,
                "t,late_us,x_s,v_s,f_contact,f_cmd,x_cmd,x_master_est,f_slave,store,ein_s,eout_s,"
-               "net_s,pc,sent,rx,age_us\n");
+               "net_s,pc,sent,rx,age_us,work,reserved,cap\n");
 
     Nanos last_rx = first->rx;
     Nanos master_final_at = -1;
@@ -1045,9 +1056,11 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
       // books are frozen, so the master gets the same final figures from
       // whichever final sample reaches it.
       SlaveController::Step st;
+      const auto work = device.port_work();
+      const auto reserved = device.work_reserved();
       if (!final) {
         st = ctl.step(now, device.sampled_at(now), x, device.velocity(), fc,
-                       device.force_cut_after(), device.port_work(), device.work_reserved());
+                       device.force_cut_after(), work, reserved);
         if (st.work_cap) {
           device.command_force_capped(st.force, *st.work_cap);
         } else {
@@ -1073,14 +1086,15 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
         const auto& sp = ctl.channel_port();
         std::fprintf(log.get(),
                      "%.6f,%.1f,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%d,%d,%llu,"
-                     "%.1f\n",
+                     "%.1f,%.9g,%.9g,%.9g\n",
                      to_seconds(now - start), static_cast<double>(late) / 1e3, x, device.velocity(),
                      fc, st.force, ctl.command(), ctl.master_estimate(), ctl.reported_force(),
                      refl ? stv.level() : 0.0, refl ? stv.slave_input_energy() : sp.input_energy(),
                      refl ? stv.slave_output_energy() : sp.output_energy(), ctl.terminal_net(),
                      st.pc_active ? 1 : 0, st.send || final ? 1 : 0,
                      static_cast<unsigned long long>(link.counters().received),
-                     static_cast<double>(now - device.sampled_at(now)) / 1e3);
+                     static_cast<double>(now - device.sampled_at(now)) / 1e3, or_nan(work),
+                     or_nan(reserved), or_nan(st.work_cap));
       }
     }
     device.command_force(0.0);

@@ -684,3 +684,56 @@ TEST_CASE(fw_plant_float_forces_track_double) {
                 hand ? "hand" : "stop", worst * 1e3, b.motor_work(), a.motor_work(), highest);
   }
 }
+
+TEST_CASE(fw_work_cap_spent_keeps_the_torque_steady) {
+  // A cap spent 1 mJ ago, as a host's books in deficit leave it. A torque
+  // that takes energy out of the knob a hand turns stays on: cut whenever
+  // a tick's step was 0 counts and let back on with the next, it paid the
+  // tax at every count, twice what it took out. A torque that would do
+  // work on a knob at rest stays off, whether a hand holds the knob or
+  // not, and even as the encoder's noise makes the knob seem to move
+  // against it now and then.
+  for (int scene : {0, 1, 2}) {
+    for (bool noisy : {false, true}) {
+      PlantParams p = noisy ? PlantParams{} : quiet_plant();
+      Rig rig(p, config_for(p));
+      REQUIRE(rig.calibrate());
+      HandParams h;
+      h.present = scene != 2;
+      h.k = 0.5;
+      h.b = 5e-3;
+      h.ref_offset = rig.plant.angle();
+      h.ref_amplitude = scene == 0 ? 2.0 : 0.0;  // up to 1.6 rad/s
+      h.ref_freq = 0.25;
+      rig.plant.set_hand(h, rig.t);
+      const double w0 = rig.core.last_state().work;
+      const double torque = scene == 0 ? -0.014 : 0.02;
+      auto next = std::make_shared<double>(rig.t);
+      auto host = [&](double now) {
+        if (now + 1e-12 < *next) return;
+        *next += 1e-3;
+        rig.command_capped(torque, w0 - 1e-3);
+      };
+      rig.run(0.8, host);
+      const State s0 = rig.core.last_state();
+      int flips = 0;
+      bool on = rig.core.applied_torque() != 0.0f;
+      rig.run(0.2, [&](double now) {
+        host(now);
+        const bool o = rig.core.applied_torque() != 0.0f;
+        if (o != on) ++flips;
+        on = o;
+      });
+      const State s1 = rig.core.last_state();
+      CHECK(flips == 0);
+      CHECK(s1.tax == s0.tax);
+      if (scene == 0) {
+        CHECK(on);
+        CHECK(s1.work - s0.work < -1e-3);
+      } else {
+        CHECK(!on);
+        CHECK(s1.work == s0.work);
+      }
+    }
+  }
+}
