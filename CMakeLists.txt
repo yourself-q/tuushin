@@ -19,6 +19,7 @@ add_library(tuushin
   src/time.cpp
   src/control/held_device.cpp
   src/control/predictive_pc.cpp
+  src/control/reading_noise.cpp
   src/control/reflection.cpp
   src/control/tdpa.cpp
   src/crypto/legacy_digest.cpp

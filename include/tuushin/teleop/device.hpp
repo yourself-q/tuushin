@@ -1,8 +1,11 @@
 #pragma once
 
+#include <cstdint>
 #include <deque>
+#include <optional>
 #include <utility>
 
+#include "tuushin/rng.hpp"
 #include "tuushin/time.hpp"
 
 namespace tuushin::teleop {
@@ -17,6 +20,13 @@ class Device1D {
   // Samples the encoder at `now` (m). A simulated device advances its
   // physics to `now` with the force commanded last.
   virtual double read_position(Nanos now) = 0;
+  // When the position the last read_position(now) returned was sampled,
+  // on the same clock: `now` for a device sampled when it is read; earlier
+  // for one whose samples come over a link (device::RemoteDevice), whose
+  // age varies with the link and with where the host's tick falls between
+  // the device's. The controllers book and predict with the sample's own
+  // time, so that its age does not pass for motion.
+  virtual Nanos sampled_at(Nanos now) const { return now; }
   // Velocity estimate at the last read (m/s).
   virtual double velocity() const = 0;
   // Force along +x (N), held until the next command.
@@ -32,6 +42,17 @@ class Device1D {
   // was cut did no work for the rest of the sample, and booking it as if it
   // had credits energy that never entered.
   virtual Nanos force_cut_after() const { return 0; }
+  // The work the commanded force has done on the device (J: the force
+  // along +x times the displacement while it acted), summed up to the
+  // reading sampled_at() refers to, if the device measures it. A servo loop
+  // that sums it over its own ticks knows it to its encoder's resolution.
+  // The host only knows a sample's displacement, and when the force changed
+  // within the sample (a command takes effect between two readings) it can
+  // only split the displacement among the forces by a model, which a device
+  // against a stiff object, or chattering forces, put hundreds of
+  // micrometres off: work booked that no force did. The controllers book
+  // this instead when it is given.
+  virtual std::optional<double> port_work() const { return std::nullopt; }
   // Why the device cannot go on (a latched fault, a link that went
   // quiet), or nullptr while it can. A node ends its session on it.
   virtual const char* fault() const { return nullptr; }
@@ -108,6 +129,14 @@ class SimulatedDevice : public Device1D {
   // resolution does; 0 (the default) reads the exact position.
   void set_encoder_resolution(double q);
   double encoder_resolution() const { return q_; }
+  // Adds Gaussian noise of `counts` standard deviations of a count to the
+  // position before it is rounded, drawn anew for every reading, as a
+  // magnetic encoder dithers (about half a count on an MT6701 or AS5047P).
+  // Only with a resolution; 0 (the default) adds none.
+  void set_encoder_noise(double counts, std::uint64_t seed = 1) {
+    noise_counts_ = counts > 0.0 ? counts : 0.0;
+    noise_ = Rng(seed);
+  }
 
   // Friction besides the viscous damping, acting on the motor side.
   void set_friction(const FrictionParams& friction) { friction_ = friction; }
@@ -177,6 +206,8 @@ class SimulatedDevice : public Device1D {
   Nanos cut_after_ = 0;
   double work_ = 0.0;
   double q_ = 0.0;
+  double noise_counts_ = 0.0;
+  Rng noise_{1};
   bool have_read_ = false;
   double y_ = 0.0;       // last reading
   Nanos y_time_ = 0;     // and when it was taken

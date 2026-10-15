@@ -83,6 +83,8 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
                                    cfg.substeps, 0, cfg.op.ref_offset);
   master_dev.set_encoder_resolution(cfg.master_encoder_resolution);
   slave_dev.set_encoder_resolution(cfg.slave_encoder_resolution);
+  master_dev.set_encoder_noise(cfg.master_encoder_noise, cfg.jitter_seed + 1);
+  slave_dev.set_encoder_noise(cfg.slave_encoder_noise, cfg.jitter_seed + 2);
   master_dev.set_friction(cfg.master.friction);
   slave_dev.set_friction(cfg.slave.friction);
   master_dev.set_compliance(cfg.master.compliance);
@@ -106,6 +108,7 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
   mc.encoder_resolution = cfg.encoder_resolution_known ? cfg.master_encoder_resolution : 0.0;
   mc.force_rate = cfg.force_rate;
   mc.adapt_force_rate = cfg.adapt_force_rate;
+  mc.estimate_reading_noise = cfg.estimate_reading_noise;
   mc.pc_confidence = cfg.pc_confidence;
   mc.pc_tax_samples = cfg.pc_tax_samples;
   mc.pc_rise_samples = cfg.master_pc_rise_samples;
@@ -132,6 +135,7 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
   sc.encoder_resolution = cfg.encoder_resolution_known ? cfg.slave_encoder_resolution : 0.0;
   sc.force_rate = cfg.force_rate;
   sc.adapt_force_rate = cfg.adapt_force_rate;
+  sc.estimate_reading_noise = cfg.estimate_reading_noise;
   sc.pc_confidence = cfg.pc_confidence;
   sc.pc_tax_samples = cfg.pc_tax_samples;
   sc.pc_rise_samples = cfg.slave_pc_rise_samples;
@@ -290,6 +294,8 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
   r.min_channel_margin = min_channel_margin;
   r.master_actuation_delay = master.actuation_delay();
   r.slave_actuation_delay = slave.actuation_delay();
+  r.master_reading_noise = std::sqrt(master.reading_noise());
+  r.slave_reading_noise = std::sqrt(slave.reading_noise());
   return r;
 }
 

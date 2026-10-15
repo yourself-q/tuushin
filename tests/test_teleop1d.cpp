@@ -235,6 +235,42 @@ TEST_CASE(teleop_reflective_tdpa_stays_passive_on_coarse_encoders) {
   }
 }
 
+TEST_CASE(teleop_reflective_tdpa_estimates_dithering_encoders) {
+  // Magnetic encoders dither by about half a count. Taking their readings
+  // to err by the quantization alone, as before the controllers estimated
+  // the noise, the Kalman filters trust each reading too much, the force
+  // rate's adaptation takes the surprise for a hand pushing faster and the
+  // predictions grow too wide for the PCs to let any force through: no
+  // wall is displayed at all. Estimated, the wall comes out at 50 to 100
+  // N/m at 10 to 100 ms (1040, 173 and 72 N/m without dither), and nothing
+  // is generated.
+  for (int ms : {10, 50, 100}) {
+    for (bool estimate : {true, false}) {
+      sim::Teleop1DConfig cfg;
+      cfg.passivity = Passivity::kReflective;
+      cfg.master_encoder_resolution = 55e-6;
+      cfg.slave_encoder_resolution = 1e-6;
+      cfg.master_encoder_noise = 0.5;
+      cfg.slave_encoder_noise = 0.5;
+      cfg.estimate_reading_noise = estimate;
+      const auto r = run(cfg, from_millis(ms));
+      CHECK(!r.diverged);
+      CHECK(r.min_true_margin > -1e-7);
+      const double master_truth = 55e-6 * std::sqrt(0.25 + 1.0 / 12.0);
+      const double slave_truth = 1e-6 * std::sqrt(0.25 + 1.0 / 12.0);
+      if (estimate) {
+        CHECK(r.max_display_force > 2.0);
+        CHECK(r.displayed_stiffness > 30.0);
+        CHECK_NEAR(r.master_reading_noise / master_truth, 1.0, 0.15);
+        CHECK_NEAR(r.slave_reading_noise / slave_truth, 1.0, 0.15);
+      } else {
+        CHECK(r.max_display_force < 0.1);
+        CHECK_NEAR(r.master_reading_noise, 55e-6 / std::sqrt(12.0), 1e-12);
+      }
+    }
+  }
+}
+
 namespace {
 
 sim::Teleop1DConfig coarse(double freq, double amplitude) {
@@ -455,8 +491,10 @@ TEST_CASE(teleop_reflective_tdpa_pays_for_the_forces_in_flight) {
     }
   }
   // With coarse encoders the books already allow for misses, but unaware of
-  // a delay of 2 ms the teleoperator still generates 0.1 J at 50 and 100 ms.
-  // Told it, it generates nothing.
+  // a delay of 2 ms the teleoperator still generates 45 and 72 mJ at 50 and
+  // 100 ms (0.10 and 0.09 J with the reading noise taken to be the
+  // quantization's: the estimate of it takes in some of the misses, and
+  // the filters trust the readings less). Told it, it generates nothing.
   for (int ms : {10, 50, 100}) {
     for (const bool known : {true, false}) {
       auto cfg = coarse(0.5, 0.04);
@@ -469,7 +507,7 @@ TEST_CASE(teleop_reflective_tdpa_pays_for_the_forces_in_flight) {
         CHECK(r.max_book_excess < 1e-12);
         CHECK(r.min_true_margin > -1e-9);
       } else if (ms > 10) {
-        CHECK(r.min_true_margin < -0.05);
+        CHECK(r.min_true_margin < -0.03);
       }
     }
   }

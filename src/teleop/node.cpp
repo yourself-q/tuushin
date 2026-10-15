@@ -558,7 +558,7 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
   }
   if (emulation) link.set_emulation(std::move(emulation));
   MasterController ctl(cfg.control);
-  CsvLog log(cfg.log_path, "t,late_us,x_m,v_m,f_display,ein,eout,granted,pc,sent,rx,rtt_us\n");
+  CsvLog log(cfg.log_path, "t,late_us,x_m,v_m,f_display,ein,eout,granted,pc,sent,rx,rtt_us,age_us\n");
   std::optional<SessionRejoin> rejoin;
   std::optional<net::Endpoint> server;
   if (rv) server = cfg.rendezvous->server.for_family(socket.is_ipv6());
@@ -621,7 +621,7 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
     // sample carries the same, final, figures.
     MasterController::Step st;
     if (!final) {
-      st = ctl.step(now, x, device.force_cut_after());
+      st = ctl.step(now, device.sampled_at(now), x, device.force_cut_after(), device.port_work());
       device.command_force(-st.display_force);
     } else {
       device.command_force(0.0);
@@ -639,12 +639,13 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
     rep.max_force = std::max(rep.max_force, std::fabs(st.display_force));
     if (log.get()) {
       const auto& rtts = link.rtts();
-      std::fprintf(log.get(), "%.6f,%.1f,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%d,%d,%llu,%.1f\n",
+      std::fprintf(log.get(), "%.6f,%.1f,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%d,%d,%llu,%.1f,%.1f\n",
                    to_seconds(now - start), static_cast<double>(late) / 1e3, x, device.velocity(),
                    st.display_force, port.input_energy(), port.output_energy(),
                    port.remote_input_energy(), st.pc_active ? 1 : 0, st.send || final ? 1 : 0,
                    static_cast<unsigned long long>(link.counters().received),
-                   rtts.empty() ? -1.0 : rtts.back() / 1e3);
+                   rtts.empty() ? -1.0 : rtts.back() / 1e3,
+                   static_cast<double>(now - device.sampled_at(now)) / 1e3);
     }
   }
   device.command_force(0.0);
@@ -989,7 +990,7 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
     }
     CsvLog log(log_path,
                "t,late_us,x_s,v_s,f_contact,f_cmd,x_cmd,x_master_est,f_slave,store,ein_s,eout_s,"
-               "net_s,pc,sent,rx\n");
+               "net_s,pc,sent,rx,age_us\n");
 
     Nanos last_rx = first->rx;
     Nanos master_final_at = -1;
@@ -1040,7 +1041,8 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
       // whichever final sample reaches it.
       SlaveController::Step st;
       if (!final) {
-        st = ctl.step(now, x, device.velocity(), fc, device.force_cut_after());
+        st = ctl.step(now, device.sampled_at(now), x, device.velocity(), fc,
+                       device.force_cut_after(), device.port_work());
         device.command_force(st.force);
       } else {
         device.command_force(0.0);
@@ -1061,13 +1063,15 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
         const auto& stv = ctl.store();
         const auto& sp = ctl.channel_port();
         std::fprintf(log.get(),
-                     "%.6f,%.1f,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%d,%d,%llu\n",
+                     "%.6f,%.1f,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%d,%d,%llu,"
+                     "%.1f\n",
                      to_seconds(now - start), static_cast<double>(late) / 1e3, x, device.velocity(),
                      fc, st.force, ctl.command(), ctl.master_estimate(), ctl.reported_force(),
                      refl ? stv.level() : 0.0, refl ? stv.slave_input_energy() : sp.input_energy(),
                      refl ? stv.slave_output_energy() : sp.output_energy(), ctl.terminal_net(),
                      st.pc_active ? 1 : 0, st.send || final ? 1 : 0,
-                     static_cast<unsigned long long>(link.counters().received));
+                     static_cast<unsigned long long>(link.counters().received),
+                     static_cast<double>(now - device.sampled_at(now)) / 1e3);
       }
     }
     device.command_force(0.0);

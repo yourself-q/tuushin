@@ -105,11 +105,16 @@ class RemoteDevice final : public teleop::Device1D {
   void connect();
 
   double read_position(Nanos now) override;
+  // The State's own time on the host's clock (Clock::to_host), at most
+  // `now`; `now` before the clocks are matched.
+  Nanos sampled_at(Nanos now) const override;
   double velocity() const override;
   // A force f along +x is the torque f * r in x's sense of rotation. The
   // first command switches the driver on.
   void command_force(double f) override;
   Nanos force_cut_after() const override;
+  // The work the State used last reports, since connect().
+  std::optional<double> port_work() const override;
   const char* fault() const override;
 
   // Switches the driver off; the next command_force switches it on.

@@ -144,14 +144,20 @@ struct Teleop1DConfig {
   // (control/predictive_pc.hpp); if not, they treat the readings as exact.
   double master_encoder_resolution = 0.0;
   double slave_encoder_resolution = 0.0;
+  // Gaussian noise added to the positions before they are rounded, in
+  // counts (teleop::SimulatedDevice::set_encoder_noise).
+  double master_encoder_noise = 0.0;
+  double slave_encoder_noise = 0.0;
   bool encoder_resolution_known = true;
   // The predictors and their use by the PCs (teleop::MasterConfig): with
-  // known resolutions, the Kalman filters' least force rate in N/s and
-  // whether they may raise it; with any encoders, the confidence factor
+  // known resolutions, the Kalman filters' least force rate in N/s,
+  // whether they may raise it and whether they estimate the reading noise;
+  // with any encoders, the confidence factor
   // and the tax horizon of limit_force_predictive; with known resolutions,
   // its rise horizons.
   double force_rate = 20.0;
   bool adapt_force_rate = true;
+  bool estimate_reading_noise = true;
   double pc_confidence = 1.0;
   int pc_tax_samples = 4;
   int master_pc_rise_samples = 64;
@@ -239,6 +245,10 @@ struct Teleop1DResult {
   // their estimates.
   Nanos master_actuation_delay = 0;
   Nanos slave_actuation_delay = 0;
+  // The standard deviation of a reading's error the controllers ended up
+  // assuming (control::ReadingNoise), m; 0 with an exact encoder.
+  double master_reading_noise = 0.0;
+  double slave_reading_noise = 0.0;
 };
 
 Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forward,

@@ -25,10 +25,11 @@ void append(std::vector<control::ForceSegment>& segs, double phi, Nanos length, 
 }  // namespace
 
 const std::vector<control::ForceSegment>& ActuatorSchedule::advance(Nanos from, Nanos to,
-                                                                    Nanos cut_after) {
+                                                                    Nanos cut_after,
+                                                                    Nanos issued) {
   auto& segs = segs_;
   segs.clear();
-  const Nanos cut = cut_after > 0 ? from + cut_after : to + 1;
+  const Nanos cut = cut_after > 0 ? issued + cut_after : to + 1;
   Nanos t = from;
   while (!pending_.empty() && pending_.front().first <= to && pending_.front().first <= cut) {
     const Nanos at = std::max(t, pending_.front().first);
@@ -49,17 +50,17 @@ const std::vector<control::ForceSegment>& ActuatorSchedule::advance(Nanos from, 
   return segs;
 }
 
-const std::vector<control::ForceSegment>& ActuatorSchedule::lead(Nanos now) {
+const std::vector<control::ForceSegment>& ActuatorSchedule::lead(Nanos from, Nanos issue) {
   auto& segs = lead_;
   segs.clear();
-  if (delay_ <= 0) return segs;
-  const Nanos end = now + delay_;
-  Nanos t = now;
+  const Nanos end = issue + delay_;
+  if (end <= from) return segs;
+  Nanos t = from;
   double phi = active_;
   for (const auto& [at, f] : pending_) {
-    const Nanos from = std::clamp(at, t, end);
-    append(segs, phi, from - t, dt_);
-    t = from;
+    const Nanos start = std::clamp(at, t, end);
+    append(segs, phi, start - t, dt_);
+    t = start;
     phi = f;
   }
   append(segs, phi, end - t, dt_);
@@ -67,11 +68,9 @@ const std::vector<control::ForceSegment>& ActuatorSchedule::lead(Nanos now) {
 }
 
 void ActuatorSchedule::command(Nanos now, double phi) {
-  if (delay_ <= 0) {
-    active_ = phi;
-  } else {
-    pending_.emplace_back(now + delay_, phi);
-  }
+  // Even without a delay the command waits for advance(): the sample it
+  // ends may have been read before it was issued.
+  pending_.emplace_back(now + delay_, phi);
 }
 
 namespace {
@@ -99,11 +98,27 @@ constexpr double kAdaptPerSecond = 3.0;
 constexpr double kAdaptNisClip = 9.0;
 constexpr double kAdaptLogMax = 5.545177444479562;  // 2 ln 16
 
+// The work into the two-port over a sample: the device's measured work
+// when it reports it, else the device model's. The port force phi opposes
+// the device's force, so the work in is minus the increase of the work the
+// device's force did. The first measurement only sets the origin.
+double booked_work(std::optional<double>& last, const std::optional<double>& measured,
+                   double modeled) {
+  if (!measured) return modeled;
+  const double w = last ? *last - *measured : 0.0;
+  last = measured;
+  return w;
+}
+
 }  // namespace
 
 DeviceModel::DeviceModel(double mass, Nanos dt, double resolution, double force_rate,
-                         bool adapt_force_rate, Nanos delay, Nanos max_delay, Nanos step)
+                         bool adapt_force_rate, Nanos delay, Nanos max_delay, Nanos step,
+                         bool estimate_noise)
     : dt_(to_seconds(dt)), adapt_(adapt_force_rate) {
+  if (estimate_noise && resolution > 0.0) {
+    noise_.emplace(to_seconds(dt), resolution);
+  }
   auto add = [&](Nanos d) {
     bank_.push_back({d, ActuatorSchedule(d, dt),
                      control::DevicePredictor(mass, to_seconds(dt), resolution, force_rate,
@@ -131,13 +146,20 @@ DeviceModel::DeviceModel(double mass, Nanos dt, double resolution, double force_
 // split in proportion to time. A sample far from the nominal length is the
 // model's to reject; one during which the force was cut is not described by
 // it at all, and neither scores.
-double DeviceModel::book_and_observe(Nanos from, Nanos now, double dx, double h,
-                                     Nanos cut_after) {
+double DeviceModel::book_and_observe(Nanos from, Nanos to, double dx, double h,
+                                     Nanos cut_after, Nanos issued, Nanos issue) {
   double work = 0.0;
   double least_miss = std::numeric_limits<double>::infinity();
   for (std::size_t i = 0; i < bank_.size(); ++i) {
     auto& c = bank_[i];
-    const auto& segs = c.actuator.advance(from, now, cut_after);
+    const auto& segs = c.actuator.advance(from, to, cut_after, issued);
+    if (noise_ && i == best_) {
+      if (cut_after > 0) {
+        noise_->interrupt();
+      } else {
+        noise_->observe(dx, h, c.dev.expected_velocity_change(segs, h));
+      }
+    }
     double w = c.dev.realized_work(dx, segs);
     c.miss = 0.0;
     if (cut_after > 0) {
@@ -151,8 +173,16 @@ double DeviceModel::book_and_observe(Nanos from, Nanos now, double dx, double h,
       c.miss = c.id.innovation() * c.id.innovation();
       least_miss = std::min(least_miss, c.miss);
     }
-    c.dev.set_lead(c.actuator.lead(now));
+    c.dev.set_lead(c.actuator.lead(to, issue));
     if (i == best_) work = w;
+  }
+  if (noise_) {
+    // For the next sample: a quarter of a second's estimate does not miss
+    // one sample's lag.
+    for (auto& c : bank_) {
+      c.dev.set_reading_noise(noise_->variance());
+      c.id.set_reading_noise(noise_->variance());
+    }
   }
   const bool regular = std::fabs(h - dt_) <= 0.5 * dt_;
   if (bank_.size() > 1 && adapt_ && cut_after <= 0 && regular) {
@@ -203,6 +233,10 @@ double DeviceModel::book_and_observe(Nanos from, Nanos now, double dx, double h,
   return work;
 }
 
+void DeviceModel::refresh_lead(Nanos to, Nanos issue) {
+  for (auto& c : bank_) c.dev.set_lead(c.actuator.lead(to, issue));
+}
+
 void DeviceModel::command(Nanos now, double phi) {
   for (auto& c : bank_) c.actuator.command(now, phi);
 }
@@ -211,7 +245,8 @@ MasterController::MasterController(const MasterConfig& cfg)
     : cfg_(cfg),
       dt_(to_seconds(cfg.dt)),
       model_(cfg.model_mass, cfg.dt, cfg.encoder_resolution, cfg.force_rate, cfg.adapt_force_rate,
-             cfg.actuation_delay, cfg.actuation_delay_max, cfg.actuation_delay_step),
+             cfg.actuation_delay, cfg.actuation_delay_max, cfg.actuation_delay_step,
+             cfg.estimate_reading_noise),
       enc_(cfg.deadband_params) {}
 
 void MasterController::receive(std::uint32_t seq, const Sample& s) {
@@ -223,20 +258,30 @@ void MasterController::receive(std::uint32_t seq, const Sample& s) {
   }
 }
 
-MasterController::Step MasterController::step(Nanos now, double position, Nanos cut_after) {
+MasterController::Step MasterController::step(Nanos now, Nanos sampled, double position,
+                                              Nanos cut_after, std::optional<double> port_work) {
   // Book the work the forces over the last sample actually did, then
   // display the reflected force through the PC. The velocity is the backward
   // difference of the encoder position, as on a real device.
-  if (first_) x_sampled_ = position;
-  const bool fresh = first_ || now <= last_now_;
-  const Nanos from = fresh ? now - cfg_.dt : last_now_;
-  const double h = fresh ? dt_ : to_seconds(now - last_now_);
-  const double dx = position - x_sampled_;
-  v_meas_ = first_ ? 0.0 : dx / h;
-  first_ = false;
-  last_now_ = now;
-  port_.account_energy(model_.book_and_observe(from, now, dx, h, cut_after));
-  x_sampled_ = position;
+  const Nanos at = std::min(sampled, now);
+  if (!first_ && at < now && at <= last_now_) {
+    // The device has not been read anew since the last step.
+    model_.refresh_lead(last_now_, now);
+  } else {
+    if (first_) x_sampled_ = position;
+    const bool fresh = first_ || at <= last_now_;
+    const Nanos from = fresh ? at - cfg_.dt : last_now_;
+    const double h = fresh ? dt_ : to_seconds(at - last_now_);
+    const Nanos issued = first_ ? from : last_issued_;
+    const double dx = position - x_sampled_;
+    v_meas_ = first_ ? 0.0 : dx / h;
+    first_ = false;
+    last_now_ = at;
+    port_.account_energy(booked_work(
+        port_work_, port_work, model_.book_and_observe(from, at, dx, h, cut_after, issued, now)));
+    x_sampled_ = position;
+  }
+  last_issued_ = now;
   const control::DevicePredictor& dev = model_.predictor();
 
   Step out;
@@ -282,7 +327,8 @@ SlaveController::SlaveController(const SlaveConfig& cfg, double position)
       dt_(to_seconds(cfg.dt)),
       store_(cfg.initial_energy),
       model_(cfg.model_mass, cfg.dt, cfg.encoder_resolution, cfg.force_rate, cfg.adapt_force_rate,
-             cfg.actuation_delay, cfg.actuation_delay_max, cfg.actuation_delay_step),
+             cfg.actuation_delay, cfg.actuation_delay_max, cfg.actuation_delay_step,
+             cfg.estimate_reading_noise),
       enc_(cfg.deadband_params),
       x_sampled_(position),
       x_cmd_(position),
@@ -308,24 +354,35 @@ void SlaveController::receive(std::uint32_t seq, const Sample& s) {
   }
 }
 
-SlaveController::Step SlaveController::step(Nanos now, double position, double velocity,
-                                            double contact_force, Nanos cut_after) {
+SlaveController::Step SlaveController::step(Nanos now, Nanos sampled, double position,
+                                            double velocity, double contact_force,
+                                            Nanos cut_after, std::optional<double> port_work) {
   const bool fresh = fresh_;
   fresh_ = false;
   if (fresh) fresh_at_ = now;
-  const bool regular = stepped_ && now > last_now_;
-  const Nanos from = regular ? last_now_ : now - cfg_.dt;
-  const double h = regular ? to_seconds(now - last_now_) : dt_;
-  stepped_ = true;
-  last_now_ = now;
 
   // Book the work the applied forces did on the slave over the last sample;
   // this is the true slave terminal for every scheme, and the energy source
-  // or sink of the reflective store.
-  const double dx = position - x_sampled_;
-  const double work_in = model_.book_and_observe(from, now, dx, h, cut_after);
+  // or sink of the reflective store. A reading no newer than the last one
+  // books nothing (MasterController::step).
+  const Nanos at = std::min(sampled, now);
+  double work_in = 0.0;
+  if (stepped_ && at < now && at <= last_now_) {
+    model_.refresh_lead(last_now_, now);
+  } else {
+    const bool regular = stepped_ && at > last_now_;
+    const Nanos from = regular ? last_now_ : at - cfg_.dt;
+    const double h = regular ? to_seconds(at - last_now_) : dt_;
+    const Nanos issued = stepped_ ? last_issued_ : from;
+    stepped_ = true;
+    last_now_ = at;
+    const double dx = position - x_sampled_;
+    work_in = booked_work(port_work_, port_work,
+                          model_.book_and_observe(from, at, dx, h, cut_after, issued, now));
+    x_sampled_ = position;
+  }
+  last_issued_ = now;
   terminal_net_ += work_in;
-  x_sampled_ = position;
   const control::DevicePredictor& dev = model_.predictor();
 
   const bool live = has_value_ && (cfg_.hold_after <= 0 || now - fresh_at_ <= cfg_.hold_after);

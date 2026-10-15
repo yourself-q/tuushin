@@ -54,13 +54,13 @@ double SimulatedDevice::read_position(Nanos now) {
     advance(now);
   }
   if (q_ <= 0.0) return x_;
-  const double y = std::round(x_ / q_) * q_;
-  if (have_read_ && t_ > y_time_) v_read_ = (y - y_) / to_seconds(t_ - y_time_);
-  if (!have_read_ || t_ > y_time_) {
-    have_read_ = true;
-    y_ = y;
-    y_time_ = t_;
-  }
+  if (have_read_ && t_ <= y_time_) return y_;
+  const double dither = noise_counts_ > 0.0 ? noise_counts_ * noise_.normal() : 0.0;
+  const double y = std::round(x_ / q_ + dither) * q_;
+  if (have_read_) v_read_ = (y - y_) / to_seconds(t_ - y_time_);
+  have_read_ = true;
+  y_ = y;
+  y_time_ = t_;
   return y_;
 }
 

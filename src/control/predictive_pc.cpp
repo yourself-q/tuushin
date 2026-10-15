@@ -59,6 +59,14 @@ void DevicePredictor::observe(double dx, const std::vector<ForceSegment>& segmen
   }
   const bool regular = std::fabs(h - dt_) <= 0.5 * dt_;
   const double r = regular ? h / dt_ : 1.0;
+  double phi_d, phi_v;
+  held_forces(segments, r, phi_d, phi_v);
+  push(dx, phi_d, phi_v, r, regular);
+  held_ = segments.back().phi;
+}
+
+void DevicePredictor::held_forces(const std::vector<ForceSegment>& segments, double r,
+                                  double& phi_d, double& phi_v) {
   double total = 0.0;
   for (const auto& seg : segments) total += seg.samples;
   const double scale = total > 0.0 ? r / total : 0.0;
@@ -69,8 +77,19 @@ void DevicePredictor::observe(double dx, const std::vector<ForceSegment>& segmen
     mom += seg.phi * ri * (2.0 * (r - start) - ri);
     start += ri;
   }
-  push(dx, mom / (r * r), imp / r, r, regular);
-  held_ = segments.back().phi;
+  phi_d = mom / (r * r);
+  phi_v = imp / r;
+}
+
+double DevicePredictor::expected_velocity_change(const std::vector<ForceSegment>& segments,
+                                                 double h) const {
+  // From the mean velocity over the last sample (length h1) to the end of
+  // it, the net force acts as H - phi_v1 over h1 less H - phi_d1 over h1 /
+  // 2; from there to the mean over the coming one, as H - phi_d over h / 2.
+  double phi_d = 0.0, phi_v = 0.0;
+  if (!segments.empty()) held_forces(segments, h / dt_, phi_d, phi_v);
+  const double ext = external_force(), h1 = r1_ * dt_;
+  return ((ext - 2.0 * phiv1_ + phid1_) * h1 + (ext - phi_d) * h) / (2.0 * mass_);
 }
 
 void DevicePredictor::observe_irregular(double dx, double phi_held) {

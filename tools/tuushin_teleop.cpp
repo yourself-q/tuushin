@@ -271,16 +271,29 @@ std::unique_ptr<device::RemoteDevice> open_device(const Options& o, Nanos period
   return dev;
 }
 
-// How long after the host reads a position its force acts on the device:
-// the link both ways and the device's tick, and on average half the State
-// period by which the position read was already old.
+// How long after the device samples a position the force computed from it
+// acts: the position's way in and, on average, half the State period it
+// waited for the host's tick, then the command's way out and the wait for
+// the device's tick. The slave's coupling has to be stable over all of it.
 Nanos loop_delay_of(const device::RemoteDevice& dev) {
   return dev.connect_round_trip() + dev.state_period() / 2;
 }
 
+// How long after it is issued a command takes effect, on the host's clock:
+// the link one way, taken as half the least round trip as the clocks'
+// mapping takes it, and the wait for the device's next tick, counted
+// whole since a delay taken too short is the unsafe side. The positions'
+// age is no part of it: the controllers book each at its own time
+// (Device1D::sampled_at). Counting the age in as well put the estimate at
+// the top of its range, 4.75 ms, where the forces in flight over six
+// samples made the PC's bounds too wide to let any force through.
+Nanos actuation_delay_of(const device::RemoteDevice& dev) {
+  return dev.connect_round_trip() / 2 + Nanos{dev.info().tick_us} * 1000;
+}
+
 // The controllers' device model for a device on a link: its mass and
-// encoder, and the delay of its actuation, estimated online from the
-// loop's delay as the first guess.
+// encoder, and the delay of its actuation, estimated online with the
+// above as the first guess.
 template <class Config>
 void model_device(Config& c, const device::RemoteDevice& dev) {
   if (dev.model_mass() > 0.0) {
@@ -290,9 +303,9 @@ void model_device(Config& c, const device::RemoteDevice& dev) {
                  c.model_mass);
   }
   c.encoder_resolution = dev.encoder_resolution();
-  const Nanos delay = loop_delay_of(dev);
+  const Nanos delay = actuation_delay_of(dev);
   c.actuation_delay = delay;
-  c.actuation_delay_max = std::max<Nanos>(4 * kNanosPerMilli, 2 * delay);
+  c.actuation_delay_max = std::max(2 * delay, delay + kNanosPerMilli);
 }
 
 

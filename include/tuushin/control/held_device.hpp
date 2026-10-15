@@ -68,6 +68,8 @@ class HeldDeviceFilter {
   // square over the variance the filter expected for it.
   double innovation() const { return innovation_; }
   double normalized_innovation_squared() const { return nis_; }
+  // The variance of a reading's error, m^2 (q^2 / 12 to start).
+  void set_reading_noise(double variance) { noise_ = variance > 0.0 ? variance : noise_; }
   // Scales the variance H's random walk gains per second (1 to start).
   void set_force_walk_scale(double scale) { walk_scale_ = scale; }
   double damping() const { return s_[3]; }    // N s/m

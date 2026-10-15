@@ -66,9 +66,14 @@ void usage() {
                "  --pc-hold N           samples a PC force must stay affordable if held (2)\n"
                "  --master-encoder Q    master encoder resolution in m (0 = exact)\n"
                "  --slave-encoder Q     slave encoder resolution in m (0 = exact)\n"
+               "  --master-encoder-noise N  Gaussian noise of N counts on the master's\n"
+               "                        readings before rounding (0)\n"
+               "  --slave-encoder-noise N   the same for the slave (0)\n"
                "  --encoders-unknown    controllers treat the encoder readings as exact\n"
                "  --force-rate R        with encoders: operator's least force rate in N/s (20)\n"
                "  --fixed-force-rate    with encoders: the filters keep the force rate\n"
+               "  --fixed-reading-noise with encoders: the filters take a reading's error to\n"
+               "                        be the quantization's, not what the readings show\n"
                "  --pc-confidence K     PC predictions' confidence factor (1)\n"
                "  --pc-tax N            samples a force rise may take to repay the books'\n"
                "                        deficit and, with encoders, its quantization tax;\n"
@@ -156,6 +161,8 @@ Options parse(int argc, char** argv) {
     else if (a == "--pc-hold") o.cfg.pc_hold_samples = std::stoi(next());
     else if (a == "--master-encoder") o.cfg.master_encoder_resolution = std::stod(next());
     else if (a == "--slave-encoder") o.cfg.slave_encoder_resolution = std::stod(next());
+    else if (a == "--master-encoder-noise") o.cfg.master_encoder_noise = std::stod(next());
+    else if (a == "--slave-encoder-noise") o.cfg.slave_encoder_noise = std::stod(next());
     else if (a == "--encoders-unknown") o.cfg.encoder_resolution_known = false;
     else if (a == "--actuation-delay-unknown") {
       o.cfg.master_model_actuation_delay = 0;
@@ -167,6 +174,7 @@ Options parse(int argc, char** argv) {
     }
     else if (a == "--force-rate") o.cfg.force_rate = std::stod(next());
     else if (a == "--fixed-force-rate") o.cfg.adapt_force_rate = false;
+    else if (a == "--fixed-reading-noise") o.cfg.estimate_reading_noise = false;
     else if (a == "--pc-confidence") o.cfg.pc_confidence = std::stod(next());
     else if (a == "--pc-tax") o.cfg.pc_tax_samples = std::stoi(next());
     else if (a == "--pc-rise") o.cfg.master_pc_rise_samples = std::stoi(next());
@@ -240,6 +248,8 @@ void print_result(const sim::Teleop1DResult& r) {
   std::printf("max_book_excess        %.6g J\n", r.max_book_excess);
   std::printf("master_actuation_delay %.4f ms\n", to_seconds(r.master_actuation_delay) * 1e3);
   std::printf("slave_actuation_delay  %.4f ms\n", to_seconds(r.slave_actuation_delay) * 1e3);
+  std::printf("master_reading_noise   %.3f um\n", r.master_reading_noise * 1e6);
+  std::printf("slave_reading_noise    %.3f um\n", r.slave_reading_noise * 1e6);
   std::printf("min_channel_margin     %.6g J\n", r.min_channel_margin);
   std::printf("max_master_pos         %.4f m\n", r.max_master_pos);
   std::printf("max_display_force      %.3f N\n", r.max_display_force);

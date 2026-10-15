@@ -193,6 +193,52 @@ TEST_CASE(remote_force_turns_the_knob_against_a_hand) {
   }
 }
 
+TEST_CASE(remote_port_work_is_the_devices_from_the_connect_on) {
+  // What the controllers book: the work the host's torque did, which the
+  // firmware sums over its ticks, counted from the connect so that a
+  // calibration's sweeps are not in it; with no damping on the device's
+  // ticks, all the work the motor did.
+  for (bool reverse : {false, true}) {
+    RemoteConfig cfg;
+    cfg.reverse = reverse;
+    Bench b(quiet(), 0.5e-3, cfg);
+    CHECK(!b.dev->port_work().has_value());
+    b.dev->connect();
+    REQUIRE(b.dev->port_work().has_value());
+    CHECK(*b.dev->port_work() == 0.0);
+    const double w0 = b.link->plant().motor_work();
+    b.hold(0.1);
+    b.run(1.0, 1.0);
+    b.run(0.2, -0.5);
+    // 1 N out to 4 mm against the hand's spring, then 0.5 N the other way
+    // to 2 mm on the other side: 4 mJ and 3 mJ.
+    const double w = *b.dev->port_work();
+    CHECK_NEAR(w, b.link->plant().motor_work() - w0, 2e-5);
+    CHECK_NEAR(w, b.dev->actuator_work(), 0.0);
+    CHECK_NEAR(w, 1.0 * 0.004 + 0.5 * 0.006, 3e-4);
+  }
+}
+
+TEST_CASE(remote_positions_carry_their_sample_time) {
+  Bench b(quiet(), 0.5e-3);
+  const Nanos before = b.link->clock();
+  CHECK(b.dev->sampled_at(before) == before);  // nothing to place yet
+  b.dev->connect();
+  b.hold();
+  b.run(0.3, 0.2);
+  // A State is sampled on a device tick and sent each millisecond, 0.5 ms
+  // on the way: the reading the host holds is half a millisecond old at
+  // the least, and at most a State period and a tick or two more.
+  for (int k = 0; k < 50; ++k) {
+    b.link->advance_to(b.link->time() + 0.3e-3, b.dev.get());
+    const Nanos now = b.link->clock();
+    b.dev->read_position(now);
+    const Nanos age = now - b.dev->sampled_at(now);
+    CHECK(age >= 0.45e6);
+    CHECK(age <= 1.95e6);
+  }
+}
+
 TEST_CASE(remote_measures_the_round_trip) {
   Bench b(quiet(), 0.5e-3);
   b.dev->connect();

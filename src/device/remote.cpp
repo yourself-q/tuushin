@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <stdexcept>
 
+#include "tuushin/rt/thread.hpp"
+
 namespace tuushin::device {
 
 namespace {
@@ -457,6 +459,10 @@ void RemoteDevice::connect() {
 }
 
 void RemoteDevice::reader_loop() {
+  // The States' arrival stamps and the control loop's view of the device
+  // are only as fresh as this thread: on a loaded Mac, at the default
+  // priority it left the loop with States up to 40 ms old.
+  rt::prefer_low_latency(cfg_.state_period);
   while (!quit_.load()) {
     stream_->wait_readable(10 * kNanosPerMilli);
     std::lock_guard<std::mutex> lk(mu_);
@@ -479,6 +485,12 @@ double RemoteDevice::read_position(Nanos) {
   if (connected_) stats_.worst_state_age = std::max(stats_.worst_state_age, t - state_rx_);
   return sign_ * cfg_.radius * kTwoPi * static_cast<double>(used_.count) /
          static_cast<double>(info_.counts_per_rev);
+}
+
+Nanos RemoteDevice::sampled_at(Nanos now) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (!have_state_ || !clock_.valid()) return now;
+  return std::min(now, clock_.to_host(clock_.extend(used_.time_us), least_rtt_));
 }
 
 double RemoteDevice::velocity() const {
@@ -527,6 +539,14 @@ double RemoteDevice::encoder_resolution() const {
 
 double RemoteDevice::max_force() const {
   return static_cast<double>(torque_limit_) / cfg_.radius;
+}
+
+std::optional<double> RemoteDevice::port_work() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (!connected_) return std::nullopt;
+  // The device sums the torque times the angle; with x = sign r theta and
+  // the torque sign f r, that is f times x as the controllers see them.
+  return used_.work - work0_;
 }
 
 double RemoteDevice::actuator_work() const {

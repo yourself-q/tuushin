@@ -2,12 +2,14 @@
 
 #include <cstdint>
 #include <deque>
+#include <optional>
 #include <utility>
 #include <vector>
 
 #include "tuushin/codec/deadband.hpp"
 #include "tuushin/control/held_device.hpp"
 #include "tuushin/control/predictive_pc.hpp"
+#include "tuushin/control/reading_noise.hpp"
 #include "tuushin/control/reflection.hpp"
 #include "tuushin/control/tdpa.hpp"
 #include "tuushin/time.hpp"
@@ -67,10 +69,20 @@ class ActuatorSchedule {
   // delay runs a schedule per candidate, and returning new vectors cost it
   // two heap allocations per candidate and sample, 137 per millisecond with
   // 65 candidates.
-  const std::vector<control::ForceSegment>& advance(Nanos from, Nanos to, Nanos cut_after);
+  const std::vector<control::ForceSegment>& advance(Nanos from, Nanos to, Nanos cut_after) {
+    return advance(from, to, cut_after, from);
+  }
+  // The same with the last command issued at `issued`, which need not be
+  // when the sample began: a device whose positions come over a link was
+  // sampled some time before the host's tick (Device1D::sampled_at).
+  const std::vector<control::ForceSegment>& advance(Nanos from, Nanos to, Nanos cut_after,
+                                                    Nanos issued);
   // The forces in flight at `now`: what acts until a command issued now
   // takes effect. Empty without a delay.
-  const std::vector<control::ForceSegment>& lead(Nanos now);
+  const std::vector<control::ForceSegment>& lead(Nanos now) { return lead(now, now); }
+  // What acts from `from`, the end of the last sample, until a command
+  // issued at `issue` takes effect.
+  const std::vector<control::ForceSegment>& lead(Nanos from, Nanos issue);
   void command(Nanos now, double phi);
 
  private:
@@ -108,20 +120,36 @@ class DeviceModel {
   // `delay` is the actuation delay, or with `max_delay` > 0 the guess the
   // estimate starts from; the candidates then lie `step` apart from 0 to
   // max_delay.
+  // With `estimate_noise` and a resolution the filters' reading noise is
+  // estimated from the readings (control::ReadingNoise).
   DeviceModel(double mass, Nanos dt, double resolution, double force_rate, bool adapt_force_rate,
-              Nanos delay, Nanos max_delay = 0, Nanos step = 0);
+              Nanos delay, Nanos max_delay = 0, Nanos step = 0, bool estimate_noise = false);
 
   // Books and observes the sample from `from` to `now` in which the encoder
   // saw the displacement dx (h = its length in s), and sets the forces in
   // flight as the predictor's lead. Returns the work the port forces did
   // on the two-port over it (positive = in), as the predictor in use
   // splits it. `cut_after` as in MasterController::step.
-  double book_and_observe(Nanos from, Nanos now, double dx, double h, Nanos cut_after);
+  double book_and_observe(Nanos from, Nanos now, double dx, double h, Nanos cut_after) {
+    return book_and_observe(from, now, dx, h, cut_after, from, now);
+  }
+  // The same for a sample that ended at `to`, before the host's tick: the
+  // last command was issued at `issued` (cut_after counts from it) and the
+  // next one will be at `issue`, so the lead runs from `to` until that one
+  // takes effect.
+  double book_and_observe(Nanos from, Nanos to, double dx, double h, Nanos cut_after,
+                          Nanos issued, Nanos issue);
+  // No new reading since the sample that ended at `to`: the lead runs from
+  // it until a command issued at `issue` takes effect, and includes the
+  // commands issued since.
+  void refresh_lead(Nanos to, Nanos issue);
   void command(Nanos now, double phi);
 
   const control::DevicePredictor& predictor() const { return bank_[best_].dev; }
   // The delay the predictor in use assumes: the estimate, if it is estimated.
   Nanos actuation_delay() const { return bank_[best_].delay; }
+  // The variance of a reading's error the filters assume, m^2.
+  double reading_noise() const { return bank_[best_].dev.reading_noise(); }
 
  private:
   struct Candidate {
@@ -139,6 +167,7 @@ class DeviceModel {
   double dt_;  // s
   bool adapt_;
   double log_walk_ = 0.0;  // log of the factor on the filters' force walk
+  std::optional<control::ReadingNoise> noise_;
 };
 
 struct MasterConfig {
@@ -168,9 +197,13 @@ struct MasterConfig {
   // force the expected motion could pay for over `pc_rise_samples` samples,
   // so that the force does not rise on every count transition and decay
   // before the next, paying the tax each time (0 lets it).
+  // With `estimate_reading_noise` the filters take a reading's error to be
+  // as large as the readings' second differences show it to be, and at
+  // least the quantization's (control/reading_noise.hpp).
   double encoder_resolution = 0.0;
   double force_rate = 20.0;
   bool adapt_force_rate = true;
+  bool estimate_reading_noise = true;
   double pc_confidence = 1.0;
   int pc_tax_samples = 4;
   int pc_rise_samples = 64;
@@ -217,7 +250,21 @@ class MasterController {
   // no encoder read; the device model that chose the force predicts it, and
   // only an output is booked, since entering energy is credited only when
   // measured.
-  Step step(Nanos now, double position, Nanos cut_after = 0);
+  Step step(Nanos now, double position, Nanos cut_after = 0) {
+    return step(now, now, position, cut_after);
+  }
+  // The same for a position sampled at `sampled`, at most `now`, as a
+  // device on a link reports it (Device1D::sampled_at). The books and the
+  // device model run on the samples' times and the commands on `now`, so
+  // that the sample's age, which varies with where the host's tick falls
+  // between the device's, does not pass for motion: at 5 cm/s each 0.2 ms
+  // of it is 10 um. A reading no newer than the last one is not observed
+  // again; the force is chosen anew with the commands issued since in
+  // flight. `port_work` is the device's Device1D::port_work(): when given,
+  // the books take the work the device measured instead of the device
+  // model's split of the displacement, which the model still observes.
+  Step step(Nanos now, Nanos sampled, double position, Nanos cut_after,
+            std::optional<double> port_work = std::nullopt);
 
   // The velocity sent with the last step: the backward difference of the
   // encoder positions, or the device model's estimate with an encoder
@@ -233,6 +280,7 @@ class MasterController {
   // The actuation delay the controller books and predicts with: the
   // configured one, or its estimate.
   Nanos actuation_delay() const { return model_.actuation_delay(); }
+  double reading_noise() const { return model_.reading_noise(); }  // m^2
   std::uint64_t samples_sent() const { return sent_; }
 
  private:
@@ -242,8 +290,10 @@ class MasterController {
   DeviceModel model_;
   codec::DeadbandEncoder<1> enc_;
   bool first_ = true;
-  Nanos last_now_ = 0;
+  Nanos last_now_ = 0;      // when the last sample ended
+  Nanos last_issued_ = 0;   // when the last command was issued
   double x_sampled_ = 0.0;
+  std::optional<double> port_work_;  // the device's measured work at the last sample
   double v_meas_ = 0.0;
   double v_sent_ = 0.0;
   double f_display_ = 0.0;
@@ -279,6 +329,7 @@ struct SlaveConfig {
   double encoder_resolution = 0.0;  // m
   double force_rate = 20.0;         // N/s
   bool adapt_force_rate = true;
+  bool estimate_reading_noise = true;
   double pc_confidence = 1.0;
   int pc_tax_samples = 4;
   int pc_rise_samples = 0;
@@ -318,7 +369,13 @@ class SlaveController {
   // when the slave reports it. Irregular samples and `cut_after` are handled
   // as in MasterController::step.
   Step step(Nanos now, double position, double velocity, double contact_force,
-            Nanos cut_after = 0);
+            Nanos cut_after = 0) {
+    return step(now, now, position, velocity, contact_force, cut_after);
+  }
+  // The same for a position sampled at `sampled`, and with the work the
+  // device measured, as in MasterController.
+  Step step(Nanos now, Nanos sampled, double position, double velocity, double contact_force,
+            Nanos cut_after, std::optional<double> port_work = std::nullopt);
 
   // Diagnostics of the last step.
   double command() const { return x_cmd_; }            // coupling target (m)
@@ -328,13 +385,15 @@ class SlaveController {
   double reported_force() const { return f_slave_; }
   bool has_master_sample() const { return has_value_; }
   // Net energy that entered through the slave device port, booked from the
-  // realized work of the applied force (predicted, for a sample in which
-  // the watchdog cut it), less the quantization tax.
+  // work of the applied force as the device measured it, or else as the
+  // device model splits it (predicted, for a sample in which the watchdog
+  // cut it), less the quantization tax.
   double terminal_net() const { return terminal_net_; }
   // kReflective: the store. kNone and kChannel: the channel end at the slave.
   const control::ReflectiveStore& store() const { return store_; }
   const control::EnergyPort& channel_port() const { return port_; }
   Nanos actuation_delay() const { return model_.actuation_delay(); }
+  double reading_noise() const { return model_.reading_noise(); }  // m^2
   std::uint64_t samples_sent() const { return sent_; }
 
  private:
@@ -345,6 +404,7 @@ class SlaveController {
   DeviceModel model_;
   codec::DeadbandEncoder<1> enc_;
   double x_sampled_;
+  std::optional<double> port_work_;  // the device's measured work at the last sample
   double x_cmd_;
   double x_master_est_;
   double v_requested_ = 0.0;
@@ -358,7 +418,8 @@ class SlaveController {
   Sample last_;
   Nanos fresh_at_ = 0;  // when the newest sample was first used
   bool stepped_ = false;
-  Nanos last_now_ = 0;
+  Nanos last_now_ = 0;     // when the last sample ended
+  Nanos last_issued_ = 0;  // when the last command was issued
   std::uint64_t sent_ = 0;
 };
 

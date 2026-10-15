@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
@@ -346,11 +347,21 @@ class DevicePredictor {
   // from the state at the sample's start, the last over the rest. One
   // segment did phi * dx.
   double realized_work(double dx, const std::vector<ForceSegment>& segments) const;
+  // The mean velocity over a coming sample of length h (s), in which the
+  // port force is `segments`, less that over the last sample, as the model
+  // expects it from its estimate of H (m/s): how far the forces it knows
+  // of bend the readings' second difference (ReadingNoise).
+  double expected_velocity_change(const std::vector<ForceSegment>& segments, double h) const;
   // True when the last two samples were regular. A new predictor is ready:
   // its history is that of a device at rest.
   bool ready() const { return regular_ >= 2; }
 
   double resolution() const { return q_; }
+  // The variance of a reading's error the Kalman filter assumes, m^2: q^2 /
+  // 12, or with set_reading_noise what an estimate (ReadingNoise) says, if
+  // larger. Only used with a resolution.
+  double reading_noise() const { return noise_; }
+  void set_reading_noise(double variance) { noise_ = std::max(q_ * q_ / 12.0, variance); }
   // The rate the filter's random walk currently assumes: force_rate, or
   // with adapt_force_rate what the innovations have raised it to.
   double force_rate() const;
@@ -410,6 +421,10 @@ class DevicePredictor {
   // phi_i over r_i samples, the one starting s_i samples into a sample of
   // r: phi_v r = sum phi_i r_i, and phi_d r^2 = sum phi_i r_i (2 (r - s_i) - r_i).
   void push(double dx, double phi_d, double phi_v, double r, bool regular);
+  // phi_d and phi_v of `segments` over a sample of r (their lengths are
+  // scaled to it).
+  static void held_forces(const std::vector<ForceSegment>& segments, double r, double& phi_d,
+                          double& phi_v);
   void filter(double dx, double phi_d, double phi_v, double r, bool regular);
   // Standard deviation of a quantity whose error is gv times that of the
   // velocity, k c times that of H, and k times the model error.
@@ -430,7 +445,7 @@ class DevicePredictor {
   // Kalman filter, used when q_ > 0. The position is kept relative to the
   // last reading (e_ = estimate - reading), so that it never grows large.
   double q_;
-  double noise_;     // variance of a reading, q^2 / 12
+  double noise_;     // variance of a reading, at least q^2 / 12
   double h_walk_;    // variance of the change of H over a nominal sample
   double force_rate_;
   bool adapt_;
