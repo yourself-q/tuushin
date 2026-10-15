@@ -1,0 +1,307 @@
+menu "tuushin device"
+
+    config TUUSHIN_NAME
+        string "Device name reported to the host"
+        default "tuushin-esp32"
+        help
+            Up to 15 characters.
+
+    config TUUSHIN_TICK_US
+        int "Servo tick (us)"
+        range 100 2000
+        default 1000 if TUUSHIN_EMULATED
+        default 200
+        help
+            The period of the servo loop: encoder, host messages, checks,
+            torque. 200 us (5 kHz) on the board; the emulator cannot keep
+            up with that (see README.md).
+
+    config TUUSHIN_SERVO_CORE
+        int "Core the servo loop runs on"
+        range 0 1
+        default 1 if !FREERTOS_UNICORE
+        default 0
+        help
+            On a dual-core chip the servo loop gets core 1 to itself; the
+            Wi-Fi and Bluetooth stacks, if anyone adds them, run on core 0.
+
+    menu "Host link"
+        choice TUUSHIN_LINK
+            prompt "Link"
+            default TUUSHIN_LINK_USB_SERIAL_JTAG if SOC_USB_SERIAL_JTAG_SUPPORTED && !TUUSHIN_EMULATED
+            default TUUSHIN_LINK_UART
+
+            config TUUSHIN_LINK_UART
+                bool "UART (through the board's USB bridge)"
+            config TUUSHIN_LINK_USB_SERIAL_JTAG
+                bool "The chip's own USB Serial/JTAG port"
+                depends on SOC_USB_SERIAL_JTAG_SUPPORTED
+        endchoice
+
+        config TUUSHIN_UART_NUM
+            int "UART"
+            depends on TUUSHIN_LINK_UART
+            range 0 2
+            default 0
+
+        config TUUSHIN_UART_BAUD
+            int "Baud rate"
+            depends on TUUSHIN_LINK_UART
+            default 921600
+            help
+                The host opens the port at the same rate
+                (--device serial:PATH,baud=921600). A state every
+                millisecond takes some 400 kbit/s.
+
+        config TUUSHIN_UART_TX_GPIO
+            int "TX GPIO (-1: the UART's default pin)"
+            depends on TUUSHIN_LINK_UART
+            default -1
+
+        config TUUSHIN_UART_RX_GPIO
+            int "RX GPIO (-1: the UART's default pin)"
+            depends on TUUSHIN_LINK_UART
+            default -1
+    endmenu
+
+    menu "Motor"
+        config TUUSHIN_POLE_PAIRS
+            int "Pole pairs"
+            range 1 64
+            default 7
+            help
+                Half the number of magnets: 7 for a 12N14P gimbal motor,
+                11 for 24N22P. The calibration checks it.
+
+        config TUUSHIN_PHASE_RESISTANCE_MOHM
+            int "Phase resistance, phase to neutral (milliohm)"
+            default 5000
+            help
+                Half of what an ohmmeter reads between two of the motor's
+                terminals.
+
+        config TUUSHIN_TORQUE_CONSTANT_UNM_PER_A
+            int "Torque constant (uN m/A, amplitude-invariant; 0: from KV)"
+            default 80000
+            help
+                The torque per ampere of q-axis current. The host's energy
+                books are only as right as this: the device reports the
+                work of the torque it thinks it applies. Measure it, or
+                give KV and set this to 0.
+
+        config TUUSHIN_KV
+            int "KV (rpm/V of line-to-line peak back-EMF; 0: unknown)"
+            default 0
+
+        config TUUSHIN_MAX_TORQUE_UNM
+            int "Torque ceiling (uN m)"
+            default 100000
+            help
+                The most the device applies whatever the host asks; the host
+                can lower it but not raise it.
+
+        config TUUSHIN_INERTIA_GMM2
+            int "Rotor and knob inertia (g mm^2), reported to the host"
+            default 7000
+
+        config TUUSHIN_ALIGN_MV
+            int "Calibration voltage (mV)"
+            default 2000
+            help
+                The d-axis voltage that holds the rotor during calibration:
+                enough to beat cogging and friction, little enough to keep
+                the current low. Gimbal motors take 1 to 3 V.
+
+        config TUUSHIN_VOLTAGE_LIMIT_MV
+            int "q-axis voltage limit (mV; 0: what the supply allows)"
+            default 0
+    endmenu
+
+    menu "Bridge"
+        depends on !TUUSHIN_EMULATED
+
+        config TUUSHIN_PWM_A_GPIO
+            int "Phase A PWM GPIO"
+            default 25 if IDF_TARGET_ESP32
+            default 3 if IDF_TARGET_ESP32C3
+            default 4
+
+        config TUUSHIN_PWM_B_GPIO
+            int "Phase B PWM GPIO"
+            default 26 if IDF_TARGET_ESP32
+            default 4 if IDF_TARGET_ESP32C3
+            default 5
+
+        config TUUSHIN_PWM_C_GPIO
+            int "Phase C PWM GPIO"
+            default 27 if IDF_TARGET_ESP32
+            default 5 if IDF_TARGET_ESP32C3
+            default 6
+
+        config TUUSHIN_DRIVER_EN_GPIO
+            int "Driver enable GPIO (-1: none)"
+            default 14 if IDF_TARGET_ESP32
+            default 10 if IDF_TARGET_ESP32C3
+            default 7
+            help
+                The pin that puts the three half-bridges into high impedance
+                (EN of a DRV8313 or an L6234, tied together). Without it,
+                "off" can only pull all three phases low, which shorts the
+                windings and brakes the motor by kt^2 / R.
+
+        config TUUSHIN_DRIVER_EN_ACTIVE_LOW
+            bool "The enable pin is active low"
+            default n
+
+        config TUUSHIN_PWM_HZ
+            int "PWM frequency (Hz)"
+            range 10000 50000
+            default 20000
+    endmenu
+
+    menu "Encoder"
+        depends on !TUUSHIN_EMULATED
+
+        choice TUUSHIN_ENCODER
+            prompt "Encoder"
+            default TUUSHIN_ENCODER_MT6701
+
+            config TUUSHIN_ENCODER_MT6701
+                bool "MT6701 over SSI (14 bit)"
+            config TUUSHIN_ENCODER_AS5047P
+                bool "AS5047P over SPI (14 bit)"
+            config TUUSHIN_ENCODER_AS5600
+                bool "AS5600 over I2C (12 bit)"
+        endchoice
+
+        config TUUSHIN_ENC_SCLK_GPIO
+            int "SPI SCLK GPIO"
+            depends on !TUUSHIN_ENCODER_AS5600
+            default 18 if IDF_TARGET_ESP32
+            default 6 if IDF_TARGET_ESP32C3
+            default 12
+
+        config TUUSHIN_ENC_MISO_GPIO
+            int "SPI MISO (the encoder's DO) GPIO"
+            depends on !TUUSHIN_ENCODER_AS5600
+            default 19 if IDF_TARGET_ESP32
+            default 1 if IDF_TARGET_ESP32C3
+            default 13
+
+        config TUUSHIN_ENC_MOSI_GPIO
+            int "SPI MOSI GPIO (-1: none; the MT6701 has no input)"
+            depends on !TUUSHIN_ENCODER_AS5600
+            default -1 if TUUSHIN_ENCODER_MT6701
+            default 23 if IDF_TARGET_ESP32
+            default 7 if IDF_TARGET_ESP32C3
+            default 11
+
+        config TUUSHIN_ENC_CS_GPIO
+            int "SPI CS GPIO"
+            depends on !TUUSHIN_ENCODER_AS5600
+            default 5 if IDF_TARGET_ESP32
+            default 0 if IDF_TARGET_ESP32C3
+            default 10
+
+        config TUUSHIN_ENC_SPI_HZ
+            int "SPI clock (Hz)"
+            depends on !TUUSHIN_ENCODER_AS5600
+            default 4000000 if TUUSHIN_ENCODER_MT6701
+            default 8000000
+
+        config TUUSHIN_ENC_SDA_GPIO
+            int "I2C SDA GPIO"
+            depends on TUUSHIN_ENCODER_AS5600
+            default 21 if IDF_TARGET_ESP32
+            default 1 if IDF_TARGET_ESP32C3
+            default 8
+
+        config TUUSHIN_ENC_SCL_GPIO
+            int "I2C SCL GPIO"
+            depends on TUUSHIN_ENCODER_AS5600
+            default 22 if IDF_TARGET_ESP32
+            default 0 if IDF_TARGET_ESP32C3
+            default 9
+
+        config TUUSHIN_ENC_I2C_HZ
+            int "I2C clock (Hz)"
+            depends on TUUSHIN_ENCODER_AS5600
+            default 1000000
+            help
+                A reading takes some 50 us at 1 MHz and 120 us at 400 kHz,
+                which a 200 us tick cannot spare.
+    endmenu
+
+    menu "Supply"
+        config TUUSHIN_SUPPLY_MV
+            int "Nominal supply (mV)"
+            default 12000
+
+        config TUUSHIN_SUPPLY_ADC_GPIO
+            int "GPIO of the supply's divider (-1: use the nominal supply)"
+            depends on !TUUSHIN_EMULATED
+            default 36 if IDF_TARGET_ESP32
+            default -1 if IDF_TARGET_ESP32C3
+            default 1
+
+        config TUUSHIN_SUPPLY_DIVIDER_X1000
+            int "Divider ratio times 1000 (supply / pin voltage)"
+            depends on !TUUSHIN_EMULATED && TUUSHIN_SUPPLY_ADC_GPIO >= 0
+            default 11000
+            help
+                11000 for 100 kOhm over 10 kOhm.
+
+        config TUUSHIN_SUPPLY_MIN_MV
+            int "Lowest acceptable supply (mV; 0: unchecked)"
+            default 0
+
+        config TUUSHIN_SUPPLY_MAX_MV
+            int "Highest acceptable supply (mV)"
+            default 0
+    endmenu
+
+    menu "Emulator"
+        config TUUSHIN_EMULATED
+            bool "Emulated board: a simulated motor instead of the hardware"
+            default n
+            help
+                For QEMU: the motor, the encoder and the supply are the
+                simulated gimbal motor of firmware/core (fw/plant.hpp); the
+                servo loop, the timer, the tasks and the host link are the
+                firmware's own.
+
+        choice TUUSHIN_EMULATED_WORLD
+            prompt "What the knob touches"
+            depends on TUUSHIN_EMULATED
+            default TUUSHIN_EMULATED_FREE
+
+            config TUUSHIN_EMULATED_FREE
+                bool "Nothing"
+            config TUUSHIN_EMULATED_HAND
+                bool "A hand that turns it to and fro (a master)"
+            config TUUSHIN_EMULATED_STOP
+                bool "An object it runs into (a slave)"
+        endchoice
+
+        config TUUSHIN_EMULATED_STOP_MRAD
+            int "How far on the object is, from where the knob is once calibrated (mrad)"
+            depends on TUUSHIN_EMULATED_STOP
+            default 500
+
+        config TUUSHIN_EMULATED_STEP_US
+            int "The simulation's integration step (us)"
+            depends on TUUSHIN_EMULATED
+            default 100
+
+        config TUUSHIN_EMULATED_NOISE_MILLICOUNTS
+            int "Encoder noise (thousandths of a count)"
+            depends on TUUSHIN_EMULATED
+            default 500
+
+        config TUUSHIN_EMULATED_CALIBRATED
+            bool "Start calibrated, as a board that has been calibrated before"
+            depends on TUUSHIN_EMULATED
+            default n
+    endmenu
+
+endmenu

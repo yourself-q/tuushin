@@ -43,6 +43,11 @@ struct PlantParams {
   double electrical_offset = 1.0;  // rad
   double supply = 12.0;  // V
   double start_angle = 0.3;  // rad, in the encoder's frame
+  // The longest integration step (s). The knob against the stop rings at
+  // some 85 Hz, so a step of 100 us still integrates it closely; the
+  // emulated board (firmware/esp32), which has to keep up in real time
+  // without a double-precision FPU, takes such a step.
+  double step = 20e-6;
 };
 
 // Something the knob runs into as it turns up past `angle`: a spring and

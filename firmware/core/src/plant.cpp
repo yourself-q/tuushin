@@ -9,7 +9,6 @@ namespace tuushin::fw {
 namespace {
 
 constexpr double kPiD = 3.14159265358979323846;
-constexpr double kStep = 20e-6;  // s, the longest integration step
 
 }  // namespace
 
@@ -89,7 +88,7 @@ void Plant::advance(double t) {
     return (m + cog + fric + hand_at(ti, th, om) + stop_at(th, om) + load_) / inertia;
   };
   while (t_ < t) {
-    const double h = std::min(kStep, t - t_);
+    const double h = std::min(p_.step, t - t_);
     double m1, m2, m3, m4;
     const double a1 = accel(t_, theta_, omega_, &m1);
     const double w1 = omega_;

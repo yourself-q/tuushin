@@ -1,0 +1,12 @@
+# The emulated board (QEMU): a simulated motor instead of the bridge, the
+# encoder and the supply (fw/plant.hpp), the host link on UART0, which
+# QEMU puts on a TCP port, and a console on UART1 for the emulator's
+# reports. Add it to the defaults:
+#   idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.emulated" ...
+CONFIG_TUUSHIN_EMULATED=y
+CONFIG_TUUSHIN_LINK_UART=y
+CONFIG_ESP_CONSOLE_NONE=n
+CONFIG_ESP_CONSOLE_UART_CUSTOM=y
+CONFIG_ESP_CONSOLE_UART_CUSTOM_NUM_1=y
+CONFIG_LOG_DEFAULT_LEVEL_NONE=n
+CONFIG_LOG_DEFAULT_LEVEL_WARN=y
