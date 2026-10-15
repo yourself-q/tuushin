@@ -22,6 +22,13 @@
 # limit of 3 therefore dies at r2 if N >= 2, and reaches natA itself, with
 # one hop to live, if N = 1.
 #
+# With --cgnat-a, a carrier-grade NAT (cgnA) stands between natA and r1:
+# natA's outside address is then 100.64.0.2 in the shared space of RFC 6598,
+# cgnA's inside one 100.64.0.1, and 198.51.100.2 is cgnA's. --cgnat-b does
+# the same for natB (cgnB, 203.0.113.2). A CGNAT maps endpoint-independently,
+# as RFC 6888 requires (REQ-1, through RFC 4787's REQ-1), and here filters
+# by address and port, which it allows.
+#
 # NAT behaviour (RFC 4787 terms). Both filter by address and port: a datagram
 # from outside is forwarded only on a mapping it is a reply to (conntrack).
 #   cone       MASQUERADE: an inside port keeps its outside port for every
@@ -48,11 +55,19 @@
 #                          keeps the datagram's flow) (drop)
 #   --nat-a-input POLICY   the same for natA (drop)
 #   --master-first         start the master before the slave
-#   --prime-hops N         passed to both ends (their default, 3)
-#   --rebind-at S          S seconds after the master starts, natB moves the
-#                          slave to a new outside address (203.0.113.3, as
-#                          after a new DHCP lease or a carrier-grade NAT that
-#                          forgot it) and forgets its mappings; the session
+#   --prime-hops N         passed to both ends (their default: auto, measured)
+#   --cgnat-a, --cgnat-b   a carrier-grade NAT behind natA, natB (above)
+#   --silent-cgnat         the CGNATs send no time-exceeded errors, as some
+#                          carrier routers do not
+#   --nat-errors POLICY    pass (the default) or drop: whether natA and natB
+#                          pass the ICMP errors for their mappings back
+#                          inside (RFC 5508, REQ-4), which cheap home routers
+#                          may not
+#   --rebind-at S          S seconds after the master starts, natB (cgnB with
+#                          --cgnat-b) moves the slave to a new outside
+#                          address (203.0.113.3, as after a new DHCP lease or
+#                          a carrier-grade NAT that forgot it) and forgets
+#                          its mappings; the session
 #                          must survive it (the master's link follows the
 #                          slave, and the slave is ended by the master)
 #   --turn                 run a TURN server (coturn) next to the rendezvous
@@ -81,6 +96,10 @@ NAT_B_INPUT=drop
 MASTER_FIRST=0
 REBIND_AT=
 TURN=0
+CGNAT_A=0
+CGNAT_B=0
+SILENT_CGNAT=0
+NAT_ERRORS=pass
 KEEP=
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -98,6 +117,10 @@ while [ $# -gt 0 ]; do
     --master-first) MASTER_FIRST=1 ;;
     --rebind-at) REBIND_AT=$2; shift ;;
     --turn) TURN=1 ;;
+    --cgnat-a) CGNAT_A=1 ;;
+    --cgnat-b) CGNAT_B=1 ;;
+    --silent-cgnat) SILENT_CGNAT=1 ;;
+    --nat-errors) NAT_ERRORS=$2; shift ;;
     --keep) KEEP=$2; shift ;;
     *) echo "unknown option $1" >&2; exit 1 ;;
   esac
@@ -116,6 +139,9 @@ fi
 ROUTERS=
 for i in $(seq 1 "$WAN_HOPS"); do ROUTERS="$ROUTERS r$i"; done
 NS="master slave natA natB server$ROUTERS"
+[ "$CGNAT_A" = 0 ] || NS="$NS cgnA"
+[ "$CGNAT_B" = 0 ] || NS="$NS cgnB"
+case "$NAT_ERRORS" in pass | drop) ;; *) echo "--nat-errors must be pass or drop" >&2; exit 1 ;; esac
 
 cleanup() {
   for ns in $NS; do
@@ -158,8 +184,13 @@ for i in $(seq 1 $((N - 1))); do
   nsx "r$i" ip addr add "172.16.$i.1/24" dev right
   nsx "r$((i + 1))" ip addr add "172.16.$i.2/24" dev left
 done
-veth r1 w-a natA a-w
-veth "r$N" w-b natB b-w
+# The home NATs' outside links: to the routers, or to a CGNAT's inside.
+A_SIDE=natA
+B_SIDE=natB
+[ "$CGNAT_A" = 0 ] || A_SIDE=cgnA
+[ "$CGNAT_B" = 0 ] || B_SIDE=cgnB
+veth r1 w-a "$A_SIDE" a-w
+veth "r$N" w-b "$B_SIDE" b-w
 veth "r$MID" w-s server s-w
 nsx r1 ip addr add 198.51.100.1/24 dev w-a
 nsx "r$N" ip addr add 203.0.113.1/24 dev w-b
@@ -175,7 +206,7 @@ for i in $(seq 1 "$N"); do
 done
 nsx server ip addr add 192.0.2.10/24 dev s-w
 nsx server ip route add default via 192.0.2.1
-for l in "r1 w-a" "natA a-w" "r$N w-b" "natB b-w" "r$MID w-s" "server s-w"; do
+for l in "r1 w-a" "$A_SIDE a-w" "r$N w-b" "$B_SIDE b-w" "r$MID w-s" "server s-w"; do
   delay $l "$WAN_DELAY"
 done
 
@@ -191,6 +222,9 @@ nat() {
   local random=
   [ "$kind" = symmetric ] && random=--random-fully
   nsx "$ns" iptables -t nat -A POSTROUTING -o "$wif" -j MASQUERADE $random
+  if [ "$NAT_ERRORS" = drop ]; then
+    nsx "$ns" iptables -A FORWARD -i "$wif" -p icmp -j DROP
+  fi
   nsx "$ns" iptables -A FORWARD -i "$wif" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
   nsx "$ns" iptables -A FORWARD -i "$wif" -j DROP
   case "$input" in
@@ -206,20 +240,51 @@ nat() {
     *) echo "unknown input policy $input" >&2; exit 1 ;;
   esac
 }
-nat natA a-w 198.51.100.2 198.51.100.1 "$NAT_A" "$NAT_A_INPUT"
-nat natB b-w 203.0.113.2 203.0.113.1 "$NAT_B" "$NAT_B_INPUT"
-[ -z "$REBIND_AT" ] || nsx natB ip addr add 203.0.113.3/24 dev b-w
+# cgnat NS HOME_NS OUT_ADDR GATEWAY: a CGNAT on the outside of HOME_NS's
+# link a-w (or b-w), with its own link to HOME_NS on 100.64.0.0/24.
+cgnat() {
+  local ns=$1 home=$2 wif=$5
+  veth "$ns" in "$home" "$wif"
+  nsx "$ns" ip addr add "$3/24" dev "$wif"
+  nsx "$ns" ip route add default via "$4"
+  nsx "$ns" ip addr add 100.64.0.1/24 dev in
+  nsx "$ns" sysctl -qw net.ipv4.ip_forward=1
+  nsx "$ns" iptables -t nat -A POSTROUTING -o "$wif" -j MASQUERADE
+  nsx "$ns" iptables -A FORWARD -i "$wif" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  nsx "$ns" iptables -A FORWARD -i "$wif" -j DROP
+  nsx "$ns" iptables -A INPUT -i "$wif" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  nsx "$ns" iptables -A INPUT -i "$wif" -j DROP
+  if [ "$SILENT_CGNAT" = 1 ]; then
+    nsx "$ns" iptables -A OUTPUT -p icmp --icmp-type time-exceeded -j DROP
+  fi
+  delay "$ns" in "$WAN_DELAY"
+  delay "$home" "$wif" "$WAN_DELAY"
+}
+if [ "$CGNAT_A" = 1 ]; then
+  cgnat cgnA natA 198.51.100.2 198.51.100.1 a-w
+  nat natA a-w 100.64.0.2 100.64.0.1 "$NAT_A" "$NAT_A_INPUT"
+else
+  nat natA a-w 198.51.100.2 198.51.100.1 "$NAT_A" "$NAT_A_INPUT"
+fi
+if [ "$CGNAT_B" = 1 ]; then
+  cgnat cgnB natB 203.0.113.2 203.0.113.1 b-w
+  nat natB b-w 100.64.0.2 100.64.0.1 "$NAT_B" "$NAT_B_INPUT"
+else
+  nat natB b-w 203.0.113.2 203.0.113.1 "$NAT_B" "$NAT_B_INPUT"
+fi
+[ -z "$REBIND_AT" ] || nsx "$B_SIDE" ip addr add 203.0.113.3/24 dev b-w
 
-# The rebinding: new flows leave natB from its second address, and the old
-# mappings go, so the slave's next datagram to anyone opens a new one (the
-# rule first, so that no datagram in between maps to the old address again).
+# The rebinding: new flows leave natB (or cgnB) from its second address, and
+# the old mappings go, so the slave's next datagram to anyone opens a new
+# one (the rule first, so that no datagram in between maps to the old
+# address again).
 rebind() {
   local random=
-  [ "$NAT_B" = symmetric ] && random=--random-fully
+  [ "$NAT_B" = symmetric ] && [ "$CGNAT_B" = 0 ] && random=--random-fully
   sleep "$REBIND_AT"
   # shellcheck disable=SC2086
-  nsx natB iptables -t nat -R POSTROUTING 1 -o b-w -j SNAT --to-source 203.0.113.3 $random
-  nsx natB conntrack -D -p udp >/dev/null 2>&1 || true
+  nsx "$B_SIDE" iptables -t nat -R POSTROUTING 1 -o b-w -j SNAT --to-source 203.0.113.3 $random
+  nsx "$B_SIDE" conntrack -D -p udp >/dev/null 2>&1 || true
   echo "rebound at $(date +%s%N)" >"$LOG/rebind.txt"
 }
 
@@ -295,7 +360,8 @@ else
   start_master || RC=$?
 fi
 
-for ns in natA natB; do
+for ns in natA natB cgnA cgnB; do
+  case " $NS " in *" $ns "*) ;; *) continue ;; esac
   nsx "$ns" conntrack -L -p udp >"$LOG/conntrack-$ns.txt" 2>/dev/null || true
 done
 
@@ -305,6 +371,9 @@ SCENARIO="$SCENARIO input=$NAT_A_INPUT/$NAT_B_INPUT"
 SCENARIO="$SCENARIO master-first=$MASTER_FIRST prime-hops=${PRIME_HOPS:-default}"
 [ -z "$REBIND_AT" ] || SCENARIO="$SCENARIO rebind-at=${REBIND_AT}s"
 [ "$TURN" = 0 ] || SCENARIO="$SCENARIO turn"
+[ "$CGNAT_A$CGNAT_B" = 00 ] || SCENARIO="$SCENARIO cgnat=$CGNAT_A/$CGNAT_B"
+[ "$SILENT_CGNAT" = 0 ] || SCENARIO="$SCENARIO silent-cgnat"
+[ "$NAT_ERRORS" = pass ] || SCENARIO="$SCENARIO nat-errors=drop"
 OK=0
 if [ "$RC" = 0 ] && grep -q "^authenticated" "$LOG/master.out"; then
   OK=1
