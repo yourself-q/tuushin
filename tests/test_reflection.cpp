@@ -329,7 +329,7 @@ TEST_CASE(predictive_pc_force_is_the_largest_affordable_with_the_tax) {
     };
     const bool sign_ok = r.value * phi >= 0.0 && std::fabs(r.value) <= std::fabs(phi);
     const double scale = 1e-12 + 1e-9 * std::fabs(phi) * (q + 1e-4);
-    const bool affordable = r.value == phi ? true : cost(r.value) <= budget + scale;
+    const bool affordable = cost(r.value) <= budget + scale;
     const double bigger = r.value + 1e-6 * phi;
     const bool largest = !r.active || r.value == phi || cost(bigger) > budget - scale;
     if (!sign_ok || !affordable || !largest) {
@@ -499,7 +499,7 @@ TEST_CASE(predictive_pc_force_is_the_largest_affordable_over_the_horizon) {
     };
     const bool sign_ok = r.value * phi >= 0.0 && std::fabs(r.value) <= std::fabs(phi);
     const double scale = 1e-12 + 1e-9 * std::fabs(phi) * (q + 1e-4);
-    const bool affordable = r.value == phi || slack(r.value) >= -scale;
+    const bool affordable = slack(r.value) >= -scale;
     const double bigger = r.value + 1e-6 * phi;
     const bool largest = !r.active || r.value == phi || slack(bigger) < scale;
     if (!sign_ok || !affordable || !largest) {

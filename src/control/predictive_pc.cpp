@@ -215,18 +215,23 @@ PcResult limit_force_predictive(double budget, double phi, const DevicePredictor
   }
   if (tax_samples > 0 && q > 0.0 && l * F > kept) {
     // A rise must repay the books' deficit and its own tax within
-    // tax_samples = N: the largest lambda >= kept / F with
+    // tax_samples = N:
     // lambda * g(N) - lambda^2 * h(N) - q * (lambda * F - kept) >= -budget.
+    // The left side is concave, so the rises that do lie in one interval
+    // [lo, hi]. Books in deficit can exclude the small rises; if the other
+    // constraints allow only those, the force stays at the kept one.
     const double l0 = kept / F, gn = g(tax_samples) - q * F, hn = h(tax_samples);
     const double c0 = q * kept + budget;
     const double disc = gn * gn + 4.0 * hn * c0;
-    double ln = l0;
-    if (gn - hn + c0 >= 0.0) {
-      ln = 1.0;
-    } else if (disc >= 0.0) {
-      ln = std::max(l0, (gn + std::sqrt(disc)) / (2.0 * hn));
+    if (disc < 0.0) {
+      l = l0;
+    } else {
+      const double root = std::sqrt(disc);
+      // lo * hi = -c0 / hn; this form of lo does not cancel for small c0.
+      const double lo = gn > 0.0 ? -2.0 * c0 / (gn + root) : (gn - root) / (2.0 * hn);
+      const double hi = gn - hn + c0 >= 0.0 ? 1.0 : (gn + root) / (2.0 * hn);
+      l = l >= lo ? std::max(l0, std::min(l, hi)) : l0;
     }
-    l = std::min(l, ln);
   }
   if (l >= 1.0) return r;  // the full force is affordable
   r.value = l * phi;
