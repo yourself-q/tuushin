@@ -85,6 +85,53 @@ class VelocityFilter {
   float v_ = 0.0f;
 };
 
+// A velocity observer with the motor's torque fed forward, after R. D.
+// Lorenz and K. W. Van Patten, "High-resolution velocity estimation for
+// all-digital, AC servo drives", IEEE T-IA 27(4), 1991: a rigid rotor of
+// inertia J under the motor's torque and another it estimates (a hand, an
+// object, friction, and whatever of the rotor's inertia J leaves out),
+// corrected by the encoder. The motor's own torque moves the estimate
+// within the tick it acts, where a filter of the readings lags it; the
+// other torque is a constant to the model, which the readings correct
+// with the observer's three poles at `bandwidth_hz`. Without an inertia
+// (0) the model takes the acceleration for a constant instead.
+//
+// A hand holding the knob adds an inertia the device does not know, and
+// an observer that takes the knob's alone sees a cut in the torque slow
+// the shaft twice as fast as it does. The estimate is linear in the
+// torque over the inertia, so the observer keeps the readings' part and
+// the torque's part apart, and gives the estimate for any inertia J /
+// share at once: share 1 is the rotor alone, 0 a shaft held by something
+// without limit, which the torque does not move.
+class VelocityObserver {
+ public:
+  VelocityObserver(float bandwidth_hz, float inertia, float nominal_dt);
+  // The shaft moved dtheta (rad) over dt (s) under the motor's torque
+  // (N m, constant over dt).
+  void update(float dtheta, float dt, float torque);
+  float velocity(float share = 1.0f) const { return w_ + share * wt_; }  // rad/s
+  // The other torque's acceleration (rad/s^2).
+  float acceleration(float share = 1.0f) const { return acc_ + share * acct_; }
+  // The other torque (N m); 0 without an inertia.
+  float disturbance() const { return acceleration() * inertia_; }
+  // As VelocityFilter::spread, for the nominal tick. The torque's part
+  // is free of the readings' errors.
+  float spread(float reading_sd, float dt) const {
+    return dt > 0.0f ? reading_sd / dt * noise_gain_ : 0.0f;
+  }
+  void reset() { r_ = w_ = acc_ = rt_ = wt_ = acct_ = 0.0f; }
+
+ private:
+  float hz_, inertia_;
+  float noise_gain_;
+  // The readings' part: as if the torque moved nothing.
+  float r_ = 0.0f;    // the position estimate less the reading (rad)
+  float w_ = 0.0f;    // rad/s
+  float acc_ = 0.0f;  // rad/s^2
+  // The torque's part, for the rotor alone, as if every reading were 0.
+  float rt_ = 0.0f, wt_ = 0.0f, acct_ = 0.0f;
+};
+
 // Accumulates a single-turn encoder (raw counts in [0, cpr)) into a count
 // over turns, taking the shortest way between readings.
 class TurnCounter {

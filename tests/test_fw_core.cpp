@@ -4,6 +4,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -199,6 +200,88 @@ TEST_CASE(fw_turn_counter_takes_the_short_way) {
   CHECK(t.count() == 90);
   for (int i = 0; i < 3 * 8; ++i) t.update(static_cast<std::uint32_t>((4090 + 512 * (i + 1)) % 4096));
   CHECK(t.count() == 90 + 3 * 4096);
+}
+
+TEST_CASE(fw_velocity_estimates_spread_as_they_say) {
+  // At rest, with readings that dither half a count: the two estimates
+  // spread as spread() says for errors of 0.25 + 1/12 counts^2.
+  const float dt = 200e-6f;
+  const double q = kTwoPiD / 16384;
+  std::mt19937 rng(7);
+  std::normal_distribution<double> noise(0.0, 0.5);
+  VelocityFilter lpf(300.0f);
+  VelocityObserver obs(200.0f, 7e-6f, dt);
+  double last = 0.0, sum_lpf = 0.0, sum_obs = 0.0;
+  int n = 0;
+  for (int i = 0; i < 100000; ++i) {
+    const double reading = std::round(noise(rng)) * q;
+    const float step = static_cast<float>(reading - last);
+    last = reading;
+    lpf.update(step, dt);
+    obs.update(step, dt, 0.0f);
+    if (i < 1000) continue;
+    sum_lpf += lpf.value() * lpf.value();
+    sum_obs += obs.velocity() * obs.velocity();
+    ++n;
+  }
+  const float sd = static_cast<float>(std::sqrt(0.25 + 1.0 / 12.0) * q);
+  CHECK_NEAR(std::sqrt(sum_lpf / n) / lpf.spread(sd, dt), 1.0, 0.05);
+  CHECK_NEAR(std::sqrt(sum_obs / n) / obs.spread(sd, dt), 1.0, 0.05);
+  // The observer's poles sit lower: it spreads half as much.
+  CHECK(obs.spread(sd, dt) < 0.5f * lpf.spread(sd, dt));
+}
+
+TEST_CASE(fw_velocity_observer_follows_the_motor_torque) {
+  // A rotor under a torque that switches between +-0.02 N m every 2 ms,
+  // with another of 5 mN m besides, read to the count: the filter lags
+  // the motor's torque by its time constant, 1.5 rad/s, while the
+  // observer, which knows it, follows within the counts' rounding, and
+  // finds the other torque.
+  const float dt = 200e-6f;
+  const double inertia = 7e-6, other = 0.005;
+  const double q = kTwoPiD / 16384;
+  VelocityFilter lpf(300.0f);
+  VelocityObserver obs(200.0f, static_cast<float>(inertia), dt);
+  double theta = 0.0, omega = 0.0, last = 0.0, worst_lpf = 0.0, worst_obs = 0.0, seen = 0.0;
+  int n = 0;
+  for (int i = 0; i < 2000; ++i) {
+    const double torque = (i / 10) % 2 == 0 ? 0.02 : -0.02;
+    const double acc = (torque + other) / inertia;
+    theta += omega * dt + 0.5 * acc * dt * dt;
+    omega += acc * dt;
+    const double reading = std::floor(theta / q) * q;
+    const float step = static_cast<float>(reading - last);
+    last = reading;
+    lpf.update(step, dt);
+    obs.update(step, dt, static_cast<float>(torque));
+    if (i < 1000) continue;
+    worst_lpf = std::max(worst_lpf, std::fabs(lpf.value() - omega));
+    worst_obs = std::max(worst_obs, std::fabs(obs.velocity() - omega));
+    seen += obs.disturbance();
+    ++n;
+  }
+  CHECK(worst_lpf > 1.0);
+  CHECK(worst_obs < 0.5);
+  CHECK_NEAR(seen / n, other, 5e-4);
+}
+
+TEST_CASE(fw_velocity_observer_answers_for_any_inertia) {
+  // One observer for the rotor alone answers, by share, as observers for
+  // a rotor twice as heavy, and for one the torque does not move, do.
+  const float dt = 200e-6f;
+  VelocityObserver alone(200.0f, 7e-6f, dt), twice(200.0f, 14e-6f, dt), held(200.0f, 0.0f, dt);
+  std::mt19937 rng(3);
+  std::uniform_real_distribution<float> step(-0.004f, 0.004f), torque(-0.1f, 0.1f);
+  float worst = 0.0f;
+  for (int i = 0; i < 5000; ++i) {
+    const float d = step(rng), t = torque(rng);
+    alone.update(d, dt, t);
+    twice.update(d, dt, t);
+    held.update(d, dt, 0.0f);
+    worst = std::max({worst, std::fabs(alone.velocity(0.5f) - twice.velocity()),
+                      std::fabs(alone.velocity(0.0f) - held.velocity())});
+  }
+  CHECK(worst < 1e-3f);
 }
 
 TEST_CASE(fw_calibration_finds_how_the_motor_sits) {

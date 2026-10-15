@@ -265,7 +265,9 @@ TEST_CASE(remote_work_cap_stops_the_knob_where_the_work_reaches_it) {
     b.hold(0.1);
     b.run_capped(1.0, 1.0, 1e-3);
     const double w = *b.dev->port_work();
-    CHECK(w <= 1e-3 + 2e-6);
+    // Within the work of a count's step at 1 N, 7.7 uJ: the device books
+    // the work in whole counts, and the last one may cross the cap.
+    CHECK(w <= 1e-3 + 1.0 * 0.02 * 6.283185307179586 / 16384);
     CHECK(w > 0.9e-3);
     CHECK(b.dev->latest_state().flags & kStateCapped);
     // What the caps in flight still allow.

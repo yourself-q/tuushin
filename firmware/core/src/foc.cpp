@@ -71,6 +71,58 @@ float VelocityFilter::spread(float reading_sd, float dt) const {
   return reading_sd / dt * a * std::sqrt(2.0f / (2.0f - a));
 }
 
+namespace {
+
+// The gains that put the observer's three poles at z = p, for the state
+// (theta, omega dt, acceleration dt^2) and the correction x += k (reading
+// - prediction): the error's transition (I - k C) A has the
+// characteristic polynomial z^3 - (3 - k1 - k2 - k3 / 2) z^2 +
+// (3 - 2 k1 - k2 + k3 / 2) z - (1 - k1), which (z - p)^3 matches with:
+void observer_gains(float p, float k[3]) {
+  const float m = 1.0f - p;
+  k[0] = 1.0f - p * p * p;
+  k[1] = 1.5f * m * m * (1.0f + p);
+  k[2] = m * m * m;
+}
+
+}  // namespace
+
+VelocityObserver::VelocityObserver(float bandwidth_hz, float inertia, float nominal_dt)
+    : hz_(bandwidth_hz), inertia_(inertia > 0.0f ? inertia : 0.0f) {
+  // The estimate's response to one reading's error, summed in squares:
+  // the error goes in through k and dies out through (I - k C) A.
+  float k[3];
+  observer_gains(std::exp(-kTwoPi * hz_ * nominal_dt), k);
+  const float a[3][3] = {{1.0f, 1.0f, 0.5f}, {0.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 1.0f}};
+  float v[3] = {k[0], k[1], k[2]};
+  float sum = 0.0f;
+  for (int n = 0; n < 400; ++n) {
+    sum += v[1] * v[1];
+    float av[3];
+    for (int i = 0; i < 3; ++i) av[i] = a[i][0] * v[0] + a[i][1] * v[1] + a[i][2] * v[2];
+    v[0] = av[0] - k[0] * av[0];
+    v[1] = av[1] - k[1] * av[0];
+    v[2] = av[2] - k[2] * av[0];
+  }
+  noise_gain_ = std::sqrt(sum);
+}
+
+void VelocityObserver::update(float dtheta, float dt, float torque) {
+  if (dt <= 0.0f) return;
+  float k[3];
+  observer_gains(std::exp(-kTwoPi * hz_ * dt), k);
+  auto step = [&](float& r, float& w, float& acc, float push, float moved) {
+    r += w * dt + 0.5f * (acc + push) * dt * dt - moved;
+    w += (acc + push) * dt;
+    const float e = -r;
+    r += k[0] * e;
+    w += k[1] * e / dt;
+    acc += k[2] * e / (dt * dt);
+  };
+  step(r_, w_, acc_, 0.0f, dtheta);
+  step(rt_, wt_, acct_, inertia_ > 0.0f ? torque / inertia_ : 0.0f, 0.0f);
+}
+
 std::int32_t TurnCounter::update(std::uint32_t raw) {
   if (!started_) {
     reset(raw);

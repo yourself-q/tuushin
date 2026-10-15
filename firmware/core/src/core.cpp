@@ -62,6 +62,7 @@ DeviceCore::DeviceCore(Hal& hal, const DeviceConfig& cfg)
       cfg_(cfg),
       turns_(cfg.counts_per_rev),
       vel_(cfg.velocity_cutoff_hz),
+      obs_(cfg.observer_hz, cfg.inertia, static_cast<float>(cfg.tick_us) * 1e-6f),
       watchdog_us_(cfg.watchdog_us),
       state_period_us_(cfg.state_period_us),
       link_timeout_us_(cfg.link_timeout_us),
@@ -117,6 +118,7 @@ void DeviceCore::tick() {
     const float dtheta = static_cast<float>(step) * count_to_rad;
     work_ += static_cast<double>(applied_) * static_cast<double>(dtheta);
     vel_.update(dtheta, dt);
+    obs_.update(dtheta, dt, motor_torque_);
     // The second difference of the readings: of their errors, 6 times
     // their variance, and of the shaft's motion, its acceleration.
     const float d2 = static_cast<float>(step - step_);
@@ -161,6 +163,7 @@ void DeviceCore::tick() {
   const bool fresh = fresh_cmd_;
   fresh_cmd_ = false;
   applied_ = 0.0f;
+  motor_torque_ = 0.0f;
   saturated_ = false;
   if (cal_phase_ != CalPhase::kNone) {
     run_calibration(now);
@@ -172,7 +175,7 @@ void DeviceCore::tick() {
     // the one before, in the tick it takes effect.
     const float taxed =
         fresh ? growth(clampf(prev_cmd_, -torque_limit_, torque_limit_), host) : 0.0f;
-    if (host != 0.0f && capped) host = keep_to_cap(host, dt, before, taxed, omega);
+    if (host != 0.0f && capped) host = keep_to_cap(host, dt, before, taxed);
     asked_ = host;
     if (host == 0.0f && damping_ == 0.0f) {
       // No torque to make: open the windings, which then carry no current
@@ -437,6 +440,7 @@ void DeviceCore::foc(float host, float omega, float vbus) {
   if (std::fabs(total - (host + damp)) > 1e-4f * cfg_.max_torque) saturated_ = true;
   // A clamp by the voltage takes from the host's torque first.
   applied_ = total - damp;
+  motor_torque_ = total;
   const BridgeVoltages v = space_vector(0.0f, uq, electrical_angle(), vbus);
   hal_.set_duties(v.a / vbus, v.b / vbus, v.c / vbus);
 }
@@ -448,17 +452,32 @@ void DeviceCore::foc(float host, float omega, float vbus) {
 // before they knew (README, "Known issues"). The cap is the books' limit
 // on the device's side, where the work is measured.
 //
-// The shaft is taken to turn on at its filtered velocity omega, plus what
-// the torque itself adds from the moving parts' inertia J: a fraction l
-// of the torque tau held for n ticks of dt then does the work
+// The shaft is taken to turn on at its estimated velocity omega, plus
+// what the torque itself adds from the moving parts' inertia J and what
+// the other torque adds where it turns the shaft the torque's way, an
+// acceleration alpha: a fraction l of the torque tau held for n ticks of
+// dt then does the work
 //
-//   w_n(l) = l tau omega n dt + (l tau n dt)^2 / (2 J).
+//   w_n(l) = l tau omega n dt + l tau alpha (n dt)^2 / 2 + (l tau n dt)^2 / (2 J).
 //
 // The velocity, not the last step: at a few counts a tick the step is 0
 // one tick and 2 the next, and a torque taking energy out of a knob a
 // hand turns slowly looked, on the steps, as if it would push a shaft at
 // rest, was cut, and came back on the next step: 400 cuts in 0.2 s at
 // 1.5 rad/s, which the tax below made cost twice what the torque took out.
+// And an observer's (VelocityObserver), which knows the torque, not a
+// filter's, which lags what the torque does: a light knob the torque
+// stopped and sent back off a wall was, to a filter half a millisecond
+// behind, still moving into the torque, which held on and did 0.1 mJ
+// past the cap. The other torque counts only where it turns the shaft
+// the torque's way, not where it holds the shaft back, which a hand may
+// stop doing. A hand's inertia, which the device does not know, takes
+// part of what the torque does: the terms are the worse of the rotor
+// alone and of a shaft held by something without limit, which bounds
+// every hand in between, since the work is convex in the share of the
+// torque's acceleration the shaft takes. The rotor's alone, which saw a
+// cut torque slow a held knob twice as fast as it did, overran the cap
+// by 46 uJ where the bound keeps within a count (below).
 //
 // Raising the torque costs besides: the work is counted in whole counts,
 // and summed by parts the count is off by up to half a count q against
@@ -484,29 +503,41 @@ void DeviceCore::foc(float host, float omega, float vbus) {
 //    1.9 rad/s, and a torque cut on a slower one never came back.
 //    The prediction takes kRiseConfidence standard deviations of the
 //    velocity estimate off: at rest, with an encoder dithering half a
-//    count, the estimate strays 0.38 rad/s rms and up to 1.5 rad/s, and
-//    each stray against the torque let it rise, pay its tax and be cut
-//    again as the readings came back: 270 cuts in 0.2 s. The spread
-//    follows from the readings' errors (VelocityFilter::spread), whose
-//    variance the device measures from the second differences of its
-//    counts, since a real encoder's noise grows with the bridge's.
+//    count, a 300 Hz filter's estimate strayed 0.38 rad/s rms and up to
+//    1.5 rad/s, and each stray against the torque let it rise, pay its
+//    tax and be cut again as the readings came back: 270 cuts in 0.2 s.
+//    The spread follows from the readings' errors
+//    (VelocityObserver::spread), whose variance the device measures from
+//    the second differences of its counts, since a real encoder's noise
+//    grows with the bridge's.
 // The hold is on the estimate itself: a stray cuts a held torque, which
 // then stays off, rather than letting it do work.
-// The prediction misses what the hand or a wall does to the shaft, so
-// the cap can be overrun by about the torque times a few counts.
-float DeviceCore::keep_to_cap(float tau, float dt, float before, float taxed, float omega) {
+// What is left is the count: a shaft at a count's edge steps the
+// torque's way with nothing in the readings to foresee it, so the cap
+// can be overrun by up to the torque times a count. In device_lab.sh the
+// worst were 10 to 23 uJ at the master, whose count is worth 24 uJ at
+// its torque, and 21 to 32 uJ at the slave, 38 uJ at its ceiling.
+float DeviceCore::keep_to_cap(float tau, float dt, float before, float taxed) {
   const float left = static_cast<float>(cmd_.work_cap - (work_ + tax_));
   const float room = left > 0.0f ? left : 0.0f;
   const float q = kTwoPi / static_cast<float>(cfg_.counts_per_rev);
   const float mag = std::fabs(tau);
-  const float a = tau * omega * dt;
-  const float b = cfg_.inertia > 0.0f ? tau * tau * dt * dt / (2.0f * cfg_.inertia) : 0.0f;
+  const float inertia = cfg_.inertia;
+  // The shaft as the rotor alone (share 1) and as held by a hand heavier
+  // than any (share 0); the work is convex in the share, so the worse of
+  // the two, term by term, bounds it for every hand in between.
+  const float a = dt * std::max(tau * obs_.velocity(1.0f), tau * obs_.velocity(0.0f));
+  const float b = inertia > 0.0f ? tau * tau * dt * dt / (2.0f * inertia) : 0.0f;
+  // The other torque where it turns the shaft the torque's way; not where
+  // it holds the shaft back, which a hand may stop doing.
+  const float push = std::max(tau * obs_.acceleration(1.0f), tau * obs_.acceleration(0.0f));
+  const float e = push > 0.0f ? 0.5f * push * dt * dt : 0.0f;
   const float free = (before * tau > 0.0f ? std::fabs(before) : 0.0f) + taxed;
   const float l0 = free / mag;  // where the tax starts
   const float horizon = std::max(1.0f, kTaxHorizonUs * 1e-6f / dt);  // ticks
 
   // The tick's work.
-  const float held = a + b <= room ? 1.0f : clampf(largest_root(b, a, room), 0.0f, 1.0f);
+  const float held = a + e + b <= room ? 1.0f : clampf(largest_root(b, a + e, room), 0.0f, 1.0f);
   if (held * mag <= free) {
     if (held < 1.0f) capped_ = true;
     return held * tau;
@@ -516,25 +547,32 @@ float DeviceCore::keep_to_cap(float tau, float dt, float before, float taxed, fl
   // the torque's way. The readings' errors are rounding, at least, and
   // independent from one reading to the next.
   const float reading_sd = std::sqrt(std::max(reading_var_, 1.0f / 12.0f)) * q;
-  const float sure = a + mag * kRiseConfidence * vel_.spread(reading_sd, dt) * dt;
+  const float sure = a + mag * kRiseConfidence * obs_.spread(reading_sd, dt) * dt;
   auto due = [&](float l) {
-    float n = sure < 0.0f ? horizon : 1.0f;
-    if (sure < 0.0f && b > 0.0f) n = clampf(-sure / (2.0f * b * l), 1.0f, horizon);
-    return q * (l * mag - free) + (sure * n * l + b * n * n * l * l);
+    float n = 1.0f;
+    if (sure < 0.0f) {
+      const float c = e + b * l;
+      n = c > 0.0f ? clampf(-sure / (2.0f * c), 1.0f, horizon) : horizon;
+    }
+    return q * (l * mag - free) + (sure * n + e * n * n) * l + b * n * n * l * l;
   };
   if (due(held) <= room) {
     if (held < 1.0f) capped_ = true;
     return held * tau;
   }
   capped_ = true;
-  // due is falling and then rising over [l0, held]: the work taken out
-  // over the whole horizon grows with l faster than the tax, at first,
-  // up to where the torque would stop the shaft within it.
-  float low = l0;
-  if (sure < 0.0f && b > 0.0f) {
-    const float fall = -(q * mag + sure * horizon) / (2.0f * b * horizon * horizon);
-    low = clampf(fall, l0, std::max(l0, std::min(-sure / (2.0f * b * horizon), held)));
+  // due is convex: its least on [l0, held], and the largest l above that
+  // within the room.
+  float lo = l0, hi = held;
+  for (int k = 0; k < 24; ++k) {
+    const float third = (hi - lo) / 3.0f;
+    if (due(lo + third) <= due(hi - third)) {
+      hi -= third;
+    } else {
+      lo += third;
+    }
   }
+  float low = 0.5f * (lo + hi);
   if (due(low) > room) return l0 * tau;
   float high = held;
   for (int k = 0; k < 20; ++k) {
