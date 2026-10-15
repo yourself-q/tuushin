@@ -23,6 +23,9 @@ constexpr double kLostForceVar = 100.0;
 constexpr double kAdaptPerSecond = 3.0;
 constexpr double kAdaptNisClip = 9.0;
 constexpr double kAdaptLogMax = 5.545177444479562;  // 2 ln 16
+// How long the model error margin remembers a miss: the time constant of
+// its decay, in s.
+constexpr double kMissSeconds = 0.05;
 
 }  // namespace
 
@@ -55,6 +58,12 @@ void DevicePredictor::observe_irregular(double dx, double phi_held) {
 }
 
 void DevicePredictor::push(double dx, double phi_held, double r, bool regular) {
+  if (q_ <= 0.0 && regular && ready()) {
+    // What the model missed over this sample, held as a decaying envelope:
+    // exact readings leave no noise to average, only the model's error.
+    const double e = dx - hold_displacement(phi_held, r);
+    miss_ = std::max(e * e, (1.0 - std::min(1.0, r * dt_ / kMissSeconds)) * miss_);
+  }
   dx2_ = dx1_;
   phi2_ = phi1_;
   r2_ = r1_;
@@ -105,6 +114,10 @@ void DevicePredictor::filter(double dx, double phi_held, double r, bool regular)
   const double s = p[0][0] + noise_;
   const double k[3] = {p[0][0] / s, p[1][0] / s, p[2][0] / s};
   const double nu = -e_;
+  // What the innovations show beyond the filter's own spread S, the model
+  // error with noise averaged out; a consistent filter keeps it near zero.
+  excess_ += std::min(1.0, h / kMissSeconds) * (nu * nu - s - excess_);
+  miss_ = std::max(0.0, excess_);
   if (adapt_) {
     // Covariance matching: a consistent filter's normalized innovation
     // squared averages 1; more says it trusts its estimates of v and H too
@@ -151,9 +164,11 @@ double DevicePredictor::hold_base(double n) const {
 }
 
 double DevicePredictor::hold_sd(double n) const {
-  if (q_ <= 0.0) return 0.0;
+  // A miss over one sample taken as an unmodeled force grows as n^2.
+  const double miss = n * n * n * n * miss_;
+  if (q_ <= 0.0) return std::sqrt(miss);
   const double gv = n * dt_, gh = n * n * c_;
-  const double var = gv * gv * p_[1][1] + 2.0 * gv * gh * p_[1][2] + gh * gh * p_[2][2];
+  const double var = gv * gv * p_[1][1] + 2.0 * gv * gh * p_[1][2] + gh * gh * p_[2][2] + miss;
   return std::sqrt(std::max(0.0, var));
 }
 
@@ -221,7 +236,7 @@ PcResult limit_force_predictive(double budget, double phi, const DevicePredictor
     const double gm = phi * device.hold_base(rise_samples);
     l = std::min(l, std::max(kept / F, affordable_scale(gm, h(rise_samples), b)));
   }
-  if (tax_samples > 0 && q > 0.0 && l * F > kept) {
+  if (tax_samples > 0 && l * F > kept) {
     // A rise must repay the books' deficit and its own tax within
     // tax_samples = N:
     // lambda * g(N) - lambda^2 * h(N) - q * (lambda * F - kept) >= -budget.

@@ -202,11 +202,22 @@ TEST_CASE(stalled_loops_stay_passive_with_coarse_encoders) {
   }
 }
 
-TEST_CASE(stalled_loops_generate_energy_on_coarse_encoders_they_do_not_know) {
-  // Why the controllers must know the resolution: credited with the work
-  // that quantization misattributes, the master spends energy that never
-  // entered, and the teleoperator generates some after 50 ms master stalls.
+TEST_CASE(stalled_loops_on_coarse_encoders_they_do_not_know_render_nothing) {
+  // Why the controllers must know the resolution. Credited with the work
+  // that quantization misattributes, the master once spent energy that
+  // never entered, and 50 ms master stalls generated millijoules. Now the
+  // predictor takes the quantization noise its prediction differentiates
+  // twice for model error, and the margin outgrows any motion: once the
+  // margin has seen the first counts nothing more is generated, stalls or
+  // not, but nothing of the wall is displayed either. What is left is the
+  // first force, before the margin has seen any count.
   const Encoders enc{55e-6, 1e-6, false};
-  const auto w = worst_single_stalls(2 * kNanosPerMilli, 50 * kNanosPerMilli, true, false, enc);
-  CHECK(w.physical < -1e-3);
+  const double quiet = run(2 * kNanosPerMilli, {}, {}, 3 * kNanosPerSecond, enc).physical;
+  CHECK(quiet > -1e-5);
+  for (const Nanos len : {12 * kNanosPerMilli, 50 * kNanosPerMilli, 100 * kNanosPerMilli}) {
+    for (int who = 0; who < 3; ++who) {
+      const auto w = worst_single_stalls(2 * kNanosPerMilli, len, who != 1, who != 0, enc);
+      CHECK(w.physical >= quiet - 1e-9);
+    }
+  }
 }

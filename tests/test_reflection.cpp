@@ -343,40 +343,71 @@ TEST_CASE(predictive_pc_force_is_the_largest_affordable_with_the_tax) {
   }
 }
 
-TEST_CASE(predictor_spread_and_adaptation_need_a_resolution) {
-  // With an exact encoder there is no filter: no spread, no adaptation, and
-  // so the confidence bound and the tax and rise horizons change nothing.
+TEST_CASE(predictor_without_a_resolution_spreads_by_its_model_error_alone) {
+  // With an exact encoder there is no filter, so no adaptation and no
+  // spread but the model error's. A device the model describes leaves none
+  // beyond rounding, and the confidence bound changes nothing; the rise
+  // horizon, which guards a tax, never applies.
   const double m = 0.2, dt = 1e-3;
   HeldMass dev{m, dt, 1.5};
   dev.v = 0.02;
   DevicePredictor pred(m, dt, 0.0, 20.0, true);
-  for (int k = 0; k < 50; ++k) {
-    const double phi = (k % 7) * 0.5;
-    pred.observe(dev.step(phi), phi);
-  }
-  CHECK(pred.hold_sd(1.0) == 0.0 && pred.hold_sd(4.0) == 0.0);
+  // The history would take the device to have been at rest and unforced; an
+  // irregular sample has it start from two real ones instead.
+  pred.observe_irregular(dev.step(0.0), 0.0);
+  auto run = [&](int samples) {
+    for (int k = 0; k < samples; ++k) {
+      const double phi = (k % 7) * 0.5;
+      pred.observe(dev.step(phi), phi);
+    }
+  };
+  run(50);
+  CHECK(pred.model_error() < 1e-15);
+  CHECK(pred.hold_sd(4.0) == 16.0 * pred.hold_sd(1.0));
   CHECK(pred.force_rate() == 20.0);
   for (double phi : {-6.0, -1.0, 0.5, 3.0, 12.0}) {
-    for (double budget : {0.0, 1e-5, 1e-3}) {
+    for (double budget : {-1e-5, 0.0, 1e-5, 1e-3}) {
+      const double plain = limit_force_predictive(budget, phi, pred, 2, 0.0, 4).value;
+      CHECK_NEAR(limit_force_predictive(budget, phi, pred, 2, 1.0, 4).value, plain,
+                 1e-9 * std::fabs(phi));
       CHECK(limit_force_predictive(budget, phi, pred, 2, 1.0, 4, 64).value ==
-            limit_force_predictive(budget, phi, pred, 2).value);
+            limit_force_predictive(budget, phi, pred, 2, 1.0, 4).value);
     }
   }
+  // Half the mass the model assumes: each force change moves the device
+  // twice as far as predicted, and the bound now asks for less where the
+  // motion limits the force.
+  dev.m = 0.5 * m;
+  run(50);
+  const double missed = pred.model_error();
+  CHECK(missed > 1e-7);
+  CHECK(pred.force_rate() == 20.0);
+  for (double budget : {0.0, 1e-5}) {
+    const double plain = limit_force_predictive(budget, 30.0, pred, 2, 0.0, 4).value;
+    const double bounded = limit_force_predictive(budget, 30.0, pred, 2, 1.0, 4).value;
+    CHECK(bounded < plain);
+  }
+  // Once the model holds again the envelope decays, by e^-1 in amplitude
+  // every 0.1 s.
+  dev.m = m;
+  run(300);
+  CHECK(pred.model_error() < 0.1 * missed);
 }
 
 TEST_CASE(predictor_raises_its_force_rate_while_the_push_changes_fast) {
   // A hand whose push swings by 3 N at 2 Hz changes it at up to 38 N/s; the
   // filter is told 5 N/s. Its innovations then exceed their predicted
   // spread, and so would its predictions: a fixed filter misses the device's
-  // displacement by many of its own standard deviations. The adapting one
-  // raises the rate until its spread is honest, and lowers it again once the
-  // push holds still.
+  // displacement by many of its own standard deviations. The model error
+  // the predictor adds, what the innovations show beyond that spread, makes
+  // up most of the difference. The adapting one raises the rate until its
+  // spread is honest, and lowers it again once the push holds still.
   const double m = 0.2, dt = 1e-3, q = 55e-6, k_wall = 300.0;
   HeldMass dev{m, dt, 0.0};
   DevicePredictor fixed(m, dt, q, 5.0), adapting(m, dt, q, 5.0, true);
   auto reading = [&] { return std::round(dev.x / q) * q; };
   double y = reading();
-  double z2_fixed = 0.0, z2_adapting = 0.0;
+  double z2_filter = 0.0, z2_fixed = 0.0, z2_adapting = 0.0;
   int n = 0;
   const int swing = 3000, still = 5000;
   for (int k = 0; k < swing + still; ++k) {
@@ -388,9 +419,13 @@ TEST_CASE(predictor_raises_its_force_rate_while_the_push_changes_fast) {
     const double predicted_fixed = fixed.displacement(phi);
     const double predicted_adapting = adapting.displacement(phi);
     const double sd_fixed = fixed.hold_sd(1.0), sd_adapting = adapting.hold_sd(1.0);
+    // Over one sample the model error adds its square to the variance.
+    const double missed = fixed.model_error();
+    const double var_filter = sd_fixed * sd_fixed - missed * missed;
     dev.step(phi);
     if (k >= 1000 && k < swing) {
       const double dx = dev.x - x0;
+      z2_filter += (dx - predicted_fixed) * (dx - predicted_fixed) / var_filter;
       z2_fixed += (dx - predicted_fixed) * (dx - predicted_fixed) / (sd_fixed * sd_fixed);
       z2_adapting += (dx - predicted_adapting) * (dx - predicted_adapting) /
                      (sd_adapting * sd_adapting);
@@ -406,8 +441,10 @@ TEST_CASE(predictor_raises_its_force_rate_while_the_push_changes_fast) {
       CHECK(adapting.force_rate() <= 16.0 * 5.0);
     }
   }
-  const double z_fixed = std::sqrt(z2_fixed / n), z_adapting = std::sqrt(z2_adapting / n);
-  CHECK(z_fixed > 3.0);
+  const double z_filter = std::sqrt(z2_filter / n), z_fixed = std::sqrt(z2_fixed / n),
+               z_adapting = std::sqrt(z2_adapting / n);
+  CHECK(z_filter > 3.0);
+  CHECK(z_fixed < 2.0);
   CHECK(z_adapting > 0.5 && z_adapting < 2.0);
   CHECK(adapting.force_rate() < 5.0 * 1.05);
 }
@@ -480,8 +517,9 @@ TEST_CASE(predictive_pc_rises_only_as_far_as_it_could_hold) {
 // PC's force meets every constraint it checks, and any larger force of the
 // same sign would not. Over one sample and the hold the bound is on the
 // work's lower confidence bound, without the tax when a horizon repays it;
-// over the tax horizon a rise must repay its tax and the books' deficit,
-// and over the rise horizon the expected work must stay above -budget.
+// over the tax horizon a rise must repay its tax and the books' deficit
+// (with exact readings, the deficit alone), and over the rise horizon the
+// expected work must stay above -budget.
 TEST_CASE(predictive_pc_force_is_the_largest_affordable_over_the_horizon) {
   Rng rng(17);
   const double dt = 1e-3;
@@ -521,10 +559,13 @@ TEST_CASE(predictive_pc_force_is_the_largest_affordable_over_the_horizon) {
       const double prepaid = horizon > 0 ? 0.0 : tax;
       double s = b + lcb(1.0) - prepaid;
       if (hold > 1) s = std::min(s, b + lcb(hold) - prepaid);
-      // A rise, beyond the rounding of a force scaled back to the kept one.
-      const bool rise = tax > q * 1e-12 * std::fabs(phi);
+      // A rise, beyond the rounding of a force scaled back to the kept one;
+      // the tax per unit of resolution tells it with exact readings too.
+      const bool rise = quantization_tax(1.0, held, f) > 1e-12 * std::fabs(phi);
       if (horizon > 0 && rise) s = std::min(s, budget + lcb(horizon) - tax);
-      if (rise_horizon > 0 && rise) s = std::min(s, b + pred.hold_work(f, rise_horizon));
+      if (rise_horizon > 0 && q > 0.0 && rise) {
+        s = std::min(s, b + pred.hold_work(f, rise_horizon));
+      }
       return s;
     };
     const bool sign_ok = r.value * phi >= 0.0 && std::fabs(r.value) <= std::fabs(phi);

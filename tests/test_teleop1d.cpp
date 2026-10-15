@@ -1,4 +1,5 @@
 #include <cmath>
+#include <cstdio>
 #include <iterator>
 #include <memory>
 #include <stdexcept>
@@ -86,13 +87,16 @@ TEST_CASE(teleop_reflective_tdpa_is_passive_at_the_device_ports) {
 }
 
 TEST_CASE(teleop_reflective_tdpa_renders_a_stiffer_wall_than_channel_tdpa) {
+  // At 5 ms the conventional scheme's stiffness is chaotic: over runs whose
+  // hand motion differs by one part in 10^12 it spans 252 to 656 N/m,
+  // against 1262 N/m with energy reflection. From 10 ms the gap is tenfold.
   sim::Teleop1DConfig channel, reflective;
   channel.passivity = Passivity::kChannel;
   reflective.passivity = Passivity::kReflective;
   for (int ms : {5, 10, 25}) {
     const auto c = run(channel, from_millis(ms));
     const auto r = run(reflective, from_millis(ms));
-    CHECK(r.displayed_stiffness > 2.0 * c.displayed_stiffness);
+    CHECK(r.displayed_stiffness > 1.5 * c.displayed_stiffness);
     CHECK(r.pos_rmse < c.pos_rmse);
   }
 }
@@ -194,7 +198,7 @@ TEST_CASE(teleop_reflective_tdpa_stays_passive_on_coarse_encoders) {
   // took in, whatever the motion, so the true margin is that of the books'
   // guarantee: nothing is generated. The price is transparency: over nine
   // hand motions the master conveys as much of the contact force as with
-  // exact encoders at 10 ms, but only 56 % and 87 % of it at 50 and 100 ms.
+  // exact encoders at 10 ms, but only 65 % and 80 % of it at 50 and 100 ms.
   for (int ms : {10, 50, 100}) {
     for (double freq : {0.4, 0.6}) {
       for (double amplitude : {0.03, 0.05}) {
@@ -211,15 +215,24 @@ TEST_CASE(teleop_reflective_tdpa_stays_passive_on_coarse_encoders) {
       }
     }
   }
-  // Told nothing, the controllers treat the readings as exact: the
-  // prediction differentiates quantization noise twice, and at 50 ms the
-  // teleoperator generates a third of a joule.
+  // Told nothing, the controllers treat the readings as exact, and the
+  // prediction differentiates quantization noise twice. Before the model
+  // error margin the teleoperator generated a third of a joule at 50 ms.
+  // The margin takes the noise for model error and outgrows any motion:
+  // apart from the first force, displayed before the margin has seen a
+  // count (1.9 N, 7.5 uJ), nothing is generated and nothing of the wall is
+  // displayed.
   sim::Teleop1DConfig cfg;
   cfg.passivity = Passivity::kReflective;
   cfg.master_encoder_resolution = 55e-6;
   cfg.slave_encoder_resolution = 1e-6;
   cfg.encoder_resolution_known = false;
-  CHECK(run(cfg, from_millis(50)).min_true_margin < -0.1);
+  for (int ms : {10, 50, 100}) {
+    const auto r = run(cfg, from_millis(ms));
+    CHECK(r.min_true_margin > -1e-5);
+    CHECK(r.max_display_force < 2.5);
+    CHECK(r.displayed_stiffness < 1.0);
+  }
 }
 
 namespace {
@@ -251,8 +264,9 @@ TEST_CASE(teleop_coarse_encoder_rises_that_last_chatter_less) {
   // affordable force, and every count it does not lowers it again: each
   // rise pays the tax at once, and the force chatters at the count rate.
   // Holding a rise to the force the expected motion could keep paying for
-  // over 64 samples removes one half to three quarters of the chatter on
-  // every hand motion, and costs no energy.
+  // over 64 samples removes a quarter to two thirds of the chatter on every
+  // hand motion, and costs no energy. (Before the model error margin, which
+  // calms the force too, it removed one half to three quarters.)
   for (int ms : {10, 50, 100}) {
     for (double freq : {0.4, 0.6}) {
       for (double amplitude : {0.03, 0.05}) {
@@ -263,7 +277,7 @@ TEST_CASE(teleop_coarse_encoder_rises_that_last_chatter_less) {
         CHECK(!held.diverged);
         CHECK(held.max_book_excess < 1e-12);
         CHECK(held.min_true_margin > -1e-9);
-        CHECK(held.display_force_variation < 0.6 * unheld.display_force_variation);
+        CHECK(held.display_force_variation < 0.8 * unheld.display_force_variation);
       }
     }
   }
@@ -278,27 +292,34 @@ TEST_CASE(teleop_coarse_encoder_forces_start_on_slow_motions) {
   // a budget. Repaid over four samples of predicted input, the force starts
   // above about q / (4 dt), 1.4 cm/s. This hand peaks at 1.9 cm/s. Holding
   // each rise to what the expected motion could keep paying for lowers the
-  // peak (1.9 to 2.7 N against 2.8 to 5 N without), but the force starts.
+  // peak (1.4 to 2.6 N against 2.9 to 3.3 N without), but the force starts.
+  // At 100 ms the peak turns on rounding. The hand pauses near a count
+  // boundary, and differences of the last bit, grown to 1e-9 m by 1.96 s,
+  // move the next count transition by a sample; the force the PC then lets
+  // through differs (0.42 N against 0.25 N) and the runs part. The peak is
+  // 1.96 N with clang on arm64 macOS, 1.94 N there without fused
+  // multiply-adds and 1.37 N with GCC on arm64 Linux.
   for (int ms : {10, 50, 100}) {
     const auto cfg = coarse(0.2, 0.03);
     const auto r = run(cfg, from_millis(ms));
     CHECK(!r.diverged);
     CHECK(r.max_book_excess < 1e-12);
     CHECK(r.min_true_margin > -1e-9);
-    CHECK(r.max_display_force > 1.5);
+    CHECK(r.max_display_force > 1.0);
     CHECK(run(prepaid(cfg), from_millis(ms)).max_display_force == 0.0);
   }
 }
 
-TEST_CASE(teleop_coarse_encoder_pc_needs_an_honest_filter) {
+TEST_CASE(teleop_coarse_encoder_pc_survives_a_dishonest_filter) {
   // Repaying the tax over several samples trusts the filter's prediction
   // over them, and a filter told that the hand's push changes at 5 N/s
   // when it changes several times faster trusts it too much: its
-  // predictions miss by many of its own standard deviations, the lower
-  // confidence bound is too high, and the actuators generate energy.
-  // Adapting the rate to the innovations restores the guarantee. Holding
-  // rises to what the mean prediction could keep paying for makes fewer of
-  // them and the energy generated three to five times smaller, not zero.
+  // predictions miss by many of its own standard deviations. Before the
+  // model error margin the lower confidence bound was then too high, and
+  // without adaptation the actuators generated up to 7 mJ. The margin, what
+  // the innovations show beyond the filter's spread, widens the bound by
+  // the misses, and adapting the rate makes the spread honest itself;
+  // either restores the guarantee.
   for (int ms : {50, 100}) {
     auto cfg = coarse(0.6, 0.05);
     cfg.force_rate = 5.0;
@@ -306,6 +327,92 @@ TEST_CASE(teleop_coarse_encoder_pc_needs_an_honest_filter) {
     CHECK(!r.diverged);
     CHECK(r.min_true_margin > -1e-9);
     cfg.adapt_force_rate = false;
-    CHECK(run(cfg, from_millis(ms)).min_true_margin < -5e-4);
+    CHECK(run(cfg, from_millis(ms)).min_true_margin > -1e-9);
+    cfg.master_pc_rise_samples = 0;
+    CHECK(run(cfg, from_millis(ms)).min_true_margin > -1e-9);
+  }
+}
+
+namespace {
+
+// A fraction of a device's mass beyond a spring resonating at hz.
+teleop::ComplianceParams resonance(double mass, double fraction, double hz, double zeta = 0.05) {
+  const double m2 = fraction * mass, mu = (mass - m2) * m2 / mass;
+  const double w = 2.0 * 3.141592653589793 * hz;
+  return teleop::ComplianceParams{m2, mu * w * w, 2.0 * zeta * mu * w};
+}
+
+// Devices that are not what the controllers' model says: a rigid mass of
+// the model's size under the held force and a slowly changing push.
+struct Mismatch {
+  const char* name;
+  void (*apply)(sim::Teleop1DConfig&);
+};
+
+const Mismatch kMismatches[] = {
+    {"master half the model's mass", [](sim::Teleop1DConfig& c) {
+       c.master_model_mass = c.master.mass;
+       c.master.mass *= 0.5;
+     }},
+    {"master half beyond 100 Hz",
+     [](sim::Teleop1DConfig& c) { c.master.compliance = resonance(c.master.mass, 0.5, 100.0); }},
+    {"master 80 % beyond 50 Hz",
+     [](sim::Teleop1DConfig& c) { c.master.compliance = resonance(c.master.mass, 0.8, 50.0); }},
+    {"master 1 N Coulomb", [](sim::Teleop1DConfig& c) { c.master.friction.coulomb = 1.0; }},
+    {"slave half the model's mass", [](sim::Teleop1DConfig& c) {
+       c.slave_model_mass = c.slave.mass;
+       c.slave.mass *= 0.5;
+     }},
+    {"slave half beyond 50 Hz",
+     [](sim::Teleop1DConfig& c) { c.slave.compliance = resonance(c.slave.mass, 0.5, 50.0); }},
+    {"slave half beyond 20 Hz",
+     [](sim::Teleop1DConfig& c) { c.slave.compliance = resonance(c.slave.mass, 0.5, 20.0); }},
+    {"slave 10 N Coulomb", [](sim::Teleop1DConfig& c) { c.slave.friction.coulomb = 10.0; }},
+};
+
+}  // namespace
+
+TEST_CASE(teleop_reflective_tdpa_stays_passive_on_devices_the_model_misdescribes) {
+  // The PCs trust a prediction of the coming samples, and a device that
+  // moves otherwise than predicted makes them spend energy that does not
+  // come. Before the model error margin, on coarse encoders, a master with
+  // 80 % of its mass beyond a 50 Hz resonance generated 31 J here, and half
+  // the mass beyond 100 Hz 12 J; with exact encoders the first 1.3 J. The
+  // margin widens each prediction by what the model has lately missed. On
+  // coarse encoders, where the misses show as innovations beyond the
+  // filter's spread, nothing is generated whatever the device.
+  for (const auto& m : kMismatches) {
+    for (int ms : {10, 50, 100}) {
+      auto cfg = coarse(0.5, 0.04);
+      m.apply(cfg);
+      const auto r = run(cfg, from_millis(ms));
+      if (r.diverged || r.min_true_margin < -1e-9) {
+        std::printf("%s, %d ms: %g J\n", m.name, ms, r.min_true_margin);
+      }
+      CHECK(!r.diverged);
+      CHECK(r.min_true_margin > -1e-9);
+    }
+  }
+}
+
+TEST_CASE(teleop_reflective_tdpa_nearly_passive_on_exact_readings_of_misdescribed_devices) {
+  // With exact readings the miss of each sample is known exactly but only
+  // after the fact, and the margin is the decaying envelope of the misses
+  // seen: a miss larger than any before it is not covered. Before the
+  // margin these devices generated up to 1.3 J here and 3.9 J over nine
+  // hand motions; the worst over the nine now leaves a fifth of a
+  // millijoule.
+  for (const auto& m : kMismatches) {
+    for (int ms : {10, 50, 100}) {
+      sim::Teleop1DConfig cfg;
+      cfg.passivity = Passivity::kReflective;
+      m.apply(cfg);
+      const auto r = run(cfg, from_millis(ms));
+      if (r.diverged || r.min_true_margin < -5e-4) {
+        std::printf("%s, %d ms: %g J\n", m.name, ms, r.min_true_margin);
+      }
+      CHECK(!r.diverged);
+      CHECK(r.min_true_margin > -5e-4);
+    }
   }
 }

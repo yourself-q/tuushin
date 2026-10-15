@@ -144,10 +144,11 @@ struct Teleop1DConfig {
   double master_encoder_resolution = 0.0;
   double slave_encoder_resolution = 0.0;
   bool encoder_resolution_known = true;
-  // With known resolutions, the predictors' Kalman filters and their use
-  // by the PCs (teleop::MasterConfig): the operator's least force rate in
-  // N/s and whether the filters may raise it, and the confidence factor,
-  // the tax horizon and the rise horizons of limit_force_predictive.
+  // The predictors and their use by the PCs (teleop::MasterConfig): with
+  // known resolutions, the Kalman filters' least force rate in N/s and
+  // whether they may raise it; with any encoders, the confidence factor
+  // and the tax horizon of limit_force_predictive; with known resolutions,
+  // its rise horizons.
   double force_rate = 20.0;
   bool adapt_force_rate = true;
   double pc_confidence = 1.0;

@@ -121,20 +121,23 @@ series give about 1430 N/m.
 
 | one-way delay | no passivity control: margin | conventional TDPA: stiffness / margin | TDPA with energy reflection: stiffness / margin |
 |---|---|---|---|
-| 0 ms | 0 J | 1318 N/m / 0 J | 1470 N/m / 0 J |
-| 5 ms | −19 J | 256–508 / −1.3e−4–0 J | 1358 / 0 J |
-| 10 ms | −66 J | 97–107 / −1.2e−3 J | 1129 / 0 J |
-| 25 ms | −410 J | 38–87 / −0.055–−0.044 J | 438 / −3.9e−5 J |
-| 50 ms | −140 J | 53–106 / −0.24–−0.13 J | 202 / −3.7e−5 J |
-| 100 ms | −461 J | 75–78 / −0.17 J | 99–102 / −6.4e−5 J |
-| 200 ms | −322 J | 77 / −0.16 J | 87 / −9.3e−5 J |
+| 0 ms | 0 J | 1326 N/m / 0 J | 1492 N/m / 0 J |
+| 5 ms | −19 J | 252–656 / −2.1e−4–0 J | 1262–1263 / 0 J |
+| 10 ms | −66 J | 88–98 / −1.1e−3 J | 1026–1100 / 0 J |
+| 25 ms | −410 J | 38–66 / −0.071–−0.058 J | 391 / 0 J |
+| 50 ms | −140 J | 85–142 / −0.30–−0.20 J | 106 / 0 J |
+| 100 ms | −461 J | 62–100 / −0.26–−0.15 J | 77–83 / 0 J |
+| 200 ms | −322 J | 70–71 / −0.25 J | 74–81 / 0 J |
 
 The ranges are over twelve runs whose hand motion differs by one part in
 10^12. The conventional scheme's numbers are chaotic: every sample its PC
 cuts changes the command the slave integrates, so a rounding difference
 grows into a different trajectory (at 50 ms the final position drift lands
 anywhere between −4 and 14 mm). With energy reflection the PCs only scale
-forces and the same runs agree to the digits shown.
+forces, and the same runs agreed to the digits shown until the model error
+margin below: a margin that keeps the largest recent miss makes the force
+a discontinuous function of the history, and at 10, 100 and 200 ms the
+stiffness now spreads by up to a tenth.
 
 Without passivity control the loop generates hundreds of joules and runs
 into the force limit from 5 ms on. The conventional TDPA keeps each channel
@@ -142,9 +145,21 @@ direction passive (its channel margins stay above −2e−6 J), but not the
 two-port between the devices, because the slave's coupling controller sits
 outside it: energy the coupling spring stored and gives back looks generated
 in the backward channel and is dissipated, the conservatism Panzirsch et al.
-describe, and the displayed stiffness falls to tens of N/m. Booking the coupling inside one store
-keeps several times the stiffness up to 100 ms. Its small residual margins
-(under 0.2 mJ over 10 s) are not yet characterized.
+describe, and the displayed stiffness falls to tens of N/m. Booking the
+coupling inside one store keeps several times the stiffness up to 25 ms,
+and from 50 ms on about the same stiffness without generating energy.
+
+Its residual margins, under 0.1 mJ over 10 s at 25 to 200 ms, came from the
+predictive PCs (see *Coarse encoders* and *Model mismatch* below) trusting
+a prediction the device did not follow. A margin for the model's recent
+misses removed them, at a price in stiffness on this scenario: 7 % at 5 ms,
+half at 50 ms, a fifth at 100 ms. Over bands of delays the cost is smaller
+and not one-sided: over 8 runs at each delay in 4–20, 25–60 and 70–120 ms the
+median stiffness went from 1129, 208 and 159 N/m to 1090, 249 and 85 N/m,
+and the RMS error of the displayed against the contact force fell in all
+three bands (1.56, 2.98 and 5.90 N to 1.47, 2.61 and 5.61 N). From 70 ms on
+the master's PC acts in more than 95 % of the samples and the stiffness
+of single runs ranges from 37 to 270 N/m.
 
 ### Real time, two processes on loopback
 
@@ -153,17 +168,20 @@ scheme, 10 s sessions on macOS with the Mach time-constraint policy:
 
 | | no emulated delay | 25 ms each way (emulated) | simulator, 25 ms |
 |---|---|---|---|
-| round trip, p50 / p99.9 | 0.041 / 0.107 ms | 50.04 / 50.11 ms | — |
-| master tick lateness, p50 / max | 7 / 23 µs | 7 / 27 µs | — |
+| round trip, p50 / p99.9 | 0.041 / 0.090 ms | 50.04 / 50.09 ms | — |
+| master tick lateness, p50 / max | 6 / 26 µs | 7 / 24 µs | — |
 | samples lost | 0 | 0 | — |
-| max master position | 0.0233 m | 0.0288 m | 0.0286 m |
-| max displayed force | 5.017 N (simulator: 5.017 N) | 5.288 N | 5.398 N |
-| master / slave PC active | 3 % / 72 % | 89 % / 75 % | 89 % / 75 % |
-| min margin | 0 J | −3.6e−5 J | −3.9e−5 J |
+| max master position | 0.0231 m (simulator: 0.0231 m) | 0.0289 m | 0.0288 m |
+| max displayed force | 5.081 N (simulator: 5.080 N) | 4.89 N | 5.20 N |
+| master / slave PC active | 5 % / 81 % | 90 % / 80 % | 90 % / 80 % |
+| min margin | 0 J | 0 J | 0 J |
 
 With the same delay the real-time loop and the simulator agree to within
-2 % in position, force and how often the passivity controllers act, and
-their residual margins are of the same order. The one-way delays come from
+1 % in position and in how often the passivity controllers act, and
+neither generates energy. The peak displayed force at 25 ms differs by
+6 % (in four sessions the real-time loop's stayed within 4.89–4.90 N);
+in the simulator alone it ranges from 5.2 to 5.6 N between 24 and 27 ms,
+so it is sensitive to the exact delay. The one-way delays come from
 the echo fields and a clock fit, with no clock synchronization between the
 ends.
 
@@ -198,17 +216,24 @@ the master, the slave or both:
 
 | | 25 ms stall | 50 ms | 100 ms | random stalls at both ends |
 |---|---|---|---|---|
-| no watchdog | −8e−6 J | −0.019 J | −0.025 J | −0.006 J |
-| watchdog, two periods | −5e−5 J | −6e−5 J | −4e−5 J | 0 J |
+| no watchdog | −8.5e−3 J | −0.057 J | −0.065 J | −0.039 J |
+| watchdog, two periods | 0 J | −7e−7 J | −6e−7 J | 0 J |
 
 Random stalls: 30 per second at each end, 0.2 to 12 ms long, 200 runs; with
 the watchdog the energy books, which are the more conservative of the two,
-stay above −2e−5 J. In real time, with both nodes as threads of one process
+stay above −2e−8 J. Before the model error margin (see *Model mismatch*)
+the watchdog row read −5e−5, −6e−5, −4e−5 and 0 J, and the row without
+it −8e−6, −0.019, −0.025 and −0.006 J. That row grew through the
+trajectory, not the controller: in the worst case the force held when the
+master stalled happened to be 5.9 N instead of 4.1 N, and its work during
+the stall, which no controller checks, was 64 mJ instead of 26 mJ, while
+what the PC let go after the stall stayed about the same (5 against
+6 mJ). In real time, with both nodes as threads of one process
 without real-time priority on a laptop loaded with 10 busy processes (the
 setup of the test `nodes_run_a_session_over_loopback`), 2 of 48 sessions
 without the watchdog fell below −1 mJ (the worst to −6 mJ); with it the
 worst of 48 sessions was −1e−5 J, and of 60 under 24 busy processes
-−2e−5 J.
+−2e−5 J. (These real-time sessions ran before the model error margin.)
 
 ### Coarse encoders
 
@@ -238,8 +263,10 @@ virtual wall non-passive. Told the resolution, the controllers
   push to change from its innovations (covariance matching, Mehra, IEEE
   T-AC 1970). Told 20 N/s, the filter misses the device's displacement by
   about four of its standard deviations, told 5 N/s by fifteen, and a
-  four-sample horizon that trusts it lets the actuators generate up to
-  7 mJ at 50 ms. Adapted, it misses by about one;
+  four-sample horizon that trusts it let the actuators generate up to
+  7 mJ at 50 ms. Adapted, it misses by about one. The bound also takes in
+  what the innovations show beyond the filter's spread (see *Model
+  mismatch*), so a filter that keeps the rate it was told is safe too;
 - let a rise of the master's force go only as far as the expected motion
   could keep paying for over the next 64 samples. Without that the force
   chatters at the count rate with every constraint met: a count transition
@@ -267,31 +294,98 @@ tax as before):
 
 | one-way delay | worst true margin: resolution known | not known | exact encoders | force displayed: known | no rise hold | tax prepaid | exact encoders |
 |---|---|---|---|---|---|---|---|
-| 10 ms | 0 J | −4.8e−4 J | 0 J | 78 % | 40 % | 32 % | 77 % |
-| 50 ms | 0 J | −0.79 J | −1.4e−4 J | 16 % | 17 % | 12 % | 29 % |
-| 100 ms | 0 J | −1.14 J | −1.3e−4 J | 11 % | 8 % | 4 % | 13 % |
+| 10 ms | 0 J | −7.5e−6 J | 0 J | 92 % | 28 % | 32 % | 84 % |
+| 50 ms | 0 J | −7.5e−6 J | 0 J | 17 % | 13 % | 12 % | 26 % |
+| 100 ms | 0 J | −4.0e−6 J | 0 J | 10 % | 7 % | 4 % | 12 % |
 
 *True margin* is minus the work the actuators really did, which the books
 see only through the encoders. *Force displayed* is the force on the master
 in contact as a share of the contact force one delay earlier.
 
 Treating the readings as exact, the predictor differentiates quantization
-noise and the teleoperator generates up to a joule. Knowing the
-resolution, it generates nothing, also under the loop stalls above
-(`tests/test_teleop_stall.cpp`), and with the filter told a fifth of the
-default rate. The price is transparency at long delays. At 10 ms the
-operator feels as much of the contact force as with exact encoders, at
-50 ms a little over half of it, at 100 ms 87 %. On the six motions fast
-enough to pay a prepaid tax the master conveys 79, 18 and 13 %, against
-47, 18 and 6 % with the tax prepaid. The displayed force still chatters
-more than with exact encoders at 50 and 100 ms: its total variation is
-1.8 and 2.4 times theirs (and half of it at 10 ms), down from 4.4 and
-5.1 times without the rise hold, which removes 53 to 70 % of it. The hold
-costs slower hands some force: on motions of 0.15 to 0.3 Hz it doubles
-the share conveyed at 10 ms but lowers it by a sixth to a quarter at 50
-and 100 ms. The books, which pay the worst case of every rise, end at
-most 1.9 mJ below the true margin, against 7.8 mJ with the prepaid
-tax.
+noise. Before the model error margin the teleoperator then generated up
+to a joule (−4.8e−4, −0.79 and −1.14 J); now the noise shows as model
+error, the master's first force generates a few microjoules once, and
+after it the master displays nothing: the wall is not felt, but nothing
+is generated either. Knowing the resolution, it generates nothing, also
+under the loop stalls above (`tests/test_teleop_stall.cpp`), with the
+filter told a fifth of the default rate, and on the misdescribed devices
+below. The price is transparency at long delays. At 10 ms the operator
+feels more of the contact force than with exact encoders, at 50 ms 65 %
+of it, at 100 ms 80 %. On the six motions fast enough to pay a prepaid
+tax the master conveys 90, 18 and 9 %, against 47, 18 and 6 % with the
+tax prepaid. The displayed force still chatters more than with exact
+encoders at 50 and 100 ms: its total variation is 1.8 and 2.3 times
+theirs (and half of it at 10 ms), down from 3.5 and 4.0 times without the
+rise hold, which removes 43 to 62 % of it. Slower hands pay more for the
+resolution: on motions of 0.15 to 0.3 Hz the master conveys 63, 14 and
+12 %, against 111, 74 and 46 % with exact encoders. The rise hold is not
+what costs them: it more than triples the share at 10 ms, leaves it at
+50 ms and raises it by a quarter at 100 ms (before the model error margin
+it lowered it by a sixth to a quarter at 50 and 100 ms). The books, which pay the worst case of
+every rise, fall at most 0.3 mJ below zero, against 7.8 mJ with the
+prepaid tax.
+
+### Model mismatch
+
+The predictive PCs trust a model of each device, a rigid mass under a
+slowly changing push, over the next few samples. A real device is not
+one: its links bend, which puts part of its mass behind a resonance; it
+has friction; its mass is known only roughly. Where the device moves
+otherwise than predicted, the PC spends energy on inputs that do not
+come, and the longer its horizon, the more.
+
+The PCs now widen each prediction by what the model has lately missed,
+grown as n² over n samples as an unmodeled force would:
+
+- with coarse encoders, by what the filter's innovations show beyond its
+  own spread, ν² − S averaged over 50 ms (Mehra's covariance matching
+  again, applied to the residual). The misses hide among the reading
+  errors, so they have to be averaged out;
+- with exact readings, by the envelope of the squared misses, decaying
+  over 50 ms. Each miss is known exactly after its sample, and there is
+  nothing to average.
+
+With exact readings too, a rise of the force must then repay any deficit
+of the books over the tax horizon, so that a deficit the margin came too
+late to prevent is not added to.
+
+Worst true margin over nine hand motions, 20 s each, 10, 50 and 100 ms
+each way (reflective scheme; coarse: 55 µm master, 1 µm slave), before
+and after the margin:
+
+| device | coarse encoders, before | after | exact readings, before | after |
+|---|---|---|---|---|
+| as modelled | 0 J | 0 J | −1.4e−4 J | 0 J |
+| master, model twice its mass | 0 J | 0 J | −0.64 J | 0 J |
+| master, half its mass beyond 100 Hz | −77 J | 0 J | −0.78 J | −2e−8 J |
+| master, 80 % of its mass beyond 50 Hz | −67 J | 0 J | −3.9 J | −1.9e−4 J |
+| master, 1 N Coulomb friction | −2.2e−4 J | 0 J | −3.5e−4 J | −2.3e−7 J |
+| slave, model twice its mass | −0.018 J | 0 J | −0.016 J | −5.9e−5 J |
+| slave, half its mass beyond 50 Hz | −0.014 J | 0 J | −0.018 J | −8.5e−6 J |
+| slave, half its mass beyond 20 Hz | −1.8e−4 J | 0 J | −0.034 J | −1.1e−4 J |
+| slave, 10 N Coulomb friction | −4.7e−4 J | 0 J | −4.2e−4 J | −1.3e−5 J |
+
+The mass rows halve the device's true mass under an unchanged model.
+`tuushin-sim --master-compliance 0.8,50`, `--master-friction 1` and their
+`--slave-*` counterparts set up the others, and `--model-mass 0.4` the
+same ratio on the default master; `tests/test_teleop1d.cpp` checks all
+eight on one motion. Resonances are damped at 5 % of critical.
+
+With coarse encoders nothing is generated on any of them. With exact
+readings the margin covers misses like those it has seen, not one larger
+than any before it, so a little remains, at most 0.19 mJ where it was
+3.9 J. Before the margin the force on the worst devices was mostly
+chatter: with exact readings and 80 % of the master's mass beyond 50 Hz
+its total variation was 3100 to 4600 N/s and its RMS error 4 to 11 times
+the contact force; with the margin 44 to 96 N/s and under 1. On the
+devices as modelled, with exact readings, the master conveys 84, 26 and
+12 % of the contact force at 10, 50 and 100 ms (77, 29 and 13 % before)
+and its force varies a little less. The cost shows in the stiffness on
+the default scenario (Simulation, above). A margin kept per direction of
+the force recovered that stiffness but let the 80 % master generate
+eight times as much; shorter memories of 20, 10 or 5 ms did not recover
+it.
 
 ## Authentication
 
@@ -620,13 +714,23 @@ the slave kept sending to the master's port for the old relay.
   slave has seen; with `--hello-state`, across restarts too, so delete the
   file if a clock ran far ahead.
 - **Coarse encoders cost transparency.** With a 55 µm master encoder the
-  teleoperator stays passive and at 10 ms conveys as much of the contact
-  force as with exact encoders, but at 50 and 100 ms only 56 and 87 % of
-  what they convey, and the force chatters about twice as much (Coarse
-  encoders above). A hand pressing into the wall slower than about q/(4 dt),
+  teleoperator stays passive and at 10 ms conveys at least as much of the
+  contact force as with exact encoders, but at 50 and 100 ms only 65 and
+  80 % of what they convey, and the force chatters about twice as much
+  (Coarse encoders above). Slower hands lose more: at 0.15 to 0.3 Hz the
+  master conveys a fifth to three fifths of what it would with exact
+  encoders. A hand pressing into the wall slower than about q/(4 dt),
   1.4 cm/s on a Touch, still never starts a force. A longer tax horizon
   lowers that threshold (eight samples started a force on a hand peaking
-  at 0.94 cm/s) but in our runs let the actuators generate a few µJ.
+  at 0.94 cm/s) but in our runs let the actuators generate about a
+  microjoule.
+- **Exact readings of a misdescribed device are covered nearly, not
+  entirely.** The model error margin covers misses like those already
+  seen; a miss larger than any before it is not, and over nine hand
+  motions a master with 80 % of its mass beyond a 50 Hz resonance still
+  generated 0.19 mJ (Model mismatch above). Coarse encoders, whose
+  misses show among the innovations, generated nothing on the same
+  devices.
 - **Simulated devices only, one degree of freedom.** `teleop::Device1D` is
   the interface a real device will implement.
 - **Only the slave takes a relay, over UDP.** One relay is enough to cross
@@ -681,6 +785,15 @@ The code cites its sources where it uses them. The main ones:
   delayed coupled network systems", Mechatronics 58, 2019.
 - J.-H. Ryu, Y. S. Kim and B. Hannaford, "Sampled- and continuous-time
   passivity and stability of virtual environments", IEEE T-RA 20(4), 2004.
+- J. J. Abbott and A. M. Okamura, "Effects of position quantization and
+  sampling rate on virtual-wall passivity", IEEE T-RO 21(5), 2005, for why
+  coarse encoders break the books; P. R. Belanger, P. Dobrovolny,
+  A. Helmy and X. Zhang, "Estimation of angular velocity and acceleration
+  from shaft-encoder measurements", IJRR 17(11), 1998, for the Kalman
+  filter on encoder readings; R. K. Mehra, "On the identification of
+  variances and adaptive Kalman filtering", IEEE T-AC 15(2), 1970, for
+  covariance matching, which tunes the filter and sizes the model error
+  margin.
 - P. Hinterseer, S. Hirche, S. Chaudhuri, E. Steinbach and M. Buss,
   "Perception-based data reduction and transmission of haptic data in
   telepresence and teleaction systems", IEEE Trans. Signal Processing 56(2), 2008.

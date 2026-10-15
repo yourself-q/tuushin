@@ -62,15 +62,16 @@ struct MasterConfig {
   // instead of the backward difference (control/predictive_pc.hpp).
   // `force_rate` (N/s) is how fast the filter expects the operator's push
   // to change; with `adapt_force_rate` it is the least, and the filter
-  // raises it as far as its innovations show it to be overconfident. The
-  // PC then predicts with the lower bound of `pc_confidence` standard
-  // deviations, and a rise of the force repays its tax over
-  // `pc_tax_samples` samples instead of within the coming one, which a
-  // master pressed slower than a count per sample cannot pay. A rise also
-  // goes no further than the force the expected motion could pay for over
-  // `pc_rise_samples` samples, so that the force does not rise on every
-  // count transition and decay before the next, paying the tax each time
-  // (0 lets it).
+  // raises it as far as its innovations show it to be overconfident.
+  // With or without a resolution the PC predicts with the lower bound of
+  // `pc_confidence` standard deviations, which include what the model has
+  // lately missed, and a rise of the force repays any deficit of the books
+  // over `pc_tax_samples` samples. So does the tax, instead of within the
+  // coming sample, which a master pressed slower than a count per sample
+  // cannot pay. With a resolution a rise also goes no further than the
+  // force the expected motion could pay for over `pc_rise_samples` samples,
+  // so that the force does not rise on every count transition and decay
+  // before the next, paying the tax each time (0 lets it).
   double encoder_resolution = 0.0;
   double force_rate = 20.0;
   bool adapt_force_rate = true;

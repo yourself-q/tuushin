@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cmath>
+
 #include "tuushin/control/tdpa.hpp"
 
 namespace tuushin::control {
@@ -49,10 +51,14 @@ namespace tuushin::control {
 //    behaviour gradient-limited passivity controllers are designed to have;
 //    here it falls out of the device dynamics.
 //  * The mass is a model parameter. Underestimating it overestimates the
-//    device's response and makes the controller more conservative; in the
-//    1-DoF simulator (sim/teleop1d.hpp, reflective scheme, 10-100 ms) half
-//    the true mass and +-20 % keep the deficit below 0.1 mJ, twice the true
-//    mass lets it reach tens of mJ. When in doubt, err light.
+//    device's response and makes the controller more conservative;
+//    overestimating it lets the controller expect inputs that do not come.
+//    The model error margin (see "Model error") covers either once the
+//    misses show: in the 1-DoF simulator (sim/teleop1d.hpp, reflective
+//    scheme, default scenario, exact readings, 10-100 ms) half to twice
+//    the true mass keep the deficit below 1 uJ, where without the margin
+//    half the true mass and +-20 % left 0.1 mJ and twice the true mass at
+//    the master 0.14 J. When in doubt, err light.
 //
 // Holding horizon. The largest force with W >= -budget over one sample is,
 // without budget, the force that brings the device's mean displacement over
@@ -183,7 +189,45 @@ namespace tuushin::control {
 // on its readings it is still 38 N/s five seconds later and 9 N/s after
 // twenty. Reading errors replaced by white noise of the same variance give
 // the same, so it is not their correlation. The slow side is the safe one:
-// a rate too high costs transparency, not passivity.
+// a rate too high costs transparency, not passivity. Passivity no longer
+// rests on the adaptation either: with the model error margin below, the
+// rate fixed at 5 N/s generates nothing.
+//
+// Model error. The model is a rigid mass under a slowly changing push, and
+// a real device is not one: its links bend, putting part of its mass behind
+// a resonance; it has friction; its mass is known only roughly. Where it
+// moves otherwise than predicted, a horizon of several samples spends
+// energy on inputs that do not come. In the simulator, before the margin, a
+// master with 80 % of its mass beyond a 50 Hz resonance let the
+// teleoperator generate 66 J on coarse encoders and 3.9 J on exact ones.
+// hold_sd() therefore adds what the model has lately missed over a sample,
+// model_error(), grown as n^2 over n samples as an unmodeled force would.
+// Its estimate depends on the readings:
+//
+//  * With a resolution the misses hide among the reading errors, and the
+//    margin is what the innovations show beyond the filter's own spread:
+//    the running mean of nu^2 - S over 50 ms, its positive part. This is
+//    Mehra's covariance matching again, applied to the residual instead of
+//    the random walk; a consistent filter keeps it at zero.
+//  * With exact readings each miss is known exactly, after its sample, and
+//    there is nothing to average out: the margin is the envelope of the
+//    squared misses, decaying with a time constant of 50 ms. It covers
+//    misses like those already seen, not one larger than any before it.
+//
+// The tax horizon then serves exact readings too: a rise must repay any
+// deficit of the books from the work predicted, less the margin, over
+// tax_samples samples. Without that, a deficit the margin came too late to
+// prevent stays and the next rise may add to it.
+//
+// The margin costs stiffness where the model is right but the motion is
+// hard to predict. On the default scenario with exact readings the
+// displayed stiffness of the reflective scheme fell by 3 to 9 % at 5 and
+// 10 ms, 11 % at 25 ms, half at 50 ms and 6 to 22 % at 100 and 200 ms,
+// where residual deficits of 0.04 to 0.09 mJ went to zero. A margin kept
+// per direction of the force recovered the stiffness but let the worst
+// misdescribed device generate eight times as much; a shorter memory (20,
+// 10 or 5 ms), or a margin on one side of the prediction only, did not
+// recover it.
 //
 // Rises that cannot last. With a coarse encoder the master's force chatters
 // with every constraint met: a count transition shows the hand moving into
@@ -205,18 +249,23 @@ namespace tuushin::control {
 // conveyed from 17 to 11 %.
 //
 // Measured in the 1-DoF simulator (reflective scheme, 55 um master and 1 um
-// slave encoders, 20 s over nine hand motions): with the filter, the tax and
-// the ports paying their own excess first (control/tdpa.hpp), the actuators
-// never generate energy at 10, 50 or 100 ms each way. Controllers that take
-// the readings as exact let the teleoperator generate up to 0.5 mJ, 0.8 J
-// and 1.1 J. The price is transparency: with adaptation, confidence 1, the
-// tax repaid over four samples and rises held over 64 the master conveys
-// 78, 16 and 11 % of the contact force at 10, 50 and 100 ms, against 77, 29
-// and 13 % with exact encoders, and its force varies 0.5, 1.8 and 2.4 times
-// as much. Without the rise hold it conveyed 40, 17 and 8 % and its force
-// varied 1.6, 4.4 and 5.1 times as much. With the tax prepaid as well it
-// conveyed 32, 12 and 4 %, and nothing at all on the three motions too slow
-// to pay it.
+// slave encoders, 20 s over nine hand motions): with the filter, the tax,
+// the model error margin and the ports paying their own excess first
+// (control/tdpa.hpp), the actuators never generate energy at 10, 50 or
+// 100 ms each way, on the nominal devices and on the eight misdescribed
+// ones of tests/test_teleop1d.cpp (half the model's mass, half or 80 % of
+// the mass beyond a resonance, Coulomb friction). Controllers that take the
+// readings as exact let the teleoperator generate up to 0.5 mJ, 0.8 J and
+// 1.1 J before the margin; with it, the quantization shows as model error,
+// and they generate 7.5 uJ, once, with the first force, and display
+// nothing after. The price of the resolution is transparency: with
+// adaptation, confidence 1, the tax repaid over four samples and rises
+// held over 64 the master conveys 92, 17 and 10 % of the contact force at
+// 10, 50 and 100 ms, against 84, 26 and 12 % with exact encoders, and its
+// force varies 0.5, 1.8 and 2.3 times as much. Without the rise hold it
+// conveyed 28, 13 and 7 % and its force varied 1.2, 3.5 and 4.0 times as
+// much. With the tax prepaid as well it conveyed 32, 12 and 4 %, and
+// nothing at all on the three motions too slow to pay it.
 //
 // Sign convention: power into the controlled two-port is phi * dx, and the
 // device accelerates by -phi / m. At a haptic master phi is the displayed
@@ -269,9 +318,13 @@ class DevicePredictor {
     return hold_base(n) - hold_compliance(n) * phi;
   }
   double hold_work(double phi, double n) const { return phi * hold_displacement(phi, n); }
-  // Standard deviation of hold_displacement() from the Kalman filter's
-  // uncertainty about v and H; 0 without a resolution.
+  // Standard deviation of hold_displacement(): with a resolution, from the
+  // Kalman filter's uncertainty about v and H; either way, from the model
+  // error, n^2 model_error().
   double hold_sd(double n) const;
+  // How far the model has lately missed the displacement over a sample,
+  // beyond what the reading error explains, in m (see "Model error").
+  double model_error() const { return std::sqrt(miss_); }
 
   // Estimates recovered from the history (or the Kalman filter, with a
   // resolution): everything acting on the device except the port force (the
@@ -302,6 +355,11 @@ class DevicePredictor {
   double log_walk_ = 0.0;  // log of the factor adaptation applies to h_walk_
   double e_ = 0.0, v_ = 0.0, h_ = 0.0;
   double p_[3][3] = {};
+  // Model error, in m^2: with exact readings the decaying envelope of the
+  // squared miss; with a resolution the positive part of excess_, the
+  // running mean of nu^2 - S.
+  double miss_ = 0.0;
+  double excess_ = 0.0;
 };
 
 // Energy (J) to book as an output when the port force goes from `prev`, the
@@ -321,9 +379,11 @@ double quantization_tax(double q, double prev, double phi);
 // above -budget (budget in J; negative values count as zero). With an
 // encoder resolution the quantization tax of moving from the held force to
 // the result counts as well: against each of those predictions when
-// `tax_samples` is 0, and otherwise only for a rise beyond the held force,
-// which must repay it and any deficit (a negative budget) from the work
-// predicted over `tax_samples` samples. With a resolution and
+// `tax_samples` is 0, and otherwise only for a rise beyond the held force.
+// With `tax_samples` > 0, with or without a resolution, such a rise must
+// repay its tax and any deficit (a negative budget) from the work
+// predicted over `tax_samples` samples, less `confidence` standard
+// deviations. With a resolution and
 // `rise_samples` > 0 such a rise also goes no further than the expected
 // work over `rise_samples` samples can pay for. The result's gain is the
 // fraction of the requested force that was removed, 1 - lambda. While the
