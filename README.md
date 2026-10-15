@@ -24,11 +24,11 @@ and also tested on Linux (Ubuntu 24.04, GCC 13.3). MIT licensed.
 | `control/` | Time Domain Passivity Approach (TDPA): passivity observers and controllers in the conventional two-channel form, and the variant that books energy reflection at a slave-side position coupling in one store (Panzirsch, Ryu and Ferre 2019, "Approach 3"). The passivity controllers predict the work a zero-order-held force will do on a light device instead of assuming constant velocity. |
 | `codec/` | Perceptual deadband data reduction (Weber's law, Hinterseer et al. 2008). |
 | `teleop/` | Master and slave controllers, the device interface (`Device1D`) with simulated devices, `HapticLink` (one end of a session over UDP), and real-time master and slave nodes. |
-| `net/` | UDP sockets with kernel receive timestamps and hop-limited sends, clock-skew estimation from four-timestamp exchanges, channel models (fixed delay, jitter, Gilbert-Elliott loss, bottleneck queue, recorded traces), path measurement with probes and a reflector, and a rendezvous server and client for ends behind NATs (see NAT traversal below). |
+| `net/` | UDP sockets with kernel receive timestamps and hop-limited sends, clock-skew estimation from four-timestamp exchanges, channel models (fixed delay, jitter, Gilbert-Elliott loss, bottleneck queue, recorded traces), path measurement with probes and a reflector, a rendezvous server and client for ends behind NATs, and STUN messages and a TURN client (RFC 8656) for a relayed path where no direct one opens (see NAT traversal below). |
 | `wire/` | The datagram format: a 32-byte header whose echo fields let each end measure the round trip from ordinary traffic, as RTCP does. |
-| `crypto/` | A Noise_NNpsk0 handshake and ChaCha20-Poly1305 on libsodium: a pre-shared key becomes fresh keys for every session, and every datagram is authenticated and encrypted (see Authentication below). |
+| `crypto/` | A Noise_NNpsk0 handshake and ChaCha20-Poly1305 on libsodium: a pre-shared key becomes fresh keys for every session, and every datagram is authenticated and encrypted (see Authentication below). SHA-1, HMAC-SHA1 and MD5, only because STUN and TURN require them. |
 | `sim/` | A deterministic 1-DoF teleoperation simulator built on the same controllers and devices. |
-| `tools/` | `tuushin-sim`, `tuushin-teleop` (master, slave and rendezvous server as separate processes), `tuushin-probe` (measure a path, write replayable traces), `nat_lab.sh` (master and slave behind Linux NATs in network namespaces). `tests/sim_nat.hpp` is a NAT in user space for tests on any system. |
+| `tools/` | `tuushin-sim`, `tuushin-teleop` (master, slave and rendezvous server as separate processes), `tuushin-probe` (measure a path, write replayable traces), `nat_lab.sh` (master and slave behind Linux NATs in network namespaces, with coturn as a relay). `tests/sim_nat.hpp` and `tests/sim_turn.hpp` are a NAT and a TURN server in user space for tests on any system. |
 
 ## Build and test
 
@@ -82,6 +82,19 @@ a host both can reach, and need no forwarded port:
 ./build/tools/tuushin-teleop slave --key-file haptic.key --rendezvous SERVER
 ./build/tools/tuushin-teleop master --key-file haptic.key --rendezvous SERVER
 ```
+
+Where both NATs give every destination its own port (symmetric NATs), no
+direct path opens. Give the slave a relay on a TURN server, coturn for
+instance, with long-term credentials; the password is read from a file so
+that it does not show in `ps`:
+
+```sh
+./build/tools/tuushin-teleop slave --key-file haptic.key --rendezvous SERVER \
+    --turn TURNSERVER --turn-user NAME --turn-pass-file turn.pass
+```
+
+The master needs nothing more: the rendezvous server tells it of the
+relay, and it tries the relay when its direct hellos go unanswered.
 
 Measure a real path and replay it:
 
@@ -291,8 +304,8 @@ next one gets through. This is UDP hole punching (Ford, Srisuresh and
 Kegel 2005; RFC 5128) and the core of ICE (RFC 8445), simplified:
 
 - The candidates are the address the server saw and the host's own
-  addresses (for two ends on one LAN, whose router may not hairpin). There
-  are no relayed candidates (TURN).
+  addresses (for two ends on one LAN, whose router may not hairpin), and,
+  with `--turn`, the slave's relayed address (Through a relay, below).
 - The connectivity check is the haptic handshake. The master sends its
   hello to every candidate of the slave and takes the first reply that
   authenticates; the slave sends small punch datagrams to the master's
@@ -362,11 +375,78 @@ session:
 | the master 100 ms behind a NAT that accepts them, `--prime-hops 0` | fails: the NAT moved the master to another port | — |
 | the same, primed, with one router between the NATs | fails: the primes reach the other NAT, with one hop to live | — |
 | the same with `--prime-hops 2` | connects | 2.96 s |
-| a symmetric NAT (a new port per destination) at either end or both | fails | — |
+| a symmetric NAT (a new port per destination) at either end or both | fails without a relay (Through a relay, below) | — |
 
 The slave punches until its session starts, so an end 100 ms behind its
 NAT still receives the last few punches during the session; they are
 dropped before the link and not counted as `foreign`.
+
+### Through a relay
+
+Behind a NAT that gives every destination its own outside port
+(endpoint-dependent mapping, a "symmetric" NAT), the port the server saw
+is not the one the other end would be let in on, and what that end's
+datagrams come from is a port nobody was told of; the other NAT filters
+them. No ordering helps (the table's last row). With `--turn`, the slave
+allocates an address on a TURN server (RFC 8656) from a second socket and
+announces it through the rendezvous server as one more candidate. The TURN
+server passes on to the slave what reaches that relayed address from any
+IP address the slave has given a permission, and sends from it what the
+slave asks it to (`net/turn.hpp`, `net/paths.hpp`):
+
+- **One relay crosses both NATs.** To the master the relayed address is an
+  ordinary public one: its hello goes there from whatever port its NAT
+  picks, and the slave's answer comes back from the address the hello went
+  to, which that NAT lets in. Permissions are per IP address, without the
+  port, which is what makes this work against a symmetric NAT at the
+  master: the port is unknown in advance, but the address is the one the
+  rendezvous server saw. The slave's own NAT sees a single destination,
+  the TURN server. So only the slave takes a relay, and the master has no
+  TURN client.
+- **Direct first.** The master sends its hellos to the slave's own
+  candidates first and to the relay 1 s later
+  (`RendezvousConfig::relay_delay`); a direct path that opens answers well
+  within that. It takes the first reply that authenticates, and the session
+  stays on that path.
+- **The relay carries only sealed datagrams.** TURN authenticates the
+  slave's requests with its long-term credentials (MESSAGE-INTEGRITY, RFC
+  8489, 9.2), and the client accepts a response to them only with a valid
+  MAC. It does not protect the data, which the session's keys seal anyway:
+  the TURN server learns the ends' addresses and when they talk, as the
+  rendezvous server does, and its operator never needs the haptic key.
+- **It costs a detour and 4 bytes.** Datagrams go in ChannelData messages
+  (4 bytes more each) once a channel to the master is bound, in Send
+  indications (36 bytes) before. The round trip is the master's to the
+  relay plus the relay's to the slave. The relay's socket carries the
+  direct socket's DSCP mark.
+- **It keeps the allocation alive.** A Refresh every 15 s keeps the slave's
+  NAT mapping to the TURN server (a NAT may forget it after 30 s of
+  silence) and shows when the allocation is lost: the server answers 437
+  when it no longer knows the slave's address. The slave then allocates
+  again and announces the new relayed address. When the master falls
+  silent, the slave checks at once rather than at the next Refresh.
+
+The client is tested against coturn 4.6.1 in the lab (`nat_lab.sh --turn`
+runs one, with long-term credentials, next to the rendezvous server) and
+against `tests/sim_turn.hpp` in the unit tests; its STUN messages against
+the test vectors of RFC 5769. In the same lab, with 2 s sessions; the TURN
+server sits by the rendezvous server, on the middle router's own 5 ms
+link, which a relayed datagram crosses twice:
+
+| scenario | path | time | round trip, p50 |
+|---|---|---|---|
+| cone NATs | direct | 2.14 s | 20.1 ms |
+| cone NATs, the slave with a relay | direct: the relay is not used | 2.14 s | 20.1 ms |
+| both behind one NAT, the slave with a relay | direct, over the LAN | 2.09 s | 0.02 ms |
+| the slave's NAT symmetric, no relay | fails | — | — |
+| the slave's NAT symmetric | relayed | 3.19 s | 40.5 ms |
+| the master's NAT symmetric | relayed | 3.20 s | 40.4 ms |
+| both symmetric | relayed | 3.19 s | 40.4 ms |
+| both symmetric, the master starts 0.5 s before the slave | relayed | 3.69 s | 40.4 ms |
+
+No sample was lost in any of them. A relayed session starts about 1 s
+later than a direct one: the master waits `relay_delay` before it tries
+the relay.
 
 ### When an end moves
 
@@ -393,6 +473,15 @@ repair this:
   now lets the moved end's datagrams in, and its link follows them. This
   needs the rendezvous server; between two fixed addresses the link alone
   follows.
+- **The punches are copies of the last sample.** A rejoining end punches
+  with copies of the last datagram its link sent, sealed like any other.
+  They open its own NAT as a punch would, and they also authenticate, so
+  the other end's link follows the punching end to the port its NAT sent
+  them from. That matters where that NAT gives every destination its own
+  port: the punch towards the moved end leaves from a port nobody was told
+  of, and the moved end would otherwise keep answering to the old one. A
+  copy has the sequence number of the sample it copies, so where the old
+  path still works it is a duplicate, and nothing moves.
 
 `tests/sim_nat.hpp` is a NAT in user space for loopback tests (with RFC
 4787's mapping and filtering behaviours): when the slave's NAT forgets its
@@ -415,6 +504,24 @@ away: the moved end's first datagrams reach the other NAT before anyone
 knows it moved, and conntrack keeps their flow while they keep coming.
 A firewall that drops or rejects them, as nearly every router has, keeps
 conntrack from recording them.
+
+Through a relay (`--turn --rebind-at 2`, since a relayed session starts
+about 1.2 s after the master), natB's flush takes the slave's mapping to the TURN server with the
+others. The slave, hearing nothing, refreshes at once; the TURN server
+answers 437 to the new address; the slave allocates again and announces
+the new relayed address, the master punches towards it, and the links
+follow:
+
+| scenario | result | samples lost, master / slave |
+|---|---|---|
+| the slave's NAT symmetric | the master's link follows the slave to the new relay | 173 / 214 |
+| the master's NAT symmetric | both links follow: the master's copies come from a new port | 216 / 256 |
+| both NATs symmetric | the same | 213 / 252 |
+| cone NATs (the relay unused) | as without a relay | 112 / 131 |
+
+The new allocation costs 60 to 100 samples more than a direct move. With
+both NATs symmetric the session was lost before the punches were copies:
+the slave kept sending to the master's port for the old relay.
 
 ## Known issues
 
@@ -442,17 +549,26 @@ conntrack from recording them.
   input it predicted mostly never comes.
 - **Simulated devices only, one degree of freedom.** `teleop::Device1D` is
   the interface a real device will implement.
-- **No relay.** Hole punching fails where a NAT gives every destination its
-  own port (a symmetric NAT, at either end, in the lab), and there is no
-  relayed path (TURN) to fall back to: the master reports that no
-  authenticated reply came. In the IPFS network, Trautwein et al. found
-  about 30 % of hole-punching attempts fail.
+- **Only the slave takes a relay, over UDP.** One relay is enough to cross
+  both NATs, but a slave without one cannot be reached through a symmetric
+  NAT, and a master cannot offer a relay of its own. There is no TURN over
+  TCP or TLS for networks that block UDP. The credentials are long-term
+  ones; for coturn's time-limited credentials (its `use-auth-secret`),
+  compute the user name and password outside and pass them in.
+- **A relayed session stays relayed.** Nothing moves a running session to a
+  direct path that opens later, as ICE's continued checks would. Every
+  master the rendezvous server announces gets a permission on the relay,
+  and keeps it until the next allocation.
+- **A move during the handshake is not followed.** The rejoin starts with
+  the session, and a relayed session starts more than a second after the
+  master (it waits `relay_delay`): the lab's `--turn --rebind-at 1` loses
+  it.
 - **`--prime-hops` is a guess about the path.** Two ends a few hops apart
   need a smaller value, or the primes reach the other NAT (the lab's one-
   router case); nothing measures the hop count yet.
 - **A move costs about 100 ms plus a round trip to the server** (When an end
-  moves, above), during which the ends hear nothing from each other, as in
-  any outage. Behind a NAT that
+  moves, above), about 200 ms through a relay, during which the ends hear
+  nothing from each other, as in any outage. Behind a NAT that
   accepts datagrams addressed to itself, the end that did not move cannot
   take the moved one back at all; its session ends.
 - **Host candidates are taken once.** An end that changes network keeps
@@ -466,8 +582,8 @@ conntrack from recording them.
 
 - Traces of real paths (fibre, 4G and 5G in Japan) recorded with
   `tuushin-probe`, published so that any simulator or testbed can replay them.
-- A relay for ends behind symmetric NATs and a measured hop count for
-  priming; then QUIC datagrams as a transport.
+- A measured hop count for priming; a relayed session that moves to a
+  direct path once one opens; then QUIC datagrams as a transport.
 - Deadbands that adapt to the measured delay; more degrees of freedom; a real
   device behind `Device1D`.
 
@@ -501,6 +617,10 @@ The code cites its sources where it uses them. The main ones:
   punching; A. Keranen, C. Holmberg and J. Rosenberg, RFC 8445 (ICE), for
   candidates and connectivity checks; F. Audet and C. Jennings, RFC 4787,
   for the terms of NAT behaviour.
+- T. Reddy, A. Johnston, P. Matthews and J. Rosenberg, RFC 8656 (TURN), and
+  M. Petit-Huguenin, G. Salgueiro, J. Rosenberg, D. Wing, R. Mahy and
+  P. Matthews, RFC 8489 (STUN), for the relay and its long-term
+  credentials; R. Denis-Courmont, RFC 5769, for STUN's test vectors.
 - D. Trautwein, C. Ihle, M. Schubotz and B. Gipp, "Challenging tribal
   knowledge: large scale measurement campaign on decentralized NAT
   traversal", arXiv:2510.27500, 2025, for priming with low-TTL datagrams
