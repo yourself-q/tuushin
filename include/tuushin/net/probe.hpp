@@ -159,17 +159,24 @@ class OneClockDirection {
     Nanos sent = 0;
     Nanos received = -1;  // first arrival; -1 if none
     int duplicates = 0;   // further arrivals of the same probe
+    bool unsent = false;  // the send call failed, so the probe never left
   };
 
   // Header of the next probe, sent at `t`.
   wire::Header next(Nanos t);
+
+  // Marks the probe last handed out by next() as never sent: its send call
+  // failed. Such a probe counts as neither sent nor lost.
+  void mark_unsent();
 
   // Feeds a datagram received at `t`. Returns true if it was one of this
   // direction's probes.
   bool on_datagram(const std::uint8_t* data, std::size_t size, Nanos t);
 
   std::uint32_t session() const { return session_; }
+  // Probes handed out by next(), unsent ones included.
   std::size_t sent() const { return records_.size(); }
+  std::size_t unsent() const { return unsent_; }
   std::size_t received() const { return received_; }
   std::size_t stray() const { return stray_; }
   // Indexed by probe seq - 1.
@@ -178,16 +185,24 @@ class OneClockDirection {
  private:
   std::uint32_t session_;
   std::vector<Record> records_;
+  std::size_t unsent_ = 0;
   std::size_t received_ = 0;
   std::size_t stray_ = 0;
 };
 
 struct OneClockReport {
-  DirectionReport dir;
+  DirectionReport dir;      // sent and lost leave out the unsent probes
   std::size_t duplicates = 0;
-  Trace trace;
+  std::size_t unsent = 0;   // probes whose send call failed
+  std::size_t in_flight = 0;  // losses just before `until`, left out
+  Trace trace;              // no entry for an unsent or left-out probe
 };
 
-OneClockReport analyze_one_clock(const OneClockDirection& d);
+// Probes sent at or after `until` are left out of the report and the trace,
+// for a run cut short where one of its ends went away: what the other end
+// sent after that is not the path's loss. So is the run of losses leading
+// up to `until`, back to the longest delay seen, as those probes may have
+// been in flight to the end when it went.
+OneClockReport analyze_one_clock(const OneClockDirection& d, Nanos until = INT64_MAX);
 
 }  // namespace tuushin::net

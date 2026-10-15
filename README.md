@@ -980,6 +980,12 @@ and the reverse.
 - Then both directions are probed at the same rate and stamped by the
   kernel on arrival; `PREFIX.ab.csv` and `PREFIX.ba.csv` are traces for
   `tuushin-sim` and `tuushin-netreplay`. They record no address.
+- A probe whose send call fails never left, so it counts as neither sent
+  nor lost. When every send through one end fails for a second, the end
+  has gone away (a phone unplugged takes its interface with it), and the
+  run ends where the failures began: what follows is not the path's loss,
+  nor are the losses just before it, back to the longest delay seen, as
+  those probes may have been on their way to the end when it went.
 
 `tools/pair_lab.sh` puts each of two interfaces of one network namespace
 behind its own NAT, the NATs meet in a router that runs coturn as the STUN
@@ -999,6 +1005,41 @@ On Linux, strict reverse-path filtering (`rp_filter` 1) drops what
 arrives on the second interface from addresses the first one routes to,
 which is all of them; loose filtering (2) lets it in. A Linux host also
 needs a default route through each interface.
+
+A real path: a Mac on home Wi-Fi (5 GHz) and, tethered to it by USB, an
+iPhone on mobile data (5G NSA when its log last said), probed at 1 kHz
+each way for 15 minutes, of which the first 820 s count (the phone was
+then unplugged; pair now ends a run there by itself):
+
+| | min | p50 | p99 | p99.9 | lost |
+|---|---|---|---|---|---|
+| Wi-Fi to phone (home uplink, mobile downlink) | 8.744 ms | 17.339 ms | 82.846 ms | 105.967 ms | 0.023 % |
+| phone to Wi-Fi (mobile uplink, home downlink) | 13.886 ms | 30.349 ms | 69.592 ms | 153.467 ms | 0.005 % |
+
+The way out through the phone is 5.1 ms slower at the minimum and 13.0 ms
+at the median, as a mobile uplink waits for a grant before it may send.
+Halving the round trip would have put 11.3 ms on each direction at the
+minimum and 23.8 ms at the median: off by 2.6 and 6.5 ms. Each minute's
+median stayed within 16.4 to 18.3 ms one way and 29.9 to 31.6 ms the
+other. What remains in the tail is, on the way to the phone, about 20 a
+minute above 90 ms, each a pause and a drain (after the peak the delay
+falls 0.98 ms per ms of send time) of 40 to 110 ms over the delay just
+before (most 70 to 90), with no loss before it and next to nothing in the
+other direction at the same moment. So they are not at the Mac's Wi-Fi, which both directions cross,
+but on one direction's own stretch: the mobile downlink most likely,
+though this run cannot tell it from the home uplink.
+
+Two things on the Mac got in the way. macOS did not bring the phone's USB
+interface up by itself (`sudo ifconfig en6 up`, with en6 the phone's
+port). And AWDL, the link behind AirDrop and Sidecar, takes the Wi-Fi off
+its channel to visit its own: a 10 s trial showed stalls of about 100 ms
+every 512 TU (524.3 ms) in both directions, the Wi-Fi-to-phone median at
+47.8 ms, and the same stall meeting the other direction 20 to 35 ms of
+send time earlier, as it would at the Mac's end. The period is that of
+the two AWDL channel visits per 16-window period in Stute et al. (USENIX
+Security 2019, figure 1). `sudo ifconfig awdl0 down` removed it (until
+`up` or a restart). A Mac measuring a path, or running an end of a
+teleoperator, wants AWDL off.
 
 ## Known issues
 

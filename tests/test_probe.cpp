@@ -321,6 +321,48 @@ TEST_CASE(one_clock_direction_measures_each_delay) {
   CHECK(!rep.trace.comments.empty());
 }
 
+TEST_CASE(one_clock_leaves_out_unsent_probes_and_the_time_after_a_cut) {
+  // Twelve probes 1 ms apart, each arriving 5 ms later if at all. Probe 2
+  // is lost and probe 3's send fails. From probe 5 (sent at 4 ms) nothing
+  // arrives: the far end went away, and the run is cut at 10 ms.
+  OneClockDirection dir(7);
+  std::vector<std::uint8_t> buf;
+  const Nanos t0 = 2 * kNanosPerSecond;
+  for (int k = 1; k <= 12; ++k) {
+    const Nanos t = t0 + (k - 1) * kNanosPerMilli;
+    wire::encode_padded(dir.next(t), 32, buf);
+    if (k == 3) {
+      dir.mark_unsent();
+      dir.mark_unsent();  // once per probe
+      continue;
+    }
+    if (k == 2 || k >= 5) continue;
+    dir.on_datagram(buf.data(), buf.size(), t + from_millis(5));
+  }
+  CHECK(dir.sent() == 12 && dir.unsent() == 1 && dir.received() == 2);
+
+  const OneClockReport whole = analyze_one_clock(dir);
+  CHECK(whole.unsent == 1 && whole.in_flight == 0);
+  CHECK(whole.dir.sent == 11 && whole.dir.lost == 9);
+  CHECK(whole.dir.longest_burst == 8);
+  CHECK(whole.trace.entries.size() == 11);
+
+  // Probes 11 and 12 come after the cut. Probes 6 to 10, sent within 5 ms
+  // of it (the longest delay seen), may have been on their way when the end
+  // went; probe 5, sent 6 ms before, would have arrived, so its loss stays.
+  const OneClockReport cut = analyze_one_clock(dir, t0 + 10 * kNanosPerMilli);
+  CHECK(cut.unsent == 1 && cut.in_flight == 5);
+  CHECK(cut.dir.sent == 4 && cut.dir.lost == 2);
+  CHECK(cut.dir.longest_burst == 1);
+  REQUIRE(cut.trace.entries.size() == 4);
+  // Probe 3 leaves no entry: the trace goes from 1 ms to 3 ms.
+  CHECK(cut.trace.entries[1].send_offset == kNanosPerMilli && cut.trace.entries[1].delay == -1);
+  CHECK(cut.trace.entries[2].send_offset == 3 * kNanosPerMilli);
+  CHECK(cut.trace.entries[3].send_offset == 4 * kNanosPerMilli && cut.trace.entries[3].delay == -1);
+  CHECK(cut.dir.delay.count == 2);
+  CHECK_NEAR(cut.dir.delay.p50, 5e6, 0.0);
+}
+
 TEST_CASE(one_clock_traces_replay_the_measured_path) {
   // Two directions of different constant delays through one clock come out
   // as measured, each on its own: no half of the round trip is assumed.

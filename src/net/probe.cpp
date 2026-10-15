@@ -331,6 +331,12 @@ wire::Header OneClockDirection::next(Nanos t) {
   return h;
 }
 
+void OneClockDirection::mark_unsent() {
+  if (records_.empty() || records_.back().unsent) return;
+  records_.back().unsent = true;
+  ++unsent_;
+}
+
 bool OneClockDirection::on_datagram(const std::uint8_t* data, std::size_t size, Nanos t) {
   const auto h = wire::decode_header(data, size);
   if (!h || h->type != wire::PacketType::kProbe || h->session != session_ || h->seq == 0 ||
@@ -348,21 +354,26 @@ bool OneClockDirection::on_datagram(const std::uint8_t* data, std::size_t size, 
   return true;
 }
 
-OneClockReport analyze_one_clock(const OneClockDirection& d) {
+OneClockReport analyze_one_clock(const OneClockDirection& d, Nanos until) {
   OneClockReport rep;
   const auto& recs = d.records();
   if (recs.empty()) return rep;
   const Nanos t0 = recs.front().sent;
   std::vector<double> delays;
   std::vector<std::pair<Nanos, double>> arrivals;
-  std::vector<bool> lost(recs.size(), false);
+  std::vector<bool> lost;
+  lost.reserve(recs.size());
   Nanos latest = INT64_MIN;
-  for (std::size_t k = 0; k < recs.size(); ++k) {
-    const auto& r = recs[k];
+  for (const auto& r : recs) {
+    if (r.sent >= until) break;
+    if (r.unsent) {
+      rep.unsent++;
+      continue;
+    }
     rep.dir.sent++;
     rep.duplicates += static_cast<std::size_t>(r.duplicates);
+    lost.push_back(r.received < 0);
     if (r.received < 0) {
-      lost[k] = true;
       rep.dir.lost++;
       rep.trace.entries.push_back({r.sent - t0, -1});
       continue;
@@ -376,6 +387,20 @@ OneClockReport analyze_one_clock(const OneClockDirection& d) {
     if (r.received < latest) rep.dir.reordered++;
     latest = std::max(latest, r.received);
     rep.trace.entries.push_back({r.sent - t0, delay});
+  }
+  // Where a run is cut, an end went away. Probes lost just before the cut
+  // may have been on their way to it when it went, so the losses that run
+  // up to the cut are left out back to the longest delay seen: a probe sent
+  // earlier would have arrived before the cut.
+  if (until != INT64_MAX && !delays.empty()) {
+    const Nanos longest = static_cast<Nanos>(*std::max_element(delays.begin(), delays.end()));
+    while (!lost.empty() && lost.back() && rep.trace.entries.back().send_offset + t0 >= until - longest) {
+      lost.pop_back();
+      rep.trace.entries.pop_back();
+      rep.dir.sent--;
+      rep.dir.lost--;
+      rep.in_flight++;
+    }
   }
   rep.dir.longest_burst = longest_run(lost);
   rep.dir.delay = delay_stats(std::move(delays), std::move(arrivals));

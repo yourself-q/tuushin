@@ -570,8 +570,36 @@ int run_pair(const PairOptions& o) {
   const Nanos grace = 2 * kNanosPerSecond;
   Nanos next = start, stop_at = send_end;
   bool sending = true;
-  std::size_t send_failures = 0, skipped = 0;
+  std::size_t skipped = 0;
   Nanos next_report = start + kNanosPerSecond;
+  // An end whose every send fails for a second has gone away: a phone
+  // unplugged takes its interface with it. The run ends where the failures
+  // began, since nothing either end sent after that tells of the path.
+  Nanos fail_since[2] = {-1, -1};
+  Nanos cut = INT64_MAX;
+  std::string cut_note;
+  const auto send_probe = [&](PairEnd& e, net::OneClockDirection& dir, Nanos& since) {
+    const wire::Header h = dir.next(monotonic_now());
+    wire::encode_padded(h, padding, out);
+    if (e.sock.send_to(e.peer, out.data(), out.size())) {
+      since = -1;
+      return;
+    }
+    const int err = errno;
+    dir.mark_unsent();
+    if (since < 0) since = h.send_time;
+    if (sending && h.send_time - since >= kNanosPerSecond) {
+      char note[256];
+      std::snprintf(note, sizeof note,
+                    "the run ended at %.3f s: every send through %s failed from then on (%s)",
+                    to_seconds(since - start), e.dev.c_str(), std::strerror(err));
+      cut_note = note;
+      cut = since;
+      sending = false;
+      stop_at = monotonic_now() + grace;
+      std::fprintf(stderr, "%s\n", note);
+    }
+  };
   // Datagrams of the other session on a socket: late hellos.
   const auto drain = [&](PairEnd& e, net::OneClockDirection& dir, std::uint32_t hello) {
     for (;;) {
@@ -597,10 +625,8 @@ int run_pair(const PairOptions& o) {
         skipped += static_cast<std::size_t>(missed);
         next += missed * interval;
       }
-      wire::encode_padded(ab.next(monotonic_now()), padding, out);
-      if (!a.sock.send_to(a.peer, out.data(), out.size())) ++send_failures;
-      wire::encode_padded(ba.next(monotonic_now()), padding, out);
-      if (!b.sock.send_to(b.peer, out.data(), out.size())) ++send_failures;
+      send_probe(a, ab, fail_since[0]);
+      send_probe(b, ba, fail_since[1]);
       next += interval;
       now = monotonic_now();
     }
@@ -617,13 +643,20 @@ int run_pair(const PairOptions& o) {
     }
   }
 
-  const net::OneClockReport rab = net::analyze_one_clock(ab), rba = net::analyze_one_clock(ba);
+  const net::OneClockReport rab = net::analyze_one_clock(ab, cut),
+                            rba = net::analyze_one_clock(ba, cut);
   const std::string nab = o.a + "->" + o.b, nba = o.b + "->" + o.a;
   std::printf("pair %s and %s, %zu-byte probes at %.0f Hz, one clock, started %s\n", o.a.c_str(),
               o.b.c_str(), o.size, o.rate, started.c_str());
-  std::printf("probes %zu each way  duplicates %zu/%zu  stray %zu/%zu  send failures %zu  skipped %zu\n",
-              rab.dir.sent, rab.duplicates, rba.duplicates, ab.stray(), ba.stray(), send_failures,
-              skipped);
+  if (!cut_note.empty()) {
+    std::printf("%s; the figures cover the probes sent before, less %zu/%zu lost just before, "
+                "which may have been on their way when it went\n",
+                cut_note.c_str(), rab.in_flight, rba.in_flight);
+  }
+  std::printf("probes %zu/%zu  duplicates %zu/%zu  stray %zu/%zu  send failures %zu/%zu (not counted "
+              "as sent)  skipped %zu\n",
+              rab.dir.sent, rba.dir.sent, rab.duplicates, rba.duplicates, ab.stray(), ba.stray(),
+              rab.unsent, rba.unsent, skipped);
   print_delay((nab + " ms").c_str(), rab.dir.delay);
   print_delay((nba + " ms").c_str(), rba.dir.delay);
   print_direction(nab.c_str(), rab.dir);
@@ -643,6 +676,10 @@ int run_pair(const PairOptions& o) {
     net::Trace tab = rab.trace, tba = rba.trace;
     tab.comments.insert(tab.comments.begin(), std::string(meta) + ", " + nab);
     tba.comments.insert(tba.comments.begin(), std::string(meta) + ", " + nba);
+    if (!cut_note.empty()) {
+      tab.comments.insert(tab.comments.begin() + 1, cut_note);
+      tba.comments.insert(tba.comments.begin() + 1, cut_note);
+    }
     tab.save_csv(o.out + ".ab.csv");
     tba.save_csv(o.out + ".ba.csv");
     std::printf("wrote %s.ab.csv (%s), %s.ba.csv (%s)\n", o.out.c_str(), nab.c_str(),
