@@ -199,17 +199,18 @@ int main(int argc, char** argv) {
       return 0;
     }
     std::printf("one_way_ms,diverged,min_margin_J,min_true_margin_J,max_force_N,"
-                "displayed_k_Npm,pos_rmse_m,drift_m,force_rmse_N,fwd_rate,bwd_rate,pc_m,pc_s\n");
+                "displayed_k_Npm,pos_rmse_m,drift_m,force_rmse_N,fwd_rate,bwd_rate,pc_m,pc_s,"
+                "pc_force_rmse_N,display_variation_Nps\n");
     for (const double d : o.sweep) {
       auto fwd = make_channel(o, d, o.trace_fwd, o.seed);
       auto bwd = make_channel(o, d, o.trace_bwd, o.seed + 1);
       const auto r = sim::run_teleop1d(o.cfg, *fwd, *bwd);
-      std::printf("%g,%d,%.4g,%.4g,%.3f,%.1f,%.5f,%.5f,%.3f,%.1f,%.1f,%.4f,%.4f\n", d,
+      std::printf("%g,%d,%.4g,%.4g,%.3f,%.1f,%.5f,%.5f,%.3f,%.1f,%.1f,%.4f,%.4f,%.3f,%.1f\n", d,
                   r.diverged ? 1 : 0, r.min_passivity_margin, r.min_true_margin,
                   r.max_display_force,
                   r.displayed_stiffness, r.pos_rmse, r.final_drift, r.force_rmse,
                   r.forward_packet_rate, r.backward_packet_rate, r.master_pc_active,
-                  r.slave_pc_active);
+                  r.slave_pc_active, r.pc_force_rmse, r.display_force_variation);
     }
     return 0;
   } catch (const std::exception& e) {
