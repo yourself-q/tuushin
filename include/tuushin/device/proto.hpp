@@ -55,11 +55,21 @@ enum class MsgType : std::uint8_t {
 // Command::flags
 constexpr std::uint8_t kCmdEnable = 0x01;      // apply the torque; without it the device idles
 constexpr std::uint8_t kCmdClearFault = 0x02;  // clear a latched fault (only while not enabled)
+constexpr std::uint8_t kCmdWorkCap = 0x04;     // work_cap holds, and the device keeps to it
 
 struct Command {
   std::uint16_t seq = 0;
   float torque = 0.0f;  // N m, along +count
   std::uint8_t flags = 0;
+  // With kCmdWorkCap: the most work the torque may have done on the shaft
+  // (J, on State::work's count, since the device started) while this
+  // command is in effect. A device that advertises kInfoWorkCap scales the
+  // torque down on its own ticks, from where the shaft is going, so as to
+  // keep its work within the cap; a torque that takes energy out of the
+  // shaft is never held back. The host's energy books can only stop a
+  // torque a round trip after it did the work they did not allow; the
+  // device can stop it within a tick. Sent only with the flag.
+  double work_cap = 0.0;
 };
 
 enum class Param : std::uint8_t {
@@ -84,6 +94,7 @@ enum class DeviceKind : std::uint8_t {
 
 // Info::flags
 constexpr std::uint8_t kInfoCalibrated = 0x01;  // the electrical zero is known
+constexpr std::uint8_t kInfoWorkCap = 0x02;     // keeps to Command::work_cap
 
 struct Info {
   std::uint8_t protocol = kProtocolVersion;
@@ -105,6 +116,7 @@ constexpr std::uint8_t kStateFault = 0x04;       // a fault is latched (State::f
 constexpr std::uint8_t kStateCalibrated = 0x08;  // the electrical zero is known
 constexpr std::uint8_t kStateSaturated = 0x10;   // the torque was clamped (limit or voltage)
 constexpr std::uint8_t kStateCalibrating = 0x20;
+constexpr std::uint8_t kStateCapped = 0x40;  // the torque was scaled to keep to the work cap
 
 // State::fault, latched until cleared
 enum class Fault : std::uint8_t {
@@ -131,6 +143,13 @@ struct State {
   // displacement while it acted, over every tick) since the device started
   // (J): what the host's energy books try to know, from the device's side.
   double work = 0.0;
+  // The quantization tax the device booked for raising the torque on its
+  // own, under a work cap, since it started (J). Work counted in encoder
+  // counts is off by up to half a count times each change of the torque
+  // (summed by parts), and a host that books it with its own changes'
+  // tax (control::quantization_tax) knows nothing of the device's. The
+  // cap holds work + tax. 0 from a device that does not send it.
+  double tax = 0.0;
 };
 
 // Ack::status

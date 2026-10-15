@@ -23,6 +23,8 @@
 //    command restores it;
 //  - the torque never exceeds the configured ceiling, whatever the host
 //    asks, nor the voltage limit;
+//  - with a work cap in the command, the torque does no more work on the
+//    shaft than the cap allows, give or take a tick's misprediction;
 //  - an encoder that stops answering, a reading that jumps further than
 //    the shaft can move in a tick, or a speed over the limit latches a
 //    fault, which only a command without kCmdEnable can clear.
@@ -82,7 +84,7 @@ struct DeviceConfig {
   float damping = 0.0f;           // N m s/rad
   float velocity_cutoff_hz = 300.0f;
   device::DeviceKind kind = device::DeviceKind::kTorqueMotor;
-  std::uint32_t firmware = 0x000100;
+  std::uint32_t firmware = 0x000200;
   char name[16] = "tuushin";
 };
 
@@ -120,6 +122,7 @@ class DeviceCore {
   // The bridge: driving the windings, or open (no current).
   void drive(bool on);
   void foc(float host, float omega, float vbus);
+  float keep_to_cap(float host, float dt, float before, float taxed);
   void send(const std::uint8_t* frame, std::size_t n);
   void log(const char* text);
   void send_state(std::uint32_t now);
@@ -150,8 +153,14 @@ class DeviceCore {
   bool cut_ = false;
   std::uint32_t cut_after_us_ = 0;
   float applied_ = 0.0f;
+  float asked_ = 0.0f;  // the host's torque the tick asked for, after the work cap
   bool saturated_ = false;
+  bool capped_ = false;  // in some tick since the last State
   double work_ = 0.0;
+  double tax_ = 0.0;  // State::tax
+  float dtheta_ = 0.0f;  // the shaft's last step (rad)
+  float prev_cmd_ = 0.0f;  // the torque of the command before this one
+  bool fresh_cmd_ = false;  // the command came since the last tick
 
   CalPhase cal_phase_ = CalPhase::kNone;
   std::uint32_t cal_start_us_ = 0;

@@ -86,9 +86,11 @@ class In {
 };
 
 constexpr std::size_t kCommandSize = 7;
+constexpr std::size_t kCommandCapSize = kCommandSize + 8;  // with kCmdWorkCap
 constexpr std::size_t kSetSize = 5;
 constexpr std::size_t kInfoSize = 40;
 constexpr std::size_t kStateSize = 34;
+constexpr std::size_t kStateTaxSize = kStateSize + 8;  // with the tax
 constexpr std::size_t kAckSize = 7;
 
 bool is(const Message& msg, MsgType t, std::size_t size) {
@@ -163,11 +165,12 @@ std::size_t encode_frame(MsgType type, const std::uint8_t* body, std::size_t n,
 }
 
 std::size_t encode(const Command& m, std::uint8_t* out) {
-  std::uint8_t b[kCommandSize];
+  std::uint8_t b[kCommandCapSize];
   Out w(b);
   w.u16(m.seq);
   w.f32(m.torque);
   w.u8(m.flags);
+  if (m.flags & kCmdWorkCap) w.f64(m.work_cap);
   return encode_frame(MsgType::kCommand, b, w.size(), out);
 }
 
@@ -196,7 +199,7 @@ std::size_t encode(const Info& m, std::uint8_t* out) {
 }
 
 std::size_t encode(const State& m, std::uint8_t* out) {
-  std::uint8_t b[kStateSize];
+  std::uint8_t b[kStateTaxSize];
   Out w(b);
   w.u16(m.seq);
   w.u32(m.time_us);
@@ -209,6 +212,7 @@ std::size_t encode(const State& m, std::uint8_t* out) {
   w.u8(m.flags);
   w.u8(static_cast<std::uint8_t>(m.fault));
   w.f64(m.work);
+  w.f64(m.tax);
   return encode_frame(MsgType::kState, b, w.size(), out);
 }
 
@@ -237,6 +241,13 @@ bool decode(const Message& msg, Command* m) {
   m->seq = r.u16();
   m->torque = r.f32();
   m->flags = r.u8();
+  m->work_cap = 0.0;
+  if (m->flags & kCmdWorkCap) {
+    // A cap that did not come is no cap: refuse the command rather than
+    // apply its torque without it.
+    if (msg.size < kCommandCapSize) return false;
+    m->work_cap = r.f64();
+  }
   return true;
 }
 
@@ -279,6 +290,7 @@ bool decode(const Message& msg, State* m) {
   m->flags = r.u8();
   m->fault = static_cast<Fault>(r.u8());
   m->work = r.f64();
+  m->tax = msg.size >= kStateTaxSize ? r.f64() : 0.0;
   return true;
 }
 

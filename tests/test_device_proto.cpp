@@ -195,3 +195,36 @@ TEST_CASE(device_longer_body_is_accepted) {
   REQUIRE(short_one.size() == 1);
   CHECK(!decode(as_message(short_one[0]), &c));
 }
+
+TEST_CASE(device_command_carries_a_work_cap) {
+  std::uint8_t f[kMaxFrame];
+  Command c;
+  c.seq = 7;
+  c.torque = 0.05f;
+  c.flags = kCmdEnable | kCmdWorkCap;
+  c.work_cap = 1.0 / 3.0;  // a double: the cap sits on a total that keeps growing
+  const std::size_t n = encode(c, f);
+  FrameReader r;
+  const auto got = read_all(r, std::vector<std::uint8_t>(f, f + n));
+  REQUIRE(got.size() == 1);
+  CHECK(got[0].body.size() == 15);
+  Command c2;
+  REQUIRE(decode(as_message(got[0]), &c2));
+  CHECK(c2.flags == c.flags && c2.work_cap == c.work_cap && c2.torque == c.torque);
+  // Without the flag the cap is not sent, and a command that claims one
+  // without carrying it is refused rather than applied without it.
+  c.flags = kCmdEnable;
+  FrameReader r2;
+  const std::size_t k = encode(c, f);
+  const auto bare = read_all(r2, std::vector<std::uint8_t>(f, f + k));
+  REQUIRE(bare.size() == 1);
+  CHECK(bare[0].body.size() == 7);
+  REQUIRE(decode(as_message(bare[0]), &c2));
+  CHECK(c2.work_cap == 0.0);
+  std::uint8_t body[7] = {1, 0, 0, 0, 0x80, 0x3F, kCmdEnable | kCmdWorkCap};
+  FrameReader r3;
+  const std::size_t m = encode_frame(MsgType::kCommand, body, sizeof body, f);
+  const auto lying = read_all(r3, std::vector<std::uint8_t>(f, f + m));
+  REQUIRE(lying.size() == 1);
+  CHECK(!decode(as_message(lying[0]), &c2));
+}

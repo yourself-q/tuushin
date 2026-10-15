@@ -28,6 +28,22 @@ float clampf(float v, float lo, float hi) {
   return v < lo ? lo : (v > hi ? hi : v);
 }
 
+// How far |to| exceeds what of `from` it keeps (all of it in the same
+// direction, none across zero): what control::quantization_tax charges.
+float growth(float from, float to) {
+  const float kept = from * to > 0.0f ? std::fabs(from) : 0.0f;
+  const float g = std::fabs(to) - kept;
+  return g > 0.0f ? g : 0.0f;
+}
+
+// The largest l >= 0 with b l^2 + a l <= r, for b >= 0 and r >= 0, in the
+// form that does not cancel; 1 when every l is (b = 0, a <= 0).
+float largest_root(float b, float a, float r) {
+  const float d = std::sqrt(a * a + 4.0f * b * r);
+  if (a <= 0.0f) return b > 0.0f ? (d - a) / (2.0f * b) : 1.0f;
+  return 2.0f * r / (a + d);
+}
+
 }  // namespace
 
 DeviceCore::DeviceCore(Hal& hal, const DeviceConfig& cfg)
@@ -89,6 +105,7 @@ void DeviceCore::tick() {
     if (std::fabs(static_cast<float>(step)) > most) latch(Fault::kEncoderJump);
     const float dtheta = static_cast<float>(step) * count_to_rad;
     work_ += static_cast<double>(applied_) * static_cast<double>(dtheta);
+    dtheta_ = dtheta;
     vel_.update(dtheta, dt);
   }
 
@@ -120,13 +137,28 @@ void DeviceCore::tick() {
     }
   }
 
+  // The torque the last tick asked for: the work cap's tax is on its
+  // changes, as the host's books tax the commands'. (A voltage clamp
+  // that comes and goes changes the torque applied besides, which the
+  // State's saturated flag tells.)
+  const float before = asked_;
+  asked_ = 0.0f;
+  const bool fresh = fresh_cmd_;
+  fresh_cmd_ = false;
   applied_ = 0.0f;
   saturated_ = false;
   if (cal_phase_ != CalPhase::kNone) {
     run_calibration(now);
   } else if (enabled_) {
-    const float host = cut_ ? 0.0f : clampf(cmd_.torque, -torque_limit_, torque_limit_);
+    float host = cut_ ? 0.0f : clampf(cmd_.torque, -torque_limit_, torque_limit_);
     saturated_ = !cut_ && host != cmd_.torque;
+    const bool capped = (cmd_.flags & kCmdWorkCap) != 0;
+    // The rise of the torque the host's books taxed: the command's over
+    // the one before, in the tick it takes effect.
+    const float taxed =
+        fresh ? growth(clampf(prev_cmd_, -torque_limit_, torque_limit_), host) : 0.0f;
+    if (host != 0.0f && capped) host = keep_to_cap(host, dt, before, taxed);
+    asked_ = host;
     if (host == 0.0f && damping_ == 0.0f) {
       // No torque to make: open the windings, which then carry no current
       // at all, instead of driving against an estimate of the back-EMF,
@@ -135,6 +167,10 @@ void DeviceCore::tick() {
     } else {
       drive(true);
       foc(host, omega, vbus);
+    }
+    if (capped) {
+      const float g = growth(before, host) - taxed;
+      if (g > 0.0f) tax_ += static_cast<double>(g) * static_cast<double>(count_to_rad);
     }
   }
 
@@ -161,7 +197,7 @@ void DeviceCore::handle(const Message& m, std::uint32_t now) {
       Info info;
       info.kind = cfg_.kind;
       info.pole_pairs = static_cast<std::uint8_t>(cfg_.motor.pole_pairs);
-      info.flags = cal_.valid ? kInfoCalibrated : 0;
+      info.flags = static_cast<std::uint8_t>((cal_.valid ? kInfoCalibrated : 0) | kInfoWorkCap);
       info.counts_per_rev = cfg_.counts_per_rev;
       info.max_torque = cfg_.max_torque;
       info.inertia = cfg_.inertia;
@@ -221,6 +257,8 @@ void DeviceCore::on_command(const Command& c, std::uint32_t now) {
     set_enabled(false);
     if (c.flags & kCmdClearFault) fault_ = Fault::kNone;
   }
+  prev_cmd_ = have_cmd_ && (cmd_.flags & kCmdEnable) ? cmd_.torque : 0.0f;
+  fresh_cmd_ = true;
   cmd_ = c;
   have_cmd_ = true;
   cmd_us_ = now;
@@ -388,6 +426,57 @@ void DeviceCore::foc(float host, float omega, float vbus) {
   hal_.set_duties(v.a / vbus, v.b / vbus, v.c / vbus);
 }
 
+// The host's books learn of the work a torque did a State and a link's
+// latency after it did it, and against a stiff object the shaft can turn
+// round within that: a knob leaving a stop at 0.2 m/s under a torque the
+// host allowed while the stop pushed it back took 0.9 mJ out of them
+// before they knew (README, "Known issues"). The cap is the books' limit
+// on the device's side, where the work is measured.
+//
+// The shaft is taken to turn in the coming tick by its last step again,
+// plus what the torque itself adds over the tick from the moving parts'
+// inertia: a fraction l of the torque tau then does the work
+//
+//   w(l) = l tau dtheta + (l tau dt)^2 / (2 J).
+//
+// Raising the torque costs besides: the work is counted in whole counts,
+// and summed by parts the count is off by up to half a count q against
+// every change of the torque, which the host's books tax for the changes
+// it commands (control::quantization_tax) and the device has to tax for
+// its own. Without that, a knob dithering across a count at a spent cap
+// books a count's worth of work each time the device lets the torque back
+// on for the step that went the torque's way: 0.5 mJ in a second, held by
+// a hand, that the motor never did. So the device pays q times the rise
+// beyond what the last tick kept and the host taxed, c(l) = w(l) +
+// q max(0, l |tau| - free), and takes the largest l in [0, 1] whose cost
+// the cap's room (none, once it is spent) covers. c is convex and
+// c(0) = 0, so every smaller fraction keeps to the cap too, as when the
+// voltage limit clamps the torque further. A torque against the motion
+// passes once the work it takes out pays its tax; one that would
+// accelerate a shaft at rest needs room. The step misses what the hand or
+// a wall does to the shaft within the tick, so the cap can be overrun by
+// about the torque times a few counts, once: the cap is on the total, so
+// the next tick finds no room left.
+float DeviceCore::keep_to_cap(float tau, float dt, float before, float taxed) {
+  const double left = cmd_.work_cap - (work_ + tax_);
+  const float room = left > 0.0 ? static_cast<float>(left) : 0.0f;
+  const float q = kTwoPi / static_cast<float>(cfg_.counts_per_rev);
+  const float mag = std::fabs(tau);
+  const float a = tau * dtheta_;
+  const float b = cfg_.inertia > 0.0f ? tau * tau * dt * dt / (2.0f * cfg_.inertia) : 0.0f;
+  const float free = (before * tau > 0.0f ? std::fabs(before) : 0.0f) + taxed;
+  const float l0 = free / mag;  // where the tax starts
+  auto cost = [&](float l) {
+    const float rise = l * mag - free;
+    return a * l + b * l * l + (rise > 0.0f ? q * rise : 0.0f);
+  };
+  if (cost(1.0f) <= room) return tau;
+  capped_ = true;
+  const float l = l0 < 1.0f && cost(l0) <= room ? largest_root(b, a + q * mag, room + q * free)
+                                                : largest_root(b, a, room);
+  return clampf(l, 0.0f, 1.0f) * tau;
+}
+
 void DeviceCore::drive(bool on) {
   if (on == driving_) return;
   driving_ = on;
@@ -443,9 +532,12 @@ void DeviceCore::send_state(std::uint32_t now) {
   if (cal_.valid) flags |= kStateCalibrated;
   if (saturated_) flags |= kStateSaturated;
   if (cal_phase_ != CalPhase::kNone) flags |= kStateCalibrating;
+  if (capped_) flags |= kStateCapped;
+  capped_ = false;
   st_.flags = flags;
   st_.fault = fault_;
   st_.work = work_;
+  st_.tax = tax_;
   std::uint8_t frame[kMaxFrame];
   send(frame, encode(st_, frame));
 }

@@ -67,6 +67,15 @@ struct Rig {
     std::uint8_t f[kMaxFrame];
     send_frame(f, encode(c, f));
   }
+  void command_capped(double torque, double cap) {
+    Command c;
+    c.seq = ++seq;
+    c.torque = static_cast<float>(torque);
+    c.flags = kCmdEnable | kCmdWorkCap;
+    c.work_cap = cap;
+    std::uint8_t f[kMaxFrame];
+    send_frame(f, encode(c, f));
+  }
   void set(Param p, double v) {
     Set s;
     s.param = p;
@@ -284,6 +293,161 @@ TEST_CASE(fw_reported_work_matches_the_motor) {
     scale = 0.03 * 3.0 * 2 * 2;
   }
   CHECK(std::fabs(device - motor) < 0.02 * scale);
+}
+
+TEST_CASE(fw_work_cap_holds_the_work_on_a_hand) {
+  // A hand as a spring at rest, and a torque that would push the knob to
+  // where the spring balances it (0.2 rad, 2 mJ of work), capped at 0.3 mJ:
+  // the torque lets go where it has done the cap's work, and the spring
+  // takes the knob back, too slowly for the torque to take its work back
+  // out of it and pay the tax of coming on again. The device's work and
+  // tax never run past the cap by more than a tick's misprediction, nor
+  // ratchet up a count at a time as the knob dithers.
+  for (bool capped : {false, true}) {
+    PlantParams p = quiet_plant();
+    Rig rig(p, config_for(p));
+    REQUIRE(rig.calibrate());
+    rig.bare(MsgType::kHello);
+    rig.run(0.01);
+    REQUIRE(rig.have_info);
+    CHECK(rig.info.flags & kInfoWorkCap);
+    HandParams h;
+    h.present = true;
+    h.k = 0.1;
+    h.b = 5e-3;
+    h.ref_offset = rig.plant.angle();
+    h.ref_amplitude = 0.0;
+    rig.plant.set_hand(h, rig.t);
+    const double a0 = rig.plant.angle();
+    const double w0 = rig.core.last_state().work;
+    const double m0 = rig.plant.motor_work();  // calibrating did work, unbooked
+    const double cap = w0 + 3e-4;
+    rig.states.clear();
+    auto next = std::make_shared<double>(rig.t);
+    rig.run(1.0, [&](double now) {
+      if (now + 1e-12 < *next) return;
+      *next += 1e-3;
+      if (capped) {
+        rig.command_capped(0.02, cap);
+      } else {
+        rig.command(0.02);
+      }
+    });
+    REQUIRE(!rig.states.empty());
+    double most = -1.0;
+    bool flagged = false;
+    for (const State& st : rig.states) {
+      most = std::max(most, st.work + st.tax);
+      flagged = flagged || (st.flags & kStateCapped);
+    }
+    const double turned = rig.plant.angle() - a0;
+    if (capped) {
+      // A count is 0.38 mrad, 7.7 uJ at 0.02 N m.
+      CHECK(most <= cap + 2e-5);
+      CHECK(most >= cap - 2e-5);
+      CHECK(flagged);
+      // The torque did 0.3 mJ of work against the spring: at most 15 mrad.
+      CHECK(turned < 0.02);
+      // The motor's own work agrees with the device's books, which hold
+      // back no more than they have to.
+      const double motor = rig.plant.motor_work() - m0;
+      CHECK(motor <= cap - w0 + 1e-5);
+      CHECK(std::fabs(motor - (rig.states.back().work - w0)) < 1e-5);
+    } else {
+      CHECK(most > 1.5e-3);
+      CHECK(!flagged);
+      CHECK_NEAR(turned, 0.2, 0.01);
+    }
+  }
+}
+
+TEST_CASE(fw_work_cap_far_off_changes_nothing) {
+  // A cap the work never comes near: the torque is the host's, and the
+  // device taxes none of its changes, which the host's books tax.
+  PlantParams p;
+  Rig rig(p, config_for(p));
+  REQUIRE(rig.calibrate());
+  HandParams h;
+  h.present = true;
+  h.ref_offset = rig.plant.angle();
+  h.ref_amplitude = 3.0;
+  h.ref_freq = 1.0;
+  rig.plant.set_hand(h, rig.t);
+  rig.states.clear();
+  auto next = std::make_shared<double>(rig.t);
+  rig.run(1.0, [&](double now) {
+    if (now + 1e-12 < *next) return;
+    *next += 1e-3;
+    rig.command_capped(0.03 * std::sin(2 * 3.14159 * 3.0 * now), 1.0);
+  });
+  REQUIRE(!rig.states.empty());
+  for (const State& st : rig.states) {
+    CHECK(st.tax == 0.0);
+    CHECK(!(st.flags & kStateCapped));
+  }
+}
+
+TEST_CASE(fw_work_cap_lets_a_torque_take_energy_out) {
+  // A load turns the knob against the torque: the torque takes energy out
+  // of the shaft, which no cap holds back, even one long spent.
+  PlantParams p = quiet_plant();
+  Rig rig(p, config_for(p));
+  REQUIRE(rig.calibrate());
+  rig.plant.set_load(-0.03);
+  const double w0 = rig.core.last_state().work;
+  auto next = std::make_shared<double>(rig.t);
+  auto host = [&](double now) {
+    if (now + 1e-12 < *next) return;
+    *next += 1e-3;
+    rig.command_capped(0.02, w0 - 1.0);
+  };
+  // From rest the device cannot tell which way the shaft will go and
+  // holds the torque back until it sees it turn.
+  rig.run(0.02, host);
+  rig.states.clear();
+  rig.run(0.08, host);
+  REQUIRE(!rig.states.empty());
+  for (const State& st : rig.states) CHECK_NEAR(st.torque, 0.02, 1e-6);
+  CHECK(rig.states.back().work < w0 - 1e-3);
+}
+
+TEST_CASE(fw_work_cap_on_a_knob_leaving_a_stop) {
+  // The overrun the cap is for: the knob pressed into a stiff stop, which
+  // throws it back out, and the host's torque the same way, as when the
+  // host allowed it expecting the stop to push back. Under a cap the
+  // torque does the cap's work and then no more, while the stop speeds the
+  // knob up under it; without one it adds its own to the stop's.
+  for (bool capped : {false, true}) {
+    PlantParams p = quiet_plant();
+    Rig rig(p, config_for(p));
+    REQUIRE(rig.calibrate());
+    StopParams stop;
+    stop.present = true;
+    stop.angle = rig.plant.angle() - 0.02;  // the knob 20 mrad into it
+    rig.plant.set_stop(stop);
+    const double w0 = rig.core.last_state().work;
+    const double m0 = rig.plant.motor_work();
+    rig.states.clear();
+    auto next = std::make_shared<double>(rig.t);
+    rig.run(0.03, [&](double now) {
+      if (now + 1e-12 < *next) return;
+      *next += 1e-3;
+      if (capped) {
+        rig.command_capped(-0.01, w0 + 1e-4);
+      } else {
+        rig.command(-0.01);
+      }
+    });
+    double most = -1.0;
+    for (const State& st : rig.states) most = std::max(most, st.work - w0);
+    if (capped) {
+      CHECK(most < 1e-4 + 1e-5);
+      CHECK(most > 1e-4 - 1e-5);
+      CHECK(rig.plant.motor_work() - m0 < 1e-4 + 2e-5);
+    } else {
+      CHECK(most > 1e-3);
+    }
+  }
 }
 
 TEST_CASE(fw_watchdog_cuts_and_restores) {
