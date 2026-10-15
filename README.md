@@ -28,7 +28,7 @@ and also tested on Linux (Ubuntu 24.04, GCC 13.3). MIT licensed.
 | `wire/` | The datagram format: a 32-byte header whose echo fields let each end measure the round trip from ordinary traffic, as RTCP does. |
 | `crypto/` | A Noise_NNpsk0 handshake and ChaCha20-Poly1305 on libsodium: a pre-shared key becomes fresh keys for every session, and every datagram is authenticated and encrypted (see Authentication below). SHA-1, HMAC-SHA1 and MD5, only because STUN and TURN require them. |
 | `sim/` | A deterministic 1-DoF teleoperation simulator built on the same controllers and devices. |
-| `tools/` | `tuushin-sim`, `tuushin-teleop` (master, slave and rendezvous server as separate processes), `tuushin-probe` (measure a path, write replayable traces), `tuushin-netreplay` (Linux: replay a trace on an interface, datagram by datagram, for network namespaces, Mininet and testbeds built on them), `nat_lab.sh` (master and slave behind Linux NATs in network namespaces, with coturn as a relay), `netreplay_lab.sh` (checks the replay against its traces). `tests/sim_nat.hpp` and `tests/sim_turn.hpp` are a NAT and a TURN server in user space for tests on any system. |
+| `tools/` | `tuushin-sim`, `tuushin-teleop` (master, slave and rendezvous server as separate processes), `tuushin-probe` (measure a path, write replayable traces), `tuushin-netreplay` (Linux: replay a trace on an interface, datagram by datagram, for network namespaces, Mininet and testbeds built on them), `nat_lab.sh` (master and slave behind Linux NATs in network namespaces, with coturn as a relay), `netreplay_lab.sh` (checks the replay against its traces), `fetch_starlink.sh` (public Starlink one-way delays as traces). `tests/sim_nat.hpp` and `tests/sim_turn.hpp` are a NAT and a TURN server in user space for tests on any system. |
 
 ## Build and test
 
@@ -854,6 +854,87 @@ Two things to know when attaching it:
 - **It replaces the root qdisc.** Give a replayed link no tc parameters of
   its own (in Mininet, no `bw` or `delay` on its `TCLink`).
 
+## A real path: Starlink
+
+Garcia, Sundberg and Brunstrom (ACM LEONET 2025) published the one-way
+delays of 1437 runs over ten days of April 2025 at an unobstructed Starlink
+terminal in Karlstad, Sweden: 50 s each, both directions, a UDP probe every
+266 µs, sent and received on one hardware-timestamping NIC, so both ends
+read one clock. The data is licensed CC BY 4.0 and is not in this
+repository: `tools/fetch_starlink.sh` downloads the runs asked for, about
+2 MB each through Zenodo's API, and converts them to traces that carry the
+credit.
+
+```sh
+tools/fetch_starlink.sh --list | head
+tools/fetch_starlink.sh --out traces 2025-04-11-15-16-16
+./build/tools/tuushin-sim --passivity reflect \
+    --trace-fwd traces/starlink-2025-04-11-15-16-16.dl.csv \
+    --trace-bwd traces/starlink-2025-04-11-15-16-16.ul.csv
+```
+
+The downlink is the forward direction here: the slave sits behind the
+terminal, as a robot in the field would. Twenty runs, two a day twelve
+hours apart:
+
+| | downlink | uplink |
+|---|---|---|
+| median | 24.6–31.5 ms | 29.1–39.4 ms |
+| p99 | 31–64 ms | 46–130 ms |
+| p99.9 | 49–90 ms | 85–243 ms |
+| max | 67–111 ms | 91–264 ms |
+| probes missing | 0.07–2.0 % | 0.11–2.1 % |
+
+Within a run the delay falls by 0.99 ms per ms and jumps back up by 6 to
+7 ms every 5 to 13 ms (median 7.7 ms down, 5.6 ms up), so 92 to 98 % of
+the probes arrive within 20 µs of the one before: the path delivers in
+bunches. In the runs looked at, the delay also spikes every 15 s, with the
+network's reconfigurations, and the downlink then misses 37 to 76 probes
+in a row (10 to 20 ms); the uplink's missing probes come one or two at a
+time, spread evenly.
+
+The reflective scheme on each run, nine hand motions of 20 s as under
+*Coarse encoders*, against constant delays at the run's medians, 720
+simulations in all:
+
+| encoders | path | worst true margin | force displayed | total variation | displayed stiffness | diverged |
+|---|---|---|---|---|---|---|
+| 55 µm and 1 µm, known | Starlink | 0 J | 24 % | 35 N/s | 215 N/m | none |
+| | constant | 0 J | 23 % | 37 N/s | 207 N/m | none |
+| exact | Starlink | −4.9e−15 J | 38 % | 59 N/s | 357 N/m | none |
+| | constant | −1.6e−15 J | 37 % | 35 N/s | 337 N/m | none |
+
+The margins below zero are rounding. With encoders whose resolution the
+controllers know, the path costs nothing beyond its median delays: the
+same share of the contact force, the same chatter (on one run also with
+1, 5 and 20 µm master encoders). With exact readings, which nothing
+filters, the displayed force varies 1.7 times as much, and the bunches
+cause most of it. On one run, holding each probe's delay at the largest
+of the last 15 ms, which spaces the arrivals like the sends and which a
+receiver could do knowing delays only up to its clock offset, brought the
+variation from 57 to 40 N/s, against 32 at a constant delay of the
+result's mean (34 ms); a playout buffer at the run's p99 (34 and 52 ms)
+brought it to 23, as at a constant 43 ms, and halved the stiffness (386 to
+198 N/m). There is no playout buffer: with real encoders it would buy no
+smoothness (38 N/s before and after on that run) and cost half the
+stiffness (287 to 143 N/m).
+
+The conventional TDPA, on the default scenario (`tuushin-sim`, exact
+encoders, 10 s), generated 0.28 J over a run at the median and 0.41 J at
+worst, against 0.11 and 0.18 J at a constant delay halfway between each
+run's two medians (the simulator takes one delay for both directions);
+the reflective scheme generated nothing on any run.
+
+Replayed by `tuushin-netreplay` in the lab above (one run, 20 s of 1 kHz
+each way, on the virtual machine at a load of about 7.6), the datagrams
+sent where the trace lost were all lost on the downlink (12) and 24 of 28
+on the uplink; 2 and 8 more were lost elsewhere. The delay minus the
+trace's had a median of 0.11 and 0.09 ms, a p99 of 7.0 and 7.2 ms and a
+maximum of 57 and 58 ms, all of it late and at the same moments in both
+directions: the virtual machine stalling. 2 and 5 datagrams arrived out
+of order, each within 63 ns of its neighbour: released in one bunch and
+stamped by the receiver in another order.
+
 ## Known issues
 
 - **Devices need a watchdog.** The stall handling above relies on the
@@ -944,7 +1025,8 @@ Two things to know when attaching it:
 
 - Traces of real paths (fibre, 4G and 5G in Japan) recorded with
   `tuushin-probe`, published so that any simulator or testbed can replay
-  them (`tuushin-netreplay` on Linux).
+  them (`tuushin-netreplay` on Linux), alongside public sets such as the
+  Starlink one above.
 - A relayed session that moves to a direct path once one opens; then QUIC
   datagrams as a transport.
 - Deadbands that adapt to the measured delay; more degrees of freedom; a real
@@ -999,6 +1081,9 @@ The code cites its sources where it uses them. The main ones:
   J. Zhao, S. Wu and J. Pan, "An eBPF-based trace-driven emulation method
   for satellite networks", IEEE Networking Letters, 2024,
   arXiv:2408.15581, for replaying a path with departure times and fq.
+- J. Garcia, S. Sundberg and A. Brunstrom, "A detailed characterization of
+  Starlink one-way delay", ACM LEONET 2025, and its dataset,
+  doi:10.5281/zenodo.16275284 (CC BY 4.0), for the Starlink traces.
 - D. Trautwein, C. Ihle, M. Schubotz and B. Gipp, "Challenging tribal
   knowledge: large scale measurement campaign on decentralized NAT
   traversal", arXiv:2510.27500, 2025, for priming with low-TTL datagrams
