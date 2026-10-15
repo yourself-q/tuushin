@@ -59,10 +59,19 @@
 #   --cgnat-a, --cgnat-b   a carrier-grade NAT behind natA, natB (above)
 #   --silent-cgnat         the CGNATs send no time-exceeded errors, as some
 #                          carrier routers do not
-#   --nat-errors POLICY    pass (the default) or drop: whether natA and natB
-#                          pass the ICMP errors for their mappings back
-#                          inside (RFC 5508, REQ-4), which cheap home routers
-#                          may not
+#   --nat-b-errors POLICY  pass (the default) or drop: whether natB passes
+#                          the ICMP errors for its mappings back inside
+#                          (RFC 5508, REQ-4), which cheap home routers may
+#                          not; the slave's measurement then waits for its
+#                          timeout
+#   --nat-a-errors POLICY  the same for natA
+#   --nat-b-source WHERE   inside (the default) or outside: the address natB
+#                          (and cgnB) sends its own ICMP errors from. Linux
+#                          takes the one it would send anything to the
+#                          error's destination from, the inside address;
+#                          many home routers use their outside one, the
+#                          address the rendezvous server sees
+#   --nat-a-source WHERE   the same for natA (and cgnA)
 #   --rebind-at S          S seconds after the master starts, natB (cgnB with
 #                          --cgnat-b) moves the slave to a new outside
 #                          address (203.0.113.3, as after a new DHCP lease or
@@ -99,7 +108,10 @@ TURN=0
 CGNAT_A=0
 CGNAT_B=0
 SILENT_CGNAT=0
-NAT_ERRORS=pass
+NAT_A_ERRORS=pass
+NAT_B_ERRORS=pass
+NAT_A_SOURCE=inside
+NAT_B_SOURCE=inside
 KEEP=
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -120,7 +132,10 @@ while [ $# -gt 0 ]; do
     --cgnat-a) CGNAT_A=1 ;;
     --cgnat-b) CGNAT_B=1 ;;
     --silent-cgnat) SILENT_CGNAT=1 ;;
-    --nat-errors) NAT_ERRORS=$2; shift ;;
+    --nat-a-errors) NAT_A_ERRORS=$2; shift ;;
+    --nat-b-errors) NAT_B_ERRORS=$2; shift ;;
+    --nat-a-source) NAT_A_SOURCE=$2; shift ;;
+    --nat-b-source) NAT_B_SOURCE=$2; shift ;;
     --keep) KEEP=$2; shift ;;
     *) echo "unknown option $1" >&2; exit 1 ;;
   esac
@@ -141,7 +156,12 @@ for i in $(seq 1 "$WAN_HOPS"); do ROUTERS="$ROUTERS r$i"; done
 NS="master slave natA natB server$ROUTERS"
 [ "$CGNAT_A" = 0 ] || NS="$NS cgnA"
 [ "$CGNAT_B" = 0 ] || NS="$NS cgnB"
-case "$NAT_ERRORS" in pass | drop) ;; *) echo "--nat-errors must be pass or drop" >&2; exit 1 ;; esac
+for e in "$NAT_A_ERRORS" "$NAT_B_ERRORS"; do
+  case "$e" in pass | drop) ;; *) echo "--nat-a-errors, --nat-b-errors: pass or drop" >&2; exit 1 ;; esac
+done
+for e in "$NAT_A_SOURCE" "$NAT_B_SOURCE"; do
+  case "$e" in inside | outside) ;; *) echo "--nat-a-source, --nat-b-source: inside or outside" >&2; exit 1 ;; esac
+done
 
 cleanup() {
   for ns in $NS; do
@@ -210,19 +230,28 @@ for l in "r1 w-a" "$A_SIDE a-w" "r$N w-b" "$B_SIDE b-w" "r$MID w-s" "server s-w"
   delay $l "$WAN_DELAY"
 done
 
-# nat NS WAN_IF WAN_ADDR GATEWAY KIND INPUT
+# err_source NS IF PREFIX OUT_ADDR: unless NS sends its errors from inside,
+# what it sends into IF's PREFIX, its ICMP errors among it, leaves from
+# OUT_ADDR.
+err_source() {
+  local where=$NAT_A_SOURCE
+  case "$1" in natB | cgnB) where=$NAT_B_SOURCE ;; esac
+  [ "$where" = inside ] || nsx "$1" ip route replace "$3" dev "$2" proto kernel scope link src "$4"
+}
+# nat NS WAN_IF WAN_ADDR GATEWAY KIND INPUT ERRORS
 nat() {
-  local ns=$1 wif=$2 kind=$5 input=$6
+  local ns=$1 wif=$2 kind=$5 input=$6 errors=$7
   nsx "$ns" ip addr add "$3/24" dev "$wif"
   nsx "$ns" ip route add default via "$4"
   nsx "$ns" ip link add lan type bridge
   nsx "$ns" ip link set lan up
   nsx "$ns" ip addr add 10.0.0.1/24 dev lan
+  err_source "$ns" lan 10.0.0.0/24 "$3"
   nsx "$ns" sysctl -qw net.ipv4.ip_forward=1
   local random=
   [ "$kind" = symmetric ] && random=--random-fully
   nsx "$ns" iptables -t nat -A POSTROUTING -o "$wif" -j MASQUERADE $random
-  if [ "$NAT_ERRORS" = drop ]; then
+  if [ "$errors" = drop ]; then
     nsx "$ns" iptables -A FORWARD -i "$wif" -p icmp -j DROP
   fi
   nsx "$ns" iptables -A FORWARD -i "$wif" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
@@ -248,6 +277,7 @@ cgnat() {
   nsx "$ns" ip addr add "$3/24" dev "$wif"
   nsx "$ns" ip route add default via "$4"
   nsx "$ns" ip addr add 100.64.0.1/24 dev in
+  err_source "$ns" in 100.64.0.0/24 "$3"
   nsx "$ns" sysctl -qw net.ipv4.ip_forward=1
   nsx "$ns" iptables -t nat -A POSTROUTING -o "$wif" -j MASQUERADE
   nsx "$ns" iptables -A FORWARD -i "$wif" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
@@ -262,15 +292,15 @@ cgnat() {
 }
 if [ "$CGNAT_A" = 1 ]; then
   cgnat cgnA natA 198.51.100.2 198.51.100.1 a-w
-  nat natA a-w 100.64.0.2 100.64.0.1 "$NAT_A" "$NAT_A_INPUT"
+  nat natA a-w 100.64.0.2 100.64.0.1 "$NAT_A" "$NAT_A_INPUT" "$NAT_A_ERRORS"
 else
-  nat natA a-w 198.51.100.2 198.51.100.1 "$NAT_A" "$NAT_A_INPUT"
+  nat natA a-w 198.51.100.2 198.51.100.1 "$NAT_A" "$NAT_A_INPUT" "$NAT_A_ERRORS"
 fi
 if [ "$CGNAT_B" = 1 ]; then
   cgnat cgnB natB 203.0.113.2 203.0.113.1 b-w
-  nat natB b-w 100.64.0.2 100.64.0.1 "$NAT_B" "$NAT_B_INPUT"
+  nat natB b-w 100.64.0.2 100.64.0.1 "$NAT_B" "$NAT_B_INPUT" "$NAT_B_ERRORS"
 else
-  nat natB b-w 203.0.113.2 203.0.113.1 "$NAT_B" "$NAT_B_INPUT"
+  nat natB b-w 203.0.113.2 203.0.113.1 "$NAT_B" "$NAT_B_INPUT" "$NAT_B_ERRORS"
 fi
 [ -z "$REBIND_AT" ] || nsx "$B_SIDE" ip addr add 203.0.113.3/24 dev b-w
 
@@ -373,7 +403,8 @@ SCENARIO="$SCENARIO master-first=$MASTER_FIRST prime-hops=${PRIME_HOPS:-default}
 [ "$TURN" = 0 ] || SCENARIO="$SCENARIO turn"
 [ "$CGNAT_A$CGNAT_B" = 00 ] || SCENARIO="$SCENARIO cgnat=$CGNAT_A/$CGNAT_B"
 [ "$SILENT_CGNAT" = 0 ] || SCENARIO="$SCENARIO silent-cgnat"
-[ "$NAT_ERRORS" = pass ] || SCENARIO="$SCENARIO nat-errors=drop"
+[ "$NAT_A_ERRORS$NAT_B_ERRORS" = passpass ] || SCENARIO="$SCENARIO nat-errors=$NAT_A_ERRORS/$NAT_B_ERRORS"
+[ "$NAT_A_SOURCE$NAT_B_SOURCE" = insideinside ] || SCENARIO="$SCENARIO nat-source=$NAT_A_SOURCE/$NAT_B_SOURCE"
 OK=0
 if [ "$RC" = 0 ] && grep -q "^authenticated" "$LOG/master.out"; then
   OK=1
