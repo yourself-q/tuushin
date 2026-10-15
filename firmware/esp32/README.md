@@ -243,6 +243,11 @@ container on an Apple M4 Mac, the master a simulated hand:
 | servo ticks | about 950 a second, 1 a second missed |
 | the simulation's load | 25 % of the motor time it covers while driving |
 
+Runs differ with the load on the host. Another, after States moved onto a
+lattice of their period, connected with a round trip of 0.81 ms, coupled
+at 691 N/m, carried 0.137 J, and lost no State through one stall of 74 ms
+in the virtual machine.
+
 What it took, and what differs from a chip:
 
 - **The tick is 1 ms**, not 200 us: QEMU runs the chip at no steady speed

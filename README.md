@@ -1205,8 +1205,8 @@ nothing and 3 to 4 N from one sample to the next as the slave left the
 object, and the 17.5 g knob bounced off it: with States 0.8 to 1.8 ms old
 and a command acting 0.9 ms after it is sent, the speed reversed within a
 sample, and that one sample did 0.7 mJ of work; the master made the
-other 0.6 mJ. Under QEMU, the ESP32 firmware at the slave dipped 0.35 mJ,
-and 1.27 mJ in an earlier run.
+other 0.6 mJ. Under QEMU, the ESP32 firmware at the slave dipped 0.35, 1.27
+and 2.1 mJ in three runs.
 
 ## Known issues
 
