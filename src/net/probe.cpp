@@ -90,6 +90,12 @@ wire::Header ProbeClient::next_probe(Nanos t1) {
   return h;
 }
 
+void ProbeClient::mark_unsent() {
+  if (records_.empty() || records_.back().unsent) return;
+  records_.back().unsent = true;
+  ++unsent_;
+}
+
 bool ProbeClient::on_datagram(const std::uint8_t* data, std::size_t size, Nanos t4) {
   const auto h = wire::decode_header(data, size);
   if (!h || h->type != wire::PacketType::kProbeEcho || h->session != session_ || h->echo_seq == 0 ||
@@ -171,14 +177,44 @@ DelayStats delay_stats(std::vector<double> delays, std::vector<std::pair<Nanos, 
   return s;
 }
 
-ProbeReport analyze_probes(const ProbeClient& client, Nanos clock_window) {
+ProbeReport analyze_probes(const ProbeClient& client, Nanos clock_window, Nanos until) {
   ProbeReport rep;
   const auto& recs = client.records();
-  rep.probes = recs.size();
   if (recs.empty()) return rep;
+  const std::size_t n = recs.size();
+
+  // The probes the report covers: sent, and before `until`.
+  std::vector<bool> used(n, false);
+  Nanos longest_rtt = 0;  // send to echo arrival
+  for (std::size_t k = 0; k < n; ++k) {
+    const auto& r = recs[k];
+    if (r.t1 >= until) break;
+    if (r.unsent) {
+      rep.unsent++;
+      continue;
+    }
+    used[k] = true;
+    if (r.echoed) longest_rtt = std::max(longest_rtt, r.t4 - r.t1);
+  }
+  // Where a run is cut, the client's network went away. A probe sent less
+  // than the longest round trip before the cut and still unanswered may
+  // have been on its way, or its echo on the way back, when it went; one
+  // sent earlier would have been answered before the cut.
+  if (until != INT64_MAX && longest_rtt > 0) {
+    for (std::size_t k = n; k-- > 0;) {
+      if (!used[k]) continue;
+      const auto& r = recs[k];
+      if (r.echoed || r.t1 < until - longest_rtt) break;
+      used[k] = false;
+      rep.in_flight++;
+    }
+  }
 
   std::vector<TimestampSample> samples;
-  for (const auto& r : recs) {
+  for (std::size_t k = 0; k < n; ++k) {
+    if (!used[k]) continue;
+    const auto& r = recs[k];
+    rep.probes++;
     if (r.echoed) samples.push_back({r.t1, r.t2, r.t3, r.t4});
     rep.duplicates += static_cast<std::size_t>(r.duplicates);
   }
@@ -187,13 +223,12 @@ ProbeReport analyze_probes(const ProbeClient& client, Nanos clock_window) {
 
   // Forward delays: measured where echoed, interpolated in t1 where only a
   // receipt map says the probe arrived.
-  const std::size_t n = recs.size();
   std::vector<double> fwd(n, 0.0);
   std::vector<bool> fwd_known(n, false);
   std::vector<double> holds;
   for (std::size_t k = 0; k < n; ++k) {
     const auto& r = recs[k];
-    if (!r.echoed) continue;
+    if (!used[k] || !r.echoed) continue;
     fwd[k] = static_cast<double>(r.t2 - r.t1) - clk.offset_at(r.t1);
     fwd_known[k] = true;
     holds.push_back(static_cast<double>(r.t3 - r.t2));
@@ -208,7 +243,7 @@ ProbeReport analyze_probes(const ProbeClient& client, Nanos clock_window) {
         prev = k;
         continue;
       }
-      if (!recs[k].reflector_received) continue;
+      if (!used[k] || !recs[k].reflector_received) continue;
       if (next <= k) {
         next = k + 1;
         while (next < n && !fwd_known[next]) ++next;
@@ -231,7 +266,8 @@ ProbeReport analyze_probes(const ProbeClient& client, Nanos clock_window) {
   const Nanos t0 = recs.front().t1;
   std::vector<double> fwd_measured, bwd_measured, rtts;
   std::vector<std::pair<Nanos, double>> fwd_arrivals, bwd_arrivals;
-  std::vector<bool> fwd_lost(n, false);
+  std::vector<bool> fwd_lost;
+  fwd_lost.reserve(n);
   struct Backward {
     Nanos send_offset;
     Nanos delay;
@@ -244,10 +280,11 @@ ProbeReport analyze_probes(const ProbeClient& client, Nanos clock_window) {
   std::vector<std::pair<std::uint32_t, Nanos>> echo_order;
   Nanos max_t2 = INT64_MIN;
   for (std::size_t k = 0; k < n; ++k) {
+    if (!used[k]) continue;
     const auto& r = recs[k];
     rep.fwd.sent++;
+    fwd_lost.push_back(!r.reflector_received);
     if (!r.reflector_received) {
-      fwd_lost[k] = true;
       rep.fwd.lost++;
       if (!r.covered) rep.ambiguous++;
       rep.fwd_trace.entries.push_back({r.t1 - t0, -1});

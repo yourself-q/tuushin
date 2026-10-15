@@ -199,13 +199,13 @@ void write_raw(const std::string& path, const net::ProbeClient& c) {
   std::ofstream f(path);
   if (!f) throw std::runtime_error("cannot write " + path);
   f << "# t1, t4: client monotonic clock; t2, t3: reflector clock; ns\n";
-  f << "seq,t1,t2,t3,t4,reflector_seq,echoed,reflector_received,duplicates\n";
+  f << "seq,t1,t2,t3,t4,reflector_seq,echoed,reflector_received,duplicates,unsent\n";
   const auto& recs = c.records();
   for (std::size_t k = 0; k < recs.size(); ++k) {
     const auto& r = recs[k];
     f << (k + 1) << ',' << r.t1 << ',' << r.t2 << ',' << r.t3 << ',' << r.t4 << ','
       << r.reflector_seq << ',' << (r.echoed ? 1 : 0) << ',' << (r.reflector_received ? 1 : 0)
-      << ',' << r.duplicates << '\n';
+      << ',' << r.duplicates << ',' << (r.unsent ? 1 : 0) << '\n';
   }
 }
 
@@ -285,9 +285,15 @@ int run_measure(const MeasureOptions& o) {
   bool sending = true;
   std::vector<Nanos> lateness;  // pacing error of each send
   lateness.reserve(static_cast<std::size_t>(o.rate * o.duration) + 16);
-  std::size_t send_failures = 0, skipped = 0;
+  std::size_t skipped = 0;
   Nanos next_report = start + kNanosPerSecond;
   std::size_t echoes_at_report = 0, sent_at_report = 0;
+  // Every send failing for a second means the network this host reaches the
+  // reflector through has gone away (a tethered phone unplugged, Wi-Fi
+  // lost). The run ends where the failures began.
+  Nanos fail_since = -1;
+  Nanos cut = INT64_MAX;
+  std::string cut_note;
 
   for (;;) {
     Nanos now = monotonic_now();
@@ -308,7 +314,24 @@ int run_measure(const MeasureOptions& o) {
       const Nanos t1 = monotonic_now();
       lateness.push_back(t1 - next);
       wire::encode_padded(client.next_probe(t1), padding, out);
-      if (!sock.send_to(*peer, out.data(), out.size())) ++send_failures;
+      if (sock.send_to(*peer, out.data(), out.size())) {
+        fail_since = -1;
+      } else {
+        const int err = errno;
+        client.mark_unsent();
+        if (fail_since < 0) fail_since = t1;
+        if (t1 - fail_since >= kNanosPerSecond) {
+          char note[256];
+          std::snprintf(note, sizeof note,
+                        "the run ended at %.3f s: every send failed from then on (%s)",
+                        to_seconds(fail_since - start), std::strerror(err));
+          cut_note = note;
+          cut = fail_since;
+          sending = false;
+          stop_at = monotonic_now() + grace;
+          std::fprintf(stderr, "%s\n", note);
+        }
+      }
       next += interval;
       now = monotonic_now();
     }
@@ -332,11 +355,17 @@ int run_measure(const MeasureOptions& o) {
     }
   }
 
-  const net::ProbeReport rep = net::analyze_probes(client);
+  const net::ProbeReport rep = net::analyze_probes(client, kNanosPerSecond, cut);
   std::printf("path %s, %zu-byte probes at %.0f Hz, started %s\n", peer->to_string().c_str(), o.size,
               o.rate, started.c_str());
-  std::printf("probes %zu  echoes %zu  duplicates %zu  stray %zu  send failures %zu  skipped %zu\n",
-              rep.probes, client.echoes(), rep.duplicates, client.stray(), send_failures, skipped);
+  if (!cut_note.empty()) {
+    std::printf("%s; the figures cover the probes sent before, less %zu unanswered just before, "
+                "which may have been on their way when it went\n",
+                cut_note.c_str(), rep.in_flight);
+  }
+  std::printf("probes %zu  echoes %zu  duplicates %zu  stray %zu  send failures %zu (not counted as "
+              "sent)  skipped %zu\n",
+              rep.probes, client.echoes(), rep.duplicates, client.stray(), rep.unsent, skipped);
   print_delay("rtt  ms", rep.rtt);
   print_delay("fwd  ms", rep.fwd.delay);
   print_delay("bwd  ms", rep.bwd.delay);
@@ -363,6 +392,10 @@ int run_measure(const MeasureOptions& o) {
     net::Trace fwd = rep.fwd_trace, bwd = rep.bwd_trace;
     fwd.comments.insert(fwd.comments.begin(), std::string(meta) + ", client -> reflector");
     bwd.comments.insert(bwd.comments.begin(), std::string(meta) + ", reflector -> client");
+    if (!cut_note.empty()) {
+      fwd.comments.insert(fwd.comments.begin() + 1, cut_note);
+      bwd.comments.insert(bwd.comments.begin() + 1, cut_note);
+    }
     fwd.save_csv(o.out + ".fwd.csv");
     bwd.save_csv(o.out + ".bwd.csv");
     write_raw(o.out + ".raw.csv", client);

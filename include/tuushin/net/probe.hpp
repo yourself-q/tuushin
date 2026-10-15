@@ -75,6 +75,7 @@ struct ProbeRecord {
   int duplicates = 0;              // further echoes for the same probe
   bool reflector_received = false;  // known from an echo or a receipt map
   bool covered = false;             // some receipt map spoke about this probe
+  bool unsent = false;              // the send call failed, so the probe never left
 };
 
 // Client side: hands out probe headers and collects echoes.
@@ -85,12 +86,18 @@ class ProbeClient {
   // Header of the next probe, sent at `t1`.
   wire::Header next_probe(Nanos t1);
 
+  // Marks the probe last handed out by next_probe() as never sent: its send
+  // call failed. Such a probe counts as neither sent nor lost.
+  void mark_unsent();
+
   // Feeds a received datagram. Returns true if it was an echo of this
   // session's probes.
   bool on_datagram(const std::uint8_t* data, std::size_t size, Nanos t4);
 
   std::uint32_t session() const { return session_; }
+  // Probes handed out by next_probe(), unsent ones included.
   std::size_t sent() const { return records_.size(); }
+  std::size_t unsent() const { return unsent_; }
   std::size_t echoes() const { return echoes_; }
   std::size_t stray() const { return stray_; }
   // Indexed by probe seq - 1.
@@ -99,6 +106,7 @@ class ProbeClient {
  private:
   std::uint32_t session_;
   std::vector<ProbeRecord> records_;
+  std::size_t unsent_ = 0;
   std::size_t echoes_ = 0;
   std::size_t stray_ = 0;
 };
@@ -128,7 +136,9 @@ struct DirectionReport {
 
 struct ProbeReport {
   ClockModel clock;
-  std::size_t probes = 0;
+  std::size_t probes = 0;     // probes sent, less the unsent and left-out ones
+  std::size_t unsent = 0;     // probes whose send call failed
+  std::size_t in_flight = 0;  // unanswered probes just before `until`, left out
   std::size_t duplicates = 0;
   // Probes with neither an echo nor a receipt map that mentions them (a run
   // of more than 64 lost echoes, or the end of the run). Counted as forward
@@ -143,8 +153,12 @@ struct ProbeReport {
 };
 
 // Analyses everything the client collected. `clock_window` is the window of
-// fit_clock.
-ProbeReport analyze_probes(const ProbeClient& client, Nanos clock_window = kNanosPerSecond);
+// fit_clock. Probes sent at or after `until` are left out, for a run cut
+// short where the client's network went away; so are the unanswered probes
+// leading up to `until`, back to the longest round trip seen, as they or
+// their echoes may have been on their way when it went.
+ProbeReport analyze_probes(const ProbeClient& client, Nanos clock_window = kNanosPerSecond,
+                           Nanos until = INT64_MAX);
 
 // One direction of a path whose two ends read the same clock: two sockets
 // of one host, on two of its networks (tuushin-probe pair). Each delay is a

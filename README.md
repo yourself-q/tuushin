@@ -986,6 +986,8 @@ and the reverse.
   run ends where the failures began: what follows is not the path's loss,
   nor are the losses just before it, back to the longest delay seen, as
   those probes may have been on their way to the end when it went.
+  `measure` does the same where its own sends fail, leaving out the
+  unanswered probes back to the longest round trip seen.
 
 `tools/pair_lab.sh` puts each of two interfaces of one network namespace
 behind its own NAT, the NATs meet in a router that runs coturn as the STUN

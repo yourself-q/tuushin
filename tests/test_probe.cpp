@@ -273,6 +273,60 @@ TEST_CASE(probe_traces_replay_the_measured_path) {
   CHECK_NEAR(rep.fwd.delay.rfc3550_jitter, 0.0, 2.0);
 }
 
+TEST_CASE(probe_leaves_out_unsent_probes_and_the_time_after_a_cut) {
+  // Twelve probes 1 ms apart over 2 ms each way. Probe 2 is lost on the way
+  // out and probe 3's send fails. At 7.5 ms the client's network goes away:
+  // the reflector still gets probes 5 to 8, but no echo comes back after
+  // that, and from probe 9 (8 ms) every send fails. The run is cut at 8 ms.
+  ProbeClient client(9);
+  ProbeReflector reflector;
+  std::vector<std::uint8_t> buf;
+  const Nanos t0 = 2 * kNanosPerSecond, gone = t0 + 7'500'000;
+  for (int k = 1; k <= 12; ++k) {
+    const Nanos t1 = t0 + (k - 1) * kNanosPerMilli;
+    wire::encode_padded(client.next_probe(t1), 68, buf);
+    if (k == 3 || t1 >= gone) {
+      client.mark_unsent();
+      client.mark_unsent();  // once per probe
+      continue;
+    }
+    if (k == 2) continue;
+    const auto h = wire::decode_header(buf.data(), buf.size());
+    const Nanos t2 = t1 + from_millis(2);
+    const auto echo = reflector.on_probe(*h, t2, t2);
+    REQUIRE(echo.has_value());
+    const Nanos t4 = t2 + from_millis(2);
+    if (t4 >= gone) continue;
+    wire::encode_probe_echo(echo->header, echo->receipts, echo->payload, buf);
+    CHECK(client.on_datagram(buf.data(), buf.size(), t4));
+  }
+  CHECK(client.sent() == 12 && client.unsent() == 5 && client.echoes() == 2);
+
+  // Uncut, probes 5 to 8 read as forward losses with no receipt map to say
+  // otherwise.
+  const ProbeReport whole = analyze_probes(client);
+  CHECK(whole.unsent == 5 && whole.in_flight == 0);
+  CHECK(whole.probes == 7 && whole.fwd.sent == 7 && whole.fwd.lost == 5);
+  CHECK(whole.ambiguous == 4 && whole.fwd.longest_burst == 4);
+
+  // Probes 9 to 12 come after the cut. Probes 5 to 8, sent within 4 ms of
+  // it (the longest round trip seen), may have been on their way; probe 2,
+  // sent long before and covered by probe 4's receipt map, stays lost.
+  const ProbeReport cut = analyze_probes(client, kNanosPerSecond, t0 + 8 * kNanosPerMilli);
+  CHECK(cut.unsent == 1 && cut.in_flight == 4);
+  CHECK(cut.probes == 3 && cut.fwd.sent == 3 && cut.fwd.lost == 1 && cut.ambiguous == 0);
+  CHECK(cut.bwd.sent == 2 && cut.bwd.lost == 0 && cut.interpolated == 0);
+  CHECK(cut.fwd.longest_burst == 1);
+  REQUIRE(cut.fwd_trace.entries.size() == 3);
+  // Probe 3 leaves no entry: the trace goes from 1 ms to 3 ms.
+  CHECK(cut.fwd_trace.entries[0].send_offset == 0 && cut.fwd_trace.entries[0].delay == from_millis(2));
+  CHECK(cut.fwd_trace.entries[1].send_offset == kNanosPerMilli && cut.fwd_trace.entries[1].lost());
+  CHECK(cut.fwd_trace.entries[2].send_offset == 3 * kNanosPerMilli &&
+        cut.fwd_trace.entries[2].delay == from_millis(2));
+  CHECK(cut.bwd_trace.entries.size() == 2);
+  CHECK_NEAR(cut.rtt.max, 4e6, 0.0);
+}
+
 TEST_CASE(one_clock_direction_measures_each_delay) {
   // Delays by hand: a loss, a duplicate, two probes that swap places, a
   // stray from another session and an echo, all through the wire format.
