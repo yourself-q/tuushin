@@ -914,7 +914,8 @@ simulations in all:
 | exact | Starlink | −4.9e−15 J | 38 % | 59 N/s | 357 N/m | none |
 | | constant | −1.6e−15 J | 37 % | 35 N/s | 337 N/m | none |
 
-The margins below zero are rounding. With encoders whose resolution the
+The margins below zero are the predictor's misses of a few femtojoules,
+not rounding (Both directions on one clock). With encoders whose resolution the
 controllers know, the path costs nothing beyond its median delays: the
 same share of the contact force, the same chatter (on one run also with
 1, 5 and 20 µm master encoders). With exact readings, which nothing
@@ -1030,6 +1031,48 @@ before (most 70 to 90), with no loss before it and next to nothing in the
 other direction at the same moment. So they are not at the Mac's Wi-Fi, which both directions cross,
 but on one direction's own stretch: the mobile downlink most likely,
 though this run cannot tell it from the home uplink.
+
+Two shorter runs told the rest. One, of 120 s, ran beside the phone's
+baseband log: the phone was on 5G NSA for the first 20 s and on LTE after,
+and the stalls went on, 38 a minute on 5G and 69 on LTE. In the other, of
+60 s, each interface also sent ICMP echoes at 100 Hz to one public anycast
+resolver. From the Wi-Fi, over the home line alone, none of 6000 came back
+more than 16 ms over the median (22.9 ms at most); from the phone, 159
+stalls rose 40 ms over it, and 160 of the 178 on the way to the phone fell
+within 50 ms of one of them, where 29 % would by chance (the two sets of
+stamps aligned at the best offset). The stalls are the mobile downlink's,
+on LTE as on 5G.
+
+The reflective scheme on these traces, cut into 20 s windows (41 from the
+long run, 6 from each 120 s run, 1 from a 30 s run), nine hand motions on
+each as under *Coarse encoders*, forward to the phone (the robot behind
+it, as with Starlink), against constant delays at each window's medians:
+
+| encoders | path | worst true margin | force displayed | total variation | displayed stiffness | diverged |
+|---|---|---|---|---|---|---|
+| 55 µm and 1 µm, known | home and phone | 0 J | 27 % | 38 N/s | 241 N/m | none |
+| | delays capped at 33 and 44 ms | 0 J | 27 % | 38 N/s | 260 N/m | none |
+| | constant | 0 J | 28 % | 39 N/s | 274 N/m | none |
+| exact | home and phone | −2.5e−15 J | 41 % | 69 N/s | 397 N/m | none |
+| | delays capped at 33 and 44 ms | −1.7e−15 J | 43 % | 67 N/s | 453 N/m | none |
+| | constant | 0 J | 46 % | 48 N/s | 525 N/m | none |
+
+Unlike Starlink, this path costs something beyond its medians: 12 % of
+the displayed stiffness with real encoders and 24 % with exact ones.
+Capping each delay at the long run's 90th percentile (33 ms to the phone,
+44 ms back) gave back about three fifths of it with real encoders and two
+fifths with exact ones, and next to none of the extra chatter (69 to
+67 N/s, against 48): the stalls soften the wall, and the chatter comes
+from the jitter below them. With the directions swapped (the robot on the
+Wi-Fi) it was the same, 248 against 273 N/m and 404 against 525. The
+margins below zero are not rounding. Each of the eight looked at (the
+largest here and seven from the Starlink runs) was one sample's overshoot
+at one end, seven of them at the master: the work the predictor let
+through (`predictive_pc.hpp`) went past what was left by tens to tens of
+thousands of times the last bit of the books. That is model error, which
+the margin covers only once it has been seen (Known issues). The largest,
+−6.5e−13 J in one of the 3888 runs (swapped, exact encoders), was 0.3 % of
+that sample's 0.2 nJ.
 
 Two things on the Mac got in the way. macOS did not bring the phone's USB
 interface up by itself (`sudo ifconfig en6 up`, with en6 the phone's
