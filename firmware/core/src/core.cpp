@@ -56,7 +56,7 @@ void DeviceCore::begin() {
     latch(Fault::kEncoder);
   }
   last_us_ = hal_.micros();
-  last_state_us_ = last_us_;
+  next_state_us_ = last_us_ + state_period_us_;
   started_ = true;
 }
 
@@ -139,8 +139,17 @@ void DeviceCore::tick() {
   }
 
 
-  if (static_cast<std::uint32_t>(now - last_state_us_) >= state_period_us_) {
-    last_state_us_ = now;
+  // States go out on a lattice of the period, not a period after the last
+  // one went: a tick that came a little early would otherwise wait a whole
+  // tick, and every gap would stretch by the jitter. A tick within half a
+  // tick of its slot takes it; one that finds the next slot already passed
+  // (a stall) starts the lattice again from now instead of sending a burst.
+  const std::int32_t late = static_cast<std::int32_t>(now - next_state_us_);
+  if (late >= -static_cast<std::int32_t>(cfg_.tick_us / 2)) {
+    next_state_us_ += state_period_us_;
+    if (static_cast<std::int32_t>(next_state_us_ - now) <= 0) {
+      next_state_us_ = now + state_period_us_;
+    }
     send_state(now);
   }
 }

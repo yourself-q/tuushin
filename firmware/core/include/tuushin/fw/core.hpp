@@ -159,7 +159,7 @@ class DeviceCore {
   float cal_turn_[3] = {0.0f, 0.0f, 0.0f};   // and over turns
 
   std::uint16_t state_seq_ = 0;
-  std::uint32_t last_state_us_ = 0;
+  std::uint32_t next_state_us_ = 0;  // the next slot on the State lattice
   device::State st_;
   bool resync_ = false;  // a frame went out cut short: send a delimiter first
   std::uint32_t dropped_ = 0;

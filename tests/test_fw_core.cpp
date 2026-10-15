@@ -429,13 +429,47 @@ TEST_CASE(fw_zero_and_state_stream) {
   for (std::size_t i = 1; i < rig.states.size(); ++i) {
     CHECK(static_cast<std::uint16_t>(rig.states[i].seq - rig.states[i - 1].seq) == 1);
     const std::uint32_t gap = rig.states[i].time_us - rig.states[i - 1].time_us;
-    CHECK(gap >= 1000 && gap <= 1200);
+    CHECK(gap == 1000);  // the rig ticks without jitter: the lattice exactly
   }
   rig.plant.set_load(0.0);
   rig.bare(MsgType::kZero);
   rig.run(0.002);
   CHECK(rig.core.count() == 0);
   CHECK(rig.states.back().count == 0);
+}
+
+// The ticks of a board come a few microseconds early or late; the States
+// stay at their period on average all the same, which a period counted
+// from the last State's tick does not: a tick a microsecond early makes it
+// wait a whole tick more.
+TEST_CASE(fw_states_keep_their_period_through_jitter) {
+  struct Case {
+    std::uint32_t tick_us;
+    double jitter_us;  // each tick uniformly this much early or late
+    double late_us;    // and late by this much more
+  };
+  for (const Case& k : {Case{200, 5.0, 0.0}, Case{200, 0.0, 20.0}, Case{1000, 50.0, 0.0}}) {
+    PlantParams p = quiet_plant();
+    DeviceConfig c = config_for(p);
+    c.tick_us = k.tick_us;
+    Rig rig(p, c);
+    std::uint64_t x = 0x9E3779B97F4A7C15ull;
+    const int ticks = static_cast<int>(2e6 / k.tick_us);
+    for (int i = 1; i <= ticks; ++i) {
+      x ^= x << 13;
+      x ^= x >> 7;
+      x ^= x << 17;
+      const double u = static_cast<double>(x >> 11) * 0x1.0p-53;
+      rig.t = i * k.tick_us * 1e-6 + ((2.0 * u - 1.0) * k.jitter_us + u * k.late_us) * 1e-6;
+      rig.hal.set_time(rig.t);
+      rig.core.tick();
+      rig.pump();
+    }
+    // 2 s of a State a millisecond.
+    std::printf("  tick %u us, jitter %.0f us, late %.0f us: %zu States in 2 s\n", k.tick_us,
+                k.jitter_us, k.late_us, rig.states.size());
+    CHECK(rig.states.size() >= 1998 && rig.states.size() <= 2001);
+  }
 }
 
 TEST_CASE(fw_plant_float_forces_track_double) {
