@@ -276,6 +276,7 @@ int run_measure(const MeasureOptions& o) {
   }
 
   const Nanos start = monotonic_now();
+  const std::string started = utc_now();
   const Nanos send_end = start + from_seconds(o.duration);
   // Echoes still in flight when sending stops: wait a generous RTT.
   const Nanos grace = 2 * kNanosPerSecond;
@@ -332,8 +333,8 @@ int run_measure(const MeasureOptions& o) {
   }
 
   const net::ProbeReport rep = net::analyze_probes(client);
-  std::printf("path %s, %zu-byte probes at %.0f Hz, %s\n", peer->to_string().c_str(), o.size, o.rate,
-              utc_now().c_str());
+  std::printf("path %s, %zu-byte probes at %.0f Hz, started %s\n", peer->to_string().c_str(), o.size,
+              o.rate, started.c_str());
   std::printf("probes %zu  echoes %zu  duplicates %zu  stray %zu  send failures %zu  skipped %zu\n",
               rep.probes, client.echoes(), rep.duplicates, client.stray(), send_failures, skipped);
   print_delay("rtt  ms", rep.rtt);
@@ -357,8 +358,8 @@ int run_measure(const MeasureOptions& o) {
 
   if (!o.out.empty()) {
     char meta[256];
-    std::snprintf(meta, sizeof meta, "tuushin-probe measure %s, %zu bytes at %.0f Hz, %.0f s, %s",
-                  o.host.c_str(), o.size, o.rate, o.duration, utc_now().c_str());
+    std::snprintf(meta, sizeof meta, "tuushin-probe measure %s, %zu bytes at %.0f Hz, %.0f s, started %s",
+                  o.host.c_str(), o.size, o.rate, o.duration, started.c_str());
     net::Trace fwd = rep.fwd_trace, bwd = rep.bwd_trace;
     fwd.comments.insert(fwd.comments.begin(), std::string(meta) + ", client -> reflector");
     bwd.comments.insert(bwd.comments.begin(), std::string(meta) + ", reflector -> client");
@@ -564,6 +565,7 @@ int run_pair(const PairOptions& o) {
   std::vector<std::uint8_t> in(wire::kMaxDatagram + 1), out;
   net::UdpSocket* const both[2] = {&a.sock, &b.sock};
   const Nanos start = monotonic_now();
+  const std::string started = utc_now();
   const Nanos send_end = start + from_seconds(o.duration);
   const Nanos grace = 2 * kNanosPerSecond;
   Nanos next = start, stop_at = send_end;
@@ -617,8 +619,8 @@ int run_pair(const PairOptions& o) {
 
   const net::OneClockReport rab = net::analyze_one_clock(ab), rba = net::analyze_one_clock(ba);
   const std::string nab = o.a + "->" + o.b, nba = o.b + "->" + o.a;
-  std::printf("pair %s and %s, %zu-byte probes at %.0f Hz, one clock, %s\n", o.a.c_str(),
-              o.b.c_str(), o.size, o.rate, utc_now().c_str());
+  std::printf("pair %s and %s, %zu-byte probes at %.0f Hz, one clock, started %s\n", o.a.c_str(),
+              o.b.c_str(), o.size, o.rate, started.c_str());
   std::printf("probes %zu each way  duplicates %zu/%zu  stray %zu/%zu  send failures %zu  skipped %zu\n",
               rab.dir.sent, rab.duplicates, rba.duplicates, ab.stray(), ba.stray(), send_failures,
               skipped);
@@ -636,8 +638,8 @@ int run_pair(const PairOptions& o) {
 
   if (!o.out.empty()) {
     char meta[256];
-    std::snprintf(meta, sizeof meta, "tuushin-probe pair, %zu bytes at %.0f Hz, %.0f s, %s", o.size,
-                  o.rate, o.duration, utc_now().c_str());
+    std::snprintf(meta, sizeof meta, "tuushin-probe pair, %zu bytes at %.0f Hz, %.0f s, started %s",
+                  o.size, o.rate, o.duration, started.c_str());
     net::Trace tab = rab.trace, tba = rba.trace;
     tab.comments.insert(tab.comments.begin(), std::string(meta) + ", " + nab);
     tba.comments.insert(tba.comments.begin(), std::string(meta) + ", " + nba);
