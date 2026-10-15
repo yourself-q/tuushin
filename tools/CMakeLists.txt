@@ -7,6 +7,9 @@ target_link_libraries(tuushin-probe PRIVATE tuushin)
 add_executable(tuushin-teleop tuushin_teleop.cpp)
 target_link_libraries(tuushin-teleop PRIVATE tuushin)
 
+add_executable(tuushin-devsim tuushin_devsim.cpp)
+target_link_libraries(tuushin-devsim PRIVATE tuushin_fw)
+
 # tuushin-netreplay replays traces on a Linux interface with an eBPF
 # program, so it needs Linux, clang (for the BPF target) and libbpf, which
 # is offered under LGPL-2.1 or BSD-2-Clause and used here under the latter.

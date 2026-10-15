@@ -66,6 +66,7 @@ struct DeviceSpec {
   std::uint16_t port = 0;
   int baud = 921600;
   RemoteConfig config;
+  bool damping_given = false;  // the spec set damping=, which a caller's default must not override
 };
 // Throws std::runtime_error on a malformed spec.
 DeviceSpec parse_device_spec(const std::string& spec);
@@ -122,10 +123,17 @@ class RemoteDevice final : public teleop::Device1D {
   double encoder_resolution() const;  // m
   double max_force() const;           // N: the torque limit in effect / r
   double torque_limit() const { return torque_limit_; }
+  double damping() const { return damping_; }  // N m s/rad on the device's ticks
+  double radius() const { return cfg_.radius; }
+  Nanos state_period() const { return cfg_.state_period; }
   // Work the device booked for the host's torque since connecting (J).
   double actuator_work() const;
   // The least round trip so far (ns), 0 before any.
   Nanos least_round_trip() const;
+  // The least round trip of the parameters set while connecting (ns): the
+  // link both ways and the wait for the device's next tick, known before
+  // any command.
+  Nanos connect_round_trip() const { return ack_rtt_; }
   RemoteStats stats() const;
   std::string name() const { return stream_->name(); }
 
@@ -192,6 +200,8 @@ class RemoteDevice final : public teleop::Device1D {
   bool sent_any_ = false;
   Nanos sent_at_[64] = {};
   float torque_limit_ = 0.0f;
+  float damping_ = 0.0f;
+  Nanos ack_rtt_ = 0;
   double work0_ = 0.0;
   State used_;  // the State the last read used
   mutable std::string fault_;

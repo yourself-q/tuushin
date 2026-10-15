@@ -196,6 +196,9 @@ TEST_CASE(remote_force_turns_the_knob_against_a_hand) {
 TEST_CASE(remote_measures_the_round_trip) {
   Bench b(quiet(), 0.5e-3);
   b.dev->connect();
+  // Known from the parameters' acknowledgements before any command.
+  CHECK(b.dev->connect_round_trip() >= 1.0e6 - 1e3);
+  CHECK(b.dev->connect_round_trip() <= 1.4e6 + 1e3);
   b.hold();
   b.run(0.5, 0.2);
   const RemoteStats s = b.dev->stats();
@@ -250,7 +253,7 @@ TEST_CASE(remote_reports_faults_and_a_silent_device) {
     REQUIRE(f != nullptr);
     CHECK(std::string(f) == "device fault: encoder");
     CHECK(!b.link->hal().driver_on());
-    CHECK(b.logged("device: fault: encoder"));
+    CHECK(b.logged("firmware: fault: encoder"));
   }
   {
     Bench b;

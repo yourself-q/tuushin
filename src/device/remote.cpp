@@ -97,6 +97,7 @@ DeviceSpec parse_device_spec(const std::string& spec) {
       c.torque_limit = parse_number(value, key);
     } else if (key == "damping") {
       c.damping = parse_number(value, key);
+      d.damping_given = true;
     } else if (key == "velocity-limit") {
       c.velocity_limit = parse_number(value, key);
     } else if (key == "state-us") {
@@ -185,7 +186,7 @@ void RemoteDevice::pump_locked(Nanos t) {
       } else if (decode(m, &info_)) {
         have_info_ = true;
       } else if (decode_log(m, text, sizeof text)) {
-        say(std::string("device: ") + text);
+        say(std::string("firmware: ") + text);
       }
     }
     if (static_cast<std::size_t>(n) < sizeof buf) break;
@@ -293,6 +294,7 @@ float RemoteDevice::set_param(Param p, double value) {
     s.param = p;
     s.value = static_cast<float>(value);
     std::uint8_t frame[kMaxFrame];
+    const Nanos sent = now();
     send(frame, encode(s, frame));
     Ack got;
     const bool ok = wait_for(
@@ -307,6 +309,8 @@ float RemoteDevice::set_param(Param p, double value) {
         },
         now() + kAckWait);
     if (ok) {
+      const Nanos rtt = now() - sent;
+      if (ack_rtt_ == 0 || rtt < ack_rtt_) ack_rtt_ = rtt;
       if (got.status != AckStatus::kOk) {
         throw std::runtime_error(std::string("the device refused its ") + param_name(p));
       }
@@ -370,7 +374,7 @@ void RemoteDevice::connect() {
   set_param(Param::kWatchdogUs, static_cast<double>(cfg_.watchdog) / 1e3);
   set_param(Param::kStatePeriodUs, static_cast<double>(cfg_.state_period) / 1e3);
   set_param(Param::kLinkTimeoutUs, static_cast<double>(cfg_.link_timeout) / 1e3);
-  set_param(Param::kDamping, cfg_.damping);
+  damping_ = set_param(Param::kDamping, cfg_.damping);
   if (cfg_.velocity_limit > 0.0) set_param(Param::kVelocityLimit, cfg_.velocity_limit);
   torque_limit_ = set_param(Param::kTorqueLimit,
                             cfg_.torque_limit > 0.0 ? cfg_.torque_limit : info_.max_torque);

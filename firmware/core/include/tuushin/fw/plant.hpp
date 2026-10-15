@@ -45,6 +45,15 @@ struct PlantParams {
   double start_angle = 0.3;  // rad, in the encoder's frame
 };
 
+// Something the knob runs into as it turns up past `angle`: a spring and
+// a damper that only push (a robot's knob touching an object).
+struct StopParams {
+  bool present = false;
+  double angle = 1.0;  // rad
+  double k = 2.0;      // N m/rad (5000 N/m at a 20 mm radius)
+  double b = 2e-3;     // N m s/rad
+};
+
 // A hand holding the knob: a spring and a damper at the rim, pulling it
 // towards a reference that moves as in teleop::OperatorParams.
 struct HandParams {
@@ -70,6 +79,7 @@ class Plant {
   std::uint32_t encoder_raw();
 
   void set_hand(const HandParams& h, double t0);
+  void set_stop(const StopParams& s) { stop_ = s; }
   // An external torque (N m) besides the hand, held until changed.
   void set_load(double torque) { load_ = torque; }
 
@@ -81,15 +91,18 @@ class Plant {
   // Work done on the shaft by the motor so far (J).
   double motor_work() const { return work_; }
   double hand_torque() const;
+  double stop_torque() const { return stop_at(theta_, omega_); }
   const PlantParams& params() const { return p_; }
 
  private:
   double torque_at(double theta, double omega) const;
   double hand_at(double t, double theta, double omega) const;
+  double stop_at(double theta, double omega) const;
 
   PlantParams p_;
   HandParams hand_;
   double hand_t0_ = 0.0;
+  StopParams stop_;
   double load_ = 0.0;
   bool enabled_ = false;
   double va_ = 0.0, vb_ = 0.0, vc_ = 0.0;
@@ -99,6 +112,10 @@ class Plant {
   double spare_ = 0.0;
   bool have_spare_ = false;
 };
+
+// The firmware's view of a simulated motor: its parameters as a datasheet
+// would give them, the knob's inertia, and kSimulated for its kind.
+DeviceConfig device_config_for(const PlantParams& p, const char* name = "sim");
 
 // The board, simulated: a Hal over a Plant, on a clock the caller sets, with
 // the host link as two byte queues. A latency delays the bytes each way,

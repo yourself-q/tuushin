@@ -1,5 +1,6 @@
 #include "tuushin/rt/thread.hpp"
 
+#include <algorithm>
 #include <cstdint>
 
 #if defined(__APPLE__)
@@ -25,8 +26,13 @@ std::string prefer_low_latency(Nanos period) {
   thread_time_constraint_policy_data_t p{};
   p.period = ticks(period);
   // Up to a fifth of the period of computation, finished within half of it.
-  p.computation = ticks(period / 5);
-  p.constraint = ticks(period / 2);
+  // The kernel refuses a computation under its least real-time quantum
+  // (50 us accepted, 40 us refused on macOS 26), which a fifth of a short
+  // period is: then that quantum, and a constraint no shorter.
+  constexpr Nanos kLeastQuantum = 50 * 1000;
+  const Nanos computation = std::max(period / 5, kLeastQuantum);
+  p.computation = ticks(computation);
+  p.constraint = ticks(std::max(period / 2, computation));
   p.preemptible = 1;
   const kern_return_t r =
       thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY,

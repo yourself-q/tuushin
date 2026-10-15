@@ -29,6 +29,13 @@
 // Both ends can impair their outgoing datagrams in-process to try a path on
 // loopback: --emulate-delay 25 on each end gives a 50 ms round trip, and
 // --emulate-trace replays a path recorded with tuushin-probe.
+//
+// --device SPEC drives a knob running the firmware in firmware/ (or
+// tuushin-devsim, its simulation) instead of the simulated device, over a
+// serial port or TCP:
+//
+//   tuushin-teleop slave --device /dev/cu.usbmodem1101
+//   tuushin-teleop master HOST --device serial:/dev/ttyACM0,radius=0.025
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -49,6 +56,7 @@
 #include <utility>
 
 #include "tuushin/crypto/noise.hpp"
+#include "tuushin/device/remote.hpp"
 #include "tuushin/net/channel.hpp"
 #include "tuushin/net/rendezvous.hpp"
 #include "tuushin/net/trace.hpp"
@@ -81,6 +89,9 @@ void usage() {
                "      --contact-force      report the contact force, not the coupling force\n"
                "                           (not with reflect, which needs the coupling force)\n"
                "      --wall-k K           simulated wall stiffness in N/m (5000)\n"
+               "      --kp K               coupling stiffness in N/m (2000; with --device,\n"
+               "                           what the device's damping and delay allow)\n"
+               "      --kd B               coupling damping in N s/m (60; 0 with --device)\n"
                "      --log PREFIX         per-session CSV log PREFIX<session>.csv\n"
                "      --hello-state FILE   keep the newest answered hello's time in FILE, so\n"
                "                           that hellos recorded before a restart stay refused\n"
@@ -117,8 +128,14 @@ void usage() {
                "      --deadband K         perceptual deadband with Weber fraction K\n"
                "      --dscp D             DSCP of outgoing datagrams (46)\n"
                "      --no-rt              do not ask for low-latency scheduling\n"
-               "      --watchdog MS        the simulated device cuts its force after MS\n"
-               "                           without a command (two periods; 0 disables)\n"
+               "      --device SPEC        drive a device running the firmware instead of the\n"
+               "                           simulated one: serial:PATH (or PATH) or\n"
+               "                           tcp:HOST:PORT, then ,option=value...: baud (921600),\n"
+               "                           radius (0.02 m), reverse, torque-limit (N m),\n"
+               "                           damping (0.001 N m s/rad), velocity-limit (rad/s),\n"
+               "                           state-us (1000), calibrate=auto|always|never, nozero\n"
+               "      --watchdog MS        the device cuts its force after MS without a\n"
+               "                           command (two periods; 0 disables)\n"
                "      --emulate-delay MS   add this one-way delay to outgoing datagrams\n"
                "      --emulate-jitter MS  mean exponential jitter on top (FIFO)\n"
                "      --emulate-reorder    let the jitter reorder datagrams\n"
@@ -153,6 +170,7 @@ struct Options {
   bool ipv6 = false;
   std::string log;
   std::string key_file;
+  std::string device;
   // master
   double duration = 10.0;
   double max_force = 20.0;
@@ -163,6 +181,7 @@ struct Options {
   double hold_after_ms = 150.0;
   bool contact_force = false;
   double wall_k = 5000.0;
+  double kp = -1.0, kd = -1.0;  // negative: the default
   std::string hello_state;
   std::string turn, turn_user, turn_pass_file;
   // emulation
@@ -226,6 +245,57 @@ Nanos watchdog_of(const Options& o, Nanos period, int pc_hold_samples) {
   return from_millis(o.watchdog_ms);
 }
 
+// The knob's damping on its own servo ticks (N m s/rad) unless the spec
+// sets one: 2.5 N s/m at a 20 mm radius, some 2 mN m of drag at 2 rad/s,
+// about the cogging of a gimbal motor. It is what keeps the coupling below
+// stable: damping on the device's ticks acts with no link in between.
+constexpr double kDeviceDamping = 1e-3;
+
+std::unique_ptr<device::RemoteDevice> open_device(const Options& o, Nanos period,
+                                                  int pc_hold_samples) {
+  device::DeviceSpec spec = device::parse_device_spec(o.device);
+  device::RemoteConfig rc = spec.config;
+  if (!spec.damping_given) rc.damping = kDeviceDamping;
+  rc.watchdog = watchdog_of(o, period, pc_hold_samples);
+  rc.reader_thread = true;
+  rc.on_log = [](const std::string& line) { std::fprintf(stderr, "device: %s\n", line.c_str()); };
+  auto dev = std::make_unique<device::RemoteDevice>(device::open_stream(spec), rc);
+  dev->connect();
+  const device::Info& in = dev->info();
+  std::fprintf(stderr,
+               "device: %s on %s, %.1f g at the rim, %.3g mm a count, %.2f N at most, "
+               "round trip %.2f ms\n",
+               in.name, dev->name().c_str(), 1e3 * dev->model_mass(),
+               1e3 * dev->encoder_resolution(), dev->max_force(),
+               to_millis(dev->connect_round_trip()));
+  return dev;
+}
+
+// How long after the host reads a position its force acts on the device:
+// the link both ways and the device's tick, and on average half the State
+// period by which the position read was already old.
+Nanos loop_delay_of(const device::RemoteDevice& dev) {
+  return dev.connect_round_trip() + dev.state_period() / 2;
+}
+
+// The controllers' device model for a device on a link: its mass and
+// encoder, and the delay of its actuation, estimated online from the
+// loop's delay as the first guess.
+template <class Config>
+void model_device(Config& c, const device::RemoteDevice& dev) {
+  if (dev.model_mass() > 0.0) {
+    c.model_mass = dev.model_mass();
+  } else {
+    std::fprintf(stderr, "device: no inertia reported; the controllers assume %.3g kg\n",
+                 c.model_mass);
+  }
+  c.encoder_resolution = dev.encoder_resolution();
+  const Nanos delay = loop_delay_of(dev);
+  c.actuation_delay = delay;
+  c.actuation_delay_max = std::max<Nanos>(4 * kNanosPerMilli, 2 * delay);
+}
+
+
 const char* scheme_name(teleop::Passivity p) {
   switch (p) {
     case teleop::Passivity::kNone: return "none";
@@ -273,6 +343,26 @@ void print_link(const teleop::HapticLink::Counters& c, const char* rx_dir) {
     std::printf(", the other end moved %llu times", static_cast<unsigned long long>(c.moved));
   }
   std::printf("\n");
+}
+
+void print_device(const device::RemoteDevice& dev) {
+  const device::RemoteStats s = dev.stats();
+  std::printf("device %s: %llu States (%llu lost, %llu CRC errors, %llu bad frames), "
+              "%llu commands (%llu written short)\n",
+              dev.name().c_str(), static_cast<unsigned long long>(s.states),
+              static_cast<unsigned long long>(s.states_lost),
+              static_cast<unsigned long long>(s.crc_errors),
+              static_cast<unsigned long long>(s.bad_frames),
+              static_cast<unsigned long long>(s.commands),
+              static_cast<unsigned long long>(s.commands_short));
+  print_stats("device rtt", net::delay_stats(s.round_trip), 1e6, "ms");
+  std::printf("device: watchdog cuts %llu (and %llu between commands), %llu States saturated, "
+              "stalest State %.2f ms, actuator work %.6g J\n",
+              static_cast<unsigned long long>(s.cuts),
+              static_cast<unsigned long long>(s.cuts_between),
+              static_cast<unsigned long long>(s.saturated), to_millis(s.worst_state_age),
+              dev.actuator_work());
+  if (const char* f = dev.fault()) std::printf("device: %s\n", f);
 }
 
 // keygen: a fresh key in hex, in a file only its owner can read. An existing
@@ -495,11 +585,21 @@ int run_master(const Options& o) {
   cfg.psk = load_key(o);
   cfg.rendezvous = rendezvous_of(o, cfg.psk, sock);
 
-  const Nanos start = monotonic_now();
-  teleop::OperatorParams op;
-  teleop::SimulatedMaster device(0.2, 0.5, op, period, 10, start);
-  device.set_watchdog(watchdog_of(o, period, cfg.control.pc_hold_samples));
+  std::unique_ptr<device::RemoteDevice> remote;
+  std::unique_ptr<teleop::SimulatedMaster> simulated;
   cfg.control.model_mass = 0.2;
+  if (!o.device.empty()) {
+    remote = open_device(o, period, cfg.control.pc_hold_samples);
+    model_device(cfg.control, *remote);
+    cfg.control.max_force = std::min(o.max_force, remote->max_force());
+  }
+  const Nanos start = monotonic_now();
+  if (!remote) {
+    teleop::OperatorParams op;
+    simulated = std::make_unique<teleop::SimulatedMaster>(0.2, 0.5, op, period, 10, start);
+    simulated->set_watchdog(watchdog_of(o, period, cfg.control.pc_hold_samples));
+  }
+  teleop::Device1D& device = remote ? static_cast<teleop::Device1D&>(*remote) : *simulated;
   std::string target = peer ? peer->to_string() : std::string();
   if (cfg.rendezvous) {
     target += (target.empty() ? "" : " and ") +
@@ -578,7 +678,8 @@ int run_master(const Options& o) {
   std::printf("energy: master %.6g J, slave %.6g J%s, end margin %.6g J, min margin %.6g J\n",
               rep.master_net, rep.slave_net, rep.slave_final ? "" : " (no final books)",
               rep.master_net + rep.slave_net, rep.min_margin);
-  return 0;
+  if (remote) print_device(*remote);
+  return rep.device_fault.empty() ? 0 : 3;
 }
 
 int run_slave(const Options& o) {
@@ -613,10 +714,42 @@ int run_slave(const Options& o) {
   cfg.rendezvous = rendezvous_of(o, cfg.psk, sock);
   cfg.relay = relay_of(o, sock);
 
-  teleop::WallParams wall;
-  wall.k = o.wall_k;
-  teleop::SimulatedSlave device(1.0, 2.0, wall, period, 10, monotonic_now(), 0.0);
-  device.set_watchdog(watchdog_of(o, period, cfg.control.pc_hold_samples));
+  std::unique_ptr<device::RemoteDevice> remote;
+  std::unique_ptr<teleop::SimulatedSlave> simulated;
+  if (!o.device.empty()) {
+    remote = open_device(o, period, cfg.control.pc_hold_samples);
+    model_device(cfg.control, *remote);
+    // A sampled spring K is passive on a device with damping b when
+    // b > K T / 2 + |B| (Colgate and Schenkel), T the period and B the
+    // spring's own damping. Here the force also waits for the link and
+    // the State's age, counted with the half period as the hold's delay
+    // is; half that stiffness leaves a margin. B costs as much of b as it
+    // adds, so the coupling has none unless asked: the device damps on
+    // its own ticks, where no link delays it.
+    const double b = remote->damping() / (remote->radius() * remote->radius());
+    const double horizon = to_seconds(period / 2 + loop_delay_of(*remote));
+    if (o.kp >= 0.0) {
+      cfg.control.kp = o.kp;
+    } else if (b > 0.0) {
+      cfg.control.kp = 0.5 * b / horizon;
+    } else {
+      throw std::runtime_error("a device without damping needs --kp");
+    }
+    cfg.control.kd = o.kd < 0.0 ? 0.0 : o.kd;
+    std::fprintf(stderr,
+                 "coupling %.0f N/m and %.3g N s/m (the device damps %.3g N s/m at the rim, the "
+                 "loop's delay %.2f ms)\n",
+                 cfg.control.kp, cfg.control.kd, b, 1e3 * horizon);
+  } else {
+    if (o.kp >= 0.0) cfg.control.kp = o.kp;
+    if (o.kd >= 0.0) cfg.control.kd = o.kd;
+    teleop::WallParams wall;
+    wall.k = o.wall_k;
+    simulated =
+        std::make_unique<teleop::SimulatedSlave>(1.0, 2.0, wall, period, 10, monotonic_now(), 0.0);
+    simulated->set_watchdog(watchdog_of(o, period, cfg.control.pc_hold_samples));
+  }
+  teleop::Device1D& device = remote ? static_cast<teleop::Device1D&>(*remote) : *simulated;
 
   teleop::SlaveNodeHooks hooks;
   std::uint64_t seed = 2;
@@ -656,6 +789,10 @@ int run_slave(const Options& o) {
                o.adopt ? " (or the master's)" : "", o.rate, sched.c_str(),
                cfg.psk ? ", key required" : "", emulating(o) ? ", emulating impairments" : "");
   teleop::run_slave_node(sock, device, cfg, hooks, &g_stop);
+  if (remote) {
+    print_device(*remote);
+    if (remote->fault()) return 3;
+  }
   return 0;
 }
 
@@ -722,6 +859,9 @@ int main(int argc, char** argv) {
       else if (a == "--hold-after") o.hold_after_ms = parse_double(next(), "hold-after");
       else if (a == "--contact-force") o.contact_force = true;
       else if (a == "--wall-k") o.wall_k = parse_double(next(), "wall-k");
+      else if (a == "--kp") o.kp = parse_double(next(), "kp");
+      else if (a == "--kd") o.kd = parse_double(next(), "kd");
+      else if (a == "--device") o.device = next();
       else if (a == "--hello-state") o.hello_state = next();
       else if (a == "--turn") o.turn = next();
       else if (a == "--turn-user") o.turn_user = next();
@@ -738,6 +878,9 @@ int main(int argc, char** argv) {
     }
     if (o.mode != "slave" && !o.turn.empty()) {
       throw std::runtime_error("--turn is for the slave; the master reaches its relay");
+    }
+    if (o.mode != "slave" && (o.kp >= 0.0 || o.kd >= 0.0)) {
+      throw std::runtime_error("--kp and --kd are the slave's coupling");
     }
     if (o.mode != "slave" && !o.hello_state.empty()) {
       throw std::runtime_error("--hello-state is for the slave, which answers hellos");

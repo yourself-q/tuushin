@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 
 namespace tuushin::fw {
 
@@ -54,6 +55,26 @@ double Plant::motor_torque() const {
   return torque_at(theta_, omega_);
 }
 
+DeviceConfig device_config_for(const PlantParams& p, const char* name) {
+  DeviceConfig c;
+  c.motor.pole_pairs = p.pole_pairs;
+  c.motor.phase_resistance = static_cast<float>(p.phase_resistance);
+  c.motor.torque_constant = static_cast<float>(p.kt);
+  c.counts_per_rev = p.counts_per_rev;
+  c.max_torque = 0.1f;
+  c.inertia = static_cast<float>(p.inertia);
+  c.supply_min = static_cast<float>(0.8 * p.supply);
+  c.supply_max = static_cast<float>(1.2 * p.supply);
+  c.kind = device::DeviceKind::kSimulated;
+  std::snprintf(c.name, sizeof c.name, "%s", name);
+  return c;
+}
+
+double Plant::stop_at(double theta, double omega) const {
+  if (!stop_.present || theta <= stop_.angle) return 0.0;
+  return std::min(0.0, -stop_.k * (theta - stop_.angle) - stop_.b * omega);
+}
+
 double Plant::hand_torque() const {
   return hand_at(t_, theta_, omega_);
 }
@@ -65,7 +86,7 @@ void Plant::advance(double t) {
     *motor = m;
     const double cog = -p_.cogging * std::sin(p_.cogging_per_rev * th);
     const double fric = -p_.viscous * om - p_.coulomb * std::tanh(om / 0.02);
-    return (m + cog + fric + hand_at(ti, th, om) + load_) / inertia;
+    return (m + cog + fric + hand_at(ti, th, om) + stop_at(th, om) + load_) / inertia;
   };
   while (t_ < t) {
     const double h = std::min(kStep, t - t_);
