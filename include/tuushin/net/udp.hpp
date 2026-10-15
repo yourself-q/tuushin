@@ -140,6 +140,17 @@ class UdpSocket {
   // The code point set_dscp last set, or -1.
   int dscp() const { return dscp_; }
 
+  // Ties the socket to the network interface `name` (en0, wlan0): its
+  // datagrams leave through that interface whatever the routing table
+  // prefers, and only those that arrive on it are received. This is how one
+  // host measures the path between two of its own networks (tuushin-probe
+  // pair). SO_BINDTODEVICE on Linux (before Linux 5.7 it needs CAP_NET_RAW),
+  // IP_BOUND_IF or IPV6_BOUND_IF on macOS. Bind the socket to an address of
+  // the interface as well (interface_address): the datagrams then carry the
+  // right source address on systems that pick it before the interface.
+  // Returns false if the system refused, or has no such option.
+  bool bind_to_interface(const std::string& name);
+
   // Sends one datagram. Returns false if it could not be handed to the
   // kernel (buffer full, unreachable); the caller treats it as lost.
   bool send_to(const Endpoint& to, const std::uint8_t* data, std::size_t size);
@@ -196,5 +207,11 @@ bool wait_any_readable(UdpSocket* const* sockets, std::size_t count, Nanos timeo
 // link-local addresses are left out (Endpoint::is_local_only). At most
 // `limit` are returned, IPv4 first.
 std::vector<Endpoint> host_addresses(const UdpSocket& socket, std::size_t limit = 8);
+
+// The first address of the interface `name` (IPv6 if `ipv6`, else IPv4),
+// with `port`, leaving out loopback and link-local ones. nullopt if the
+// interface does not exist, is down or has none.
+std::optional<Endpoint> interface_address(const std::string& name, bool ipv6 = false,
+                                          std::uint16_t port = 0);
 
 }  // namespace tuushin::net

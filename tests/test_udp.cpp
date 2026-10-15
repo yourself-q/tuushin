@@ -317,3 +317,28 @@ TEST_CASE(rx_stamps_of_loopback_datagrams_are_causal) {
   const auto s = RxStampConverter::read_clocks();
   CHECK(s.mono_after >= s.mono_before);
 }
+
+TEST_CASE(udp_binds_to_an_interface) {
+#if defined(__linux__)
+  const char* loopback = "lo";
+#else
+  const char* loopback = "lo0";
+#endif
+  // The loopback interface has only loopback addresses, which
+  // interface_address leaves out, as it does interfaces that do not exist.
+  CHECK(!interface_address(loopback).has_value());
+  CHECK(!interface_address("no-such-if0").has_value());
+  CHECK(!interface_address("no-such-if0", true).has_value());
+
+  UdpSocket a = bind_loopback();
+  UdpSocket b = bind_loopback();
+  CHECK(!a.bind_to_interface("no-such-if0"));
+  // Bound to the loopback interface, a socket still talks over it.
+  REQUIRE(a.bind_to_interface(loopback));
+  REQUIRE(b.bind_to_interface(loopback));
+  const std::uint8_t msg[3] = {7, 8, 9};
+  REQUIRE(a.send_to(loopback_peer(b), msg, sizeof msg));
+  REQUIRE(b.wait_readable(kNanosPerSecond));
+  std::uint8_t buf[16];
+  CHECK(b.recv_from(buf, sizeof buf, nullptr) == std::optional<std::size_t>(3));
+}

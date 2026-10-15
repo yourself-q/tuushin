@@ -272,3 +272,78 @@ TEST_CASE(probe_traces_replay_the_measured_path) {
   }
   CHECK_NEAR(rep.fwd.delay.rfc3550_jitter, 0.0, 2.0);
 }
+
+TEST_CASE(one_clock_direction_measures_each_delay) {
+  // Delays by hand: a loss, a duplicate, two probes that swap places, a
+  // stray from another session and an echo, all through the wire format.
+  OneClockDirection dir(0xAB);
+  const std::vector<Nanos> delay = {5'000'000, 6'000'000, -1, 9'000'000, 3'500'000, 4'000'000};
+  struct Arrival {
+    Nanos time;
+    std::vector<std::uint8_t> bytes;
+  };
+  std::vector<Arrival> arrivals;
+  std::vector<std::uint8_t> buf;
+  for (std::size_t k = 0; k < delay.size(); ++k) {
+    const Nanos t = 1'000'000'000 + static_cast<Nanos>(k) * 1'000'000;
+    wire::encode_padded(dir.next(t), 100 - wire::kHeaderSize, buf);
+    if (delay[k] >= 0) arrivals.push_back({t + delay[k], buf});
+    if (k == 1) arrivals.push_back({t + delay[k] + 300'000, buf});
+  }
+  wire::encode_padded(probe(0xAC, 1), 32, buf);
+  arrivals.push_back({1'002'000'000, buf});
+  wire::Header echo = probe(0xAB, 1);
+  echo.type = wire::PacketType::kProbeEcho;
+  wire::encode_probe_echo(echo, 0, 32, buf);
+  arrivals.push_back({1'002'500'000, buf});
+  std::sort(arrivals.begin(), arrivals.end(),
+            [](const Arrival& a, const Arrival& b) { return a.time < b.time; });
+  for (const auto& a : arrivals) dir.on_datagram(a.bytes.data(), a.bytes.size(), a.time);
+
+  CHECK(dir.sent() == 6);
+  CHECK(dir.received() == 5);
+  CHECK(dir.stray() == 2);
+  const OneClockReport rep = analyze_one_clock(dir);
+  CHECK(rep.dir.sent == 6 && rep.dir.lost == 1);
+  CHECK(rep.duplicates == 1);
+  // Probe 4 (9 ms) arrives after probes 5 and 6 (3.5 and 4 ms, sent 1 and
+  // 2 ms later), which count as reordered.
+  CHECK(rep.dir.reordered == 2);
+  CHECK(rep.dir.longest_burst == 1);
+  REQUIRE(rep.trace.entries.size() == delay.size());
+  for (std::size_t k = 0; k < delay.size(); ++k) {
+    CHECK(rep.trace.entries[k].send_offset == static_cast<Nanos>(k) * 1'000'000);
+    CHECK(rep.trace.entries[k].delay == delay[k]);
+  }
+  CHECK(rep.dir.delay.count == 5);
+  CHECK_NEAR(rep.dir.delay.min, 3.5e6, 0.0);
+  CHECK_NEAR(rep.dir.delay.max, 9e6, 0.0);
+  CHECK(!rep.trace.comments.empty());
+}
+
+TEST_CASE(one_clock_traces_replay_the_measured_path) {
+  // Two directions of different constant delays through one clock come out
+  // as measured, each on its own: no half of the round trip is assumed.
+  FixedDelay ab(from_millis(20)), ba(from_millis(35));
+  OneClockDirection dab(1), dba(2);
+  std::vector<std::uint8_t> buf;
+  for (int i = 0; i < 2000; ++i) {
+    const Nanos t = 3 * kNanosPerSecond + i * kNanosPerMilli;
+    for (auto* p : {&dab, &dba}) {
+      wire::encode_padded(p->next(t), 64, buf);
+      const auto d = (p == &dab ? static_cast<ChannelModel&>(ab) : ba).transit(t, buf.size());
+      REQUIRE(d.has_value());
+      p->on_datagram(buf.data(), buf.size(), t + *d);
+    }
+  }
+  const OneClockReport rab = analyze_one_clock(dab), rba = analyze_one_clock(dba);
+  CHECK_NEAR(rab.dir.delay.p50, 20e6, 0.0);
+  CHECK_NEAR(rba.dir.delay.p50, 35e6, 0.0);
+  CHECK(rab.dir.lost == 0 && rba.dir.reordered == 0);
+  TraceChannel replay(rba.trace);
+  for (Nanos t = 0; t < kNanosPerSecond; t += 333'333) {
+    const auto d = replay.transit(t, 64);
+    REQUIRE(d.has_value());
+    CHECK(*d == from_millis(35));
+  }
+}

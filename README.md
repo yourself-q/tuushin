@@ -28,7 +28,7 @@ and also tested on Linux (Ubuntu 24.04, GCC 13.3). MIT licensed.
 | `wire/` | The datagram format: a 32-byte header whose echo fields let each end measure the round trip from ordinary traffic, as RTCP does. |
 | `crypto/` | A Noise_NNpsk0 handshake and ChaCha20-Poly1305 on libsodium: a pre-shared key becomes fresh keys for every session, and every datagram is authenticated and encrypted (see Authentication below). SHA-1, HMAC-SHA1 and MD5, only because STUN and TURN require them. |
 | `sim/` | A deterministic 1-DoF teleoperation simulator built on the same controllers and devices. |
-| `tools/` | `tuushin-sim`, `tuushin-teleop` (master, slave and rendezvous server as separate processes), `tuushin-probe` (measure a path, write replayable traces), `tuushin-netreplay` (Linux: replay a trace on an interface, datagram by datagram, for network namespaces, Mininet and testbeds built on them), `nat_lab.sh` (master and slave behind Linux NATs in network namespaces, with coturn as a relay), `netreplay_lab.sh` (checks the replay against its traces), `fetch_starlink.sh` (public Starlink one-way delays as traces). `tests/sim_nat.hpp` and `tests/sim_turn.hpp` are a NAT and a TURN server in user space for tests on any system. |
+| `tools/` | `tuushin-sim`, `tuushin-teleop` (master, slave and rendezvous server as separate processes), `tuushin-probe` (measure a path, write replayable traces; `pair` measures between two networks of one host on one clock), `tuushin-netreplay` (Linux: replay a trace on an interface, datagram by datagram, for network namespaces, Mininet and testbeds built on them), `nat_lab.sh` (master and slave behind Linux NATs in network namespaces, with coturn as a relay), `netreplay_lab.sh` (checks the replay against its traces), `pair_lab.sh` (checks `pair` behind two NATs, with coturn as the STUN server), `fetch_starlink.sh` (public Starlink one-way delays as traces). `tests/sim_nat.hpp` and `tests/sim_turn.hpp` are a NAT and a TURN server in user space for tests on any system. |
 
 ## Build and test
 
@@ -106,6 +106,16 @@ Measure a real path and replay it:
 # on the other end: 60 s of 1 kHz probes, both directions, skew-corrected
 ./build/tools/tuushin-probe measure HOST --out path
 ./build/tools/tuushin-sim --trace-fwd path.fwd.csv --trace-bwd path.bwd.csv
+```
+
+or, on a host with two networks (Wi-Fi and a phone tethered by cable, say),
+measure each direction between them on the host's one clock, with no
+reflector and no assumption about the split (Both directions on one clock,
+below):
+
+```sh
+./build/tools/tuushin-probe pair --a en0 --b en7 --stun stun.l.google.com:19302 --out wifi-lte
+./build/tools/tuushin-sim --trace-fwd wifi-lte.ab.csv --trace-bwd wifi-lte.ba.csv
 ```
 
 or replay it under real network stacks, on a Linux interface that forwards
@@ -935,6 +945,61 @@ directions: the virtual machine stalling. 2 and 5 datagrams arrived out
 of order, each within 63 ns of its neighbour: released in one bunch and
 stamped by the receiver in another order.
 
+## Both directions on one clock
+
+`measure` gets one-way delays from two clocks, the client's and the
+reflector's, and must model their offset: it fits it to the minimum
+delays, which assumes that the two directions' minima are equal. Where
+they are not, a difference a moves a/2 from one trace to the other, and no
+measurement between unsynchronized clocks can tell (Known issues). Access
+networks are asymmetric by design (a cable or mobile uplink is narrower
+and scheduled differently from its downlink). The twenty Starlink runs
+above, taken on one clock with hardware stamps, had uplink minima 1.7 to
+8.1 ms below the downlink's (and medians 2.5 to 12 ms above them): `measure`
+would have moved up to 4 ms of delay from one direction to the other.
+
+`pair` puts both ends on one host instead, on two of its networks: each
+probe leaves through one interface, crosses the internet and comes back in
+through the other, and its delay is a receive time minus a send time on
+the same clock. That is the path a teleoperator would meet between an
+operator on the first network and a robot on the second: the first
+network's uplink, the internet between them and the second's downlink,
+and the reverse.
+
+- Each socket is tied to its interface (`SO_BINDTODEVICE` on Linux,
+  `IP_BOUND_IF` on macOS) and bound to its address, so the datagrams leave
+  through it whatever the routing table prefers.
+- A STUN server (RFC 8489 Binding) tells each end its public address. Two
+  ends with the same one share their last router, and a datagram between
+  them could turn round inside it without crossing the internet: pair
+  refuses.
+- Each end sends hellos to the other's public address every 20 ms until
+  both have heard from the other. An end that hears from an address other
+  than the one the server saw (a NAT that maps by destination) answers
+  there: a peer-reflexive address, in ICE's terms.
+- Then both directions are probed at the same rate and stamped by the
+  kernel on arrival; `PREFIX.ab.csv` and `PREFIX.ba.csv` are traces for
+  `tuushin-sim` and `tuushin-netreplay`. They record no address.
+
+`tools/pair_lab.sh` puts each of two interfaces of one network namespace
+behind its own NAT, the NATs meet in a router that runs coturn as the STUN
+server and delays each direction differently with netem. With 20 ms from
+a to b and 35 ms back (5 s of 1 kHz each way, the virtual machine above),
+pair measured medians of 20.049 and 35.041 ms, minima of 20.011 and
+35.009 ms, nothing lost or reordered, and a difference of -14.999 ms at
+the minimum, where halving the round trip, as `measure` does, gives
+27.51 ms each way. Behind a NAT that maps each destination to a new port
+(here, `MASQUERADE --random-fully`) on either side, the hellos found no
+way through, as they cannot when the other NAT also filters by port, and
+pair said so after 5 s.
+
+On a real host: on macOS, an iPhone tethered by USB is an interface of
+its own (`networksetup -listallhardwareports` names it), next to Wi-Fi.
+On Linux, strict reverse-path filtering (`rp_filter` 1) drops what
+arrives on the second interface from addresses the first one routes to,
+which is all of them; loose filtering (2) lets it in. A Linux host also
+needs a default route through each interface.
+
 ## Known issues
 
 - **Devices need a watchdog.** The stall handling above relies on the
@@ -1011,8 +1076,12 @@ stamped by the receiver in another order.
 - **Host candidates are taken once.** An end that changes network keeps
   announcing the LAN addresses it started with; only the address the
   server sees follows it.
-- One-way delays assume equal minimum delays in both directions, which no
-  measurement between unsynchronized clocks can avoid.
+- **`measure`'s one-way delays assume equal minimum delays in both
+  directions**, which no measurement between unsynchronized clocks can
+  avoid. `pair` needs no such assumption, but it measures only between two
+  networks one host can join at once, over IPv4, and finds no way through
+  a NAT that maps by destination facing one that filters by port. It has
+  been checked in the lab only, not yet on two real networks.
 - **The replay is checked on a virtual machine only**, where its timing is
   that of the machine's timers (Replaying a path on Linux, above); bare
   metal should do better and has not been measured. It replays UDP over

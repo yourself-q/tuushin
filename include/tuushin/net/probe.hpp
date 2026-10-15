@@ -146,4 +146,48 @@ struct ProbeReport {
 // fit_clock.
 ProbeReport analyze_probes(const ProbeClient& client, Nanos clock_window = kNanosPerSecond);
 
+// One direction of a path whose two ends read the same clock: two sockets
+// of one host, on two of its networks (tuushin-probe pair). Each delay is a
+// receive time minus a send time on that clock, with no clock model and no
+// assumption about the other direction. The sender side hands out kProbe
+// headers; the receiver side feeds what arrives.
+class OneClockDirection {
+ public:
+  explicit OneClockDirection(std::uint32_t session) : session_(session) {}
+
+  struct Record {
+    Nanos sent = 0;
+    Nanos received = -1;  // first arrival; -1 if none
+    int duplicates = 0;   // further arrivals of the same probe
+  };
+
+  // Header of the next probe, sent at `t`.
+  wire::Header next(Nanos t);
+
+  // Feeds a datagram received at `t`. Returns true if it was one of this
+  // direction's probes.
+  bool on_datagram(const std::uint8_t* data, std::size_t size, Nanos t);
+
+  std::uint32_t session() const { return session_; }
+  std::size_t sent() const { return records_.size(); }
+  std::size_t received() const { return received_; }
+  std::size_t stray() const { return stray_; }
+  // Indexed by probe seq - 1.
+  const std::vector<Record>& records() const { return records_; }
+
+ private:
+  std::uint32_t session_;
+  std::vector<Record> records_;
+  std::size_t received_ = 0;
+  std::size_t stray_ = 0;
+};
+
+struct OneClockReport {
+  DirectionReport dir;
+  std::size_t duplicates = 0;
+  Trace trace;
+};
+
+OneClockReport analyze_one_clock(const OneClockDirection& d);
+
 }  // namespace tuushin::net

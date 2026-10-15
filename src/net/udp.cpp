@@ -318,6 +318,25 @@ bool UdpSocket::set_dscp(int dscp) {
   return ok;
 }
 
+bool UdpSocket::bind_to_interface(const std::string& name) {
+#if defined(SO_BINDTODEVICE)
+  return ::setsockopt(fd_, SOL_SOCKET, SO_BINDTODEVICE, name.c_str(),
+                      static_cast<socklen_t>(name.size())) == 0;
+#elif defined(IP_BOUND_IF)
+  const int index = static_cast<int>(::if_nametoindex(name.c_str()));
+  if (index == 0) return false;
+#if defined(IPV6_BOUND_IF)
+  if (ipv6_) return ::setsockopt(fd_, IPPROTO_IPV6, IPV6_BOUND_IF, &index, sizeof index) == 0;
+#else
+  if (ipv6_) return false;
+#endif
+  return ::setsockopt(fd_, IPPROTO_IP, IP_BOUND_IF, &index, sizeof index) == 0;
+#else
+  (void)name;
+  return false;
+#endif
+}
+
 bool UdpSocket::send_to(const Endpoint& to, const std::uint8_t* data, std::size_t size) {
   if (!to.valid()) return false;
   int flags = 0;
@@ -517,6 +536,26 @@ std::vector<Endpoint> host_addresses(const UdpSocket& socket, std::size_t limit)
   v4.insert(v4.end(), v6.begin(), v6.end());
   if (v4.size() > limit) v4.resize(limit);
   return v4;
+}
+
+std::optional<Endpoint> interface_address(const std::string& name, bool ipv6, std::uint16_t port) {
+  ifaddrs* list = nullptr;
+  if (::getifaddrs(&list) != 0) return std::nullopt;
+  std::optional<Endpoint> found;
+  for (const ifaddrs* i = list; i != nullptr && !found; i = i->ifa_next) {
+    if (i->ifa_addr == nullptr || (i->ifa_flags & IFF_UP) == 0 || name != i->ifa_name) continue;
+    std::optional<Endpoint> e;
+    if (!ipv6 && i->ifa_addr->sa_family == AF_INET) {
+      const auto* a = reinterpret_cast<const sockaddr_in*>(i->ifa_addr);
+      e = Endpoint::from_address(reinterpret_cast<const std::uint8_t*>(&a->sin_addr), 4, port);
+    } else if (ipv6 && i->ifa_addr->sa_family == AF_INET6) {
+      const auto* a = reinterpret_cast<const sockaddr_in6*>(i->ifa_addr);
+      e = Endpoint::from_address(reinterpret_cast<const std::uint8_t*>(&a->sin6_addr), 16, port);
+    }
+    if (e && !e->is_local_only()) found = e;
+  }
+  ::freeifaddrs(list);
+  return found;
 }
 
 }  // namespace tuushin::net

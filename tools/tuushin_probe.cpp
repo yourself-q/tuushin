@@ -9,20 +9,31 @@
 //
 // The reflector answers each probe with one echo of the same size, so it can
 // never amplify traffic, and it limits its total echo rate (--max-pps).
+//
+// measure splits each round trip with a clock model that assumes equal
+// minimum delays both ways. pair needs no such assumption: on one host with
+// two networks (Wi-Fi and a phone's mobile data, say) it sends probes from
+// one interface to the other across the internet and back, and both ends
+// read the same clock:
+//
+//     tuushin-probe pair --a en0 --b en7 --stun stun.l.google.com:19302 --out wifi-lte
 
 #include <algorithm>
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <fstream>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "tuushin/net/probe.hpp"
+#include "tuushin/net/stun.hpp"
 #include "tuushin/net/udp.hpp"
 #include "tuushin/rt/thread.hpp"
 #include "tuushin/time.hpp"
@@ -52,7 +63,15 @@ void usage() {
                "                      3-axis haptic sample with two energies)\n"
                "      --dscp D        DSCP of probes (46)\n"
                "      --ipv6          prefer IPv6 when HOST has both\n"
-               "      --out PREFIX    write PREFIX.fwd.csv, PREFIX.bwd.csv, PREFIX.raw.csv\n",
+               "      --out PREFIX    write PREFIX.fwd.csv, PREFIX.bwd.csv, PREFIX.raw.csv\n"
+               "  tuushin-probe pair --a IF --b IF --stun HOST[:PORT] [options]\n"
+               "      probes between two interfaces of this host, on two networks, each\n"
+               "      way across the internet, on one clock (IPv4)\n"
+               "      --a IF, --b IF  the interfaces (en0, wlan0, ...)\n"
+               "      --stun H[:P]    a STUN server, to find each end's public address\n"
+               "                      (port 3478)\n"
+               "      --rate, --duration, --size, --dscp  as for measure\n"
+               "      --out PREFIX    write PREFIX.ab.csv (a to b) and PREFIX.ba.csv\n",
                wire::kHeaderSize + wire::kReceiptMapSize, wire::kMaxDatagram);
 }
 
@@ -352,6 +371,284 @@ int run_measure(const MeasureOptions& o) {
   return client.echoes() > 0 ? 0 : 2;
 }
 
+// --------------------------------------------------------------------- pair
+
+struct PairOptions {
+  std::string a, b;  // interfaces
+  std::string stun;  // HOST[:PORT]
+  double rate = 1000;
+  double duration = 60;
+  std::size_t size = 100;
+  int dscp = 46;
+  std::string out;
+};
+
+// One end of a pair: a socket tied to one interface.
+struct PairEnd {
+  std::string dev;
+  net::UdpSocket sock;
+  net::Endpoint mapped;  // where the STUN server saw it
+  net::Endpoint peer;    // where the other end's datagrams come from
+};
+
+net::UdpSocket open_on(const std::string& dev) {
+  const auto addr = net::interface_address(dev);
+  if (!addr) throw std::runtime_error("interface " + dev + " has no IPv4 address (is it up?)");
+  net::UdpSocket s(*addr);
+  if (!s.bind_to_interface(dev)) {
+    std::string why = std::strerror(errno);
+#if defined(__linux__)
+    why += "; before Linux 5.7 this needs root or CAP_NET_RAW";
+#endif
+    throw std::runtime_error("cannot tie a socket to " + dev + ": " + why);
+  }
+  return s;
+}
+
+// HOST[:PORT], IPv4: pair's sockets are.
+net::Endpoint resolve_ipv4(const std::string& s, std::uint16_t default_port) {
+  std::string host = s;
+  std::uint16_t port = default_port;
+  const auto colon = s.rfind(':');
+  if (colon != std::string::npos) {
+    host = s.substr(0, colon);
+    const double p = parse_double(s.substr(colon + 1), "port");
+    if (p < 1 || p > 65535) throw std::runtime_error("bad port in " + s);
+    port = static_cast<std::uint16_t>(p);
+  }
+  const auto e = net::Endpoint::resolve(host, port);
+  if (!e || e->is_ipv6()) throw std::runtime_error("cannot resolve " + host + " to an IPv4 address");
+  return *e;
+}
+
+// The address a STUN server (RFC 8489) sees `sock`'s datagrams come from,
+// asking every 200 ms; nullopt after 3 s without an answer.
+std::optional<net::Endpoint> stun_mapped(net::UdpSocket& sock, const net::Endpoint& server) {
+  namespace stun = net::stun;
+  const stun::TransactionId tid = stun::random_transaction_id();
+  const std::vector<std::uint8_t> request =
+      stun::Builder(stun::method::kBinding, stun::Class::kRequest, tid).take();
+  std::vector<std::uint8_t> in(2048);
+  const Nanos give_up = monotonic_now() + 3 * kNanosPerSecond;
+  Nanos next = 0;
+  while (!g_stop) {
+    const Nanos now = monotonic_now();
+    if (now >= give_up) break;
+    if (now >= next) {
+      sock.send_to(server, request.data(), request.size());
+      next = now + 200 * kNanosPerMilli;
+    }
+    sock.wait_readable(std::min(next, give_up) - now);
+    for (;;) {
+      const auto n = sock.recv_from(in.data(), in.size(), nullptr);
+      if (!n) break;
+      const auto m = stun::Message::parse(in.data(), *n);
+      if (!m || m->method() != stun::method::kBinding || m->cls() != stun::Class::kSuccess ||
+          m->transaction() != tid) {
+        continue;
+      }
+      if (auto a = m->address(stun::attr::kXorMappedAddress)) return a;
+      if (auto a = m->address(stun::attr::kMappedAddress)) return a;  // RFC 3489 servers
+    }
+  }
+  return std::nullopt;
+}
+
+// Opens the way between the ends: each sends to the other's public address
+// every 20 ms until both have heard from the other, or 5 s pass. A NAT that
+// maps by destination gives the other end another port than the STUN
+// server saw; the datagrams that do arrive tell where an end really is (a
+// peer-reflexive address, in ICE's terms), and the other answers there.
+bool open_pair(PairEnd& a, PairEnd& b, net::OneClockDirection& hello_ab,
+               net::OneClockDirection& hello_ba, std::size_t padding) {
+  a.peer = b.mapped;
+  b.peer = a.mapped;
+  std::vector<std::uint8_t> in(wire::kMaxDatagram + 1), out;
+  net::UdpSocket* const both[2] = {&a.sock, &b.sock};
+  bool a_heard = false, b_heard = false;
+  const Nanos give_up = monotonic_now() + 5 * kNanosPerSecond;
+  Nanos next = 0;
+  while (!(a_heard && b_heard) && !g_stop) {
+    Nanos now = monotonic_now();
+    if (now >= give_up) return false;
+    if (now >= next) {
+      wire::encode_padded(hello_ab.next(now), padding, out);
+      a.sock.send_to(a.peer, out.data(), out.size());
+      wire::encode_padded(hello_ba.next(monotonic_now()), padding, out);
+      b.sock.send_to(b.peer, out.data(), out.size());
+      next = now + 20 * kNanosPerMilli;
+    }
+    now = monotonic_now();
+    net::wait_any_readable(both, 2, std::min(next, give_up) - now);
+    for (;;) {
+      net::Endpoint from;
+      const auto n = a.sock.recv_from(in.data(), in.size(), &from);
+      if (!n) break;
+      if (hello_ba.on_datagram(in.data(), *n, monotonic_now())) {
+        a.peer = from;
+        a_heard = true;
+      }
+    }
+    for (;;) {
+      net::Endpoint from;
+      const auto n = b.sock.recv_from(in.data(), in.size(), &from);
+      if (!n) break;
+      if (hello_ab.on_datagram(in.data(), *n, monotonic_now())) {
+        b.peer = from;
+        b_heard = true;
+      }
+    }
+  }
+  return a_heard && b_heard;
+}
+
+int run_pair(const PairOptions& o) {
+  if (o.size < wire::kHeaderSize || o.size > wire::kMaxDatagram) {
+    throw std::runtime_error("--size out of range");
+  }
+  if (o.rate <= 0 || o.rate > 20000) throw std::runtime_error("--rate must be in (0, 20000]");
+  if (o.a == o.b) throw std::runtime_error("--a and --b name the same interface");
+  const net::Endpoint server = resolve_ipv4(o.stun, 3478);
+  PairEnd a{o.a, open_on(o.a), {}, {}};
+  PairEnd b{o.b, open_on(o.b), {}, {}};
+  for (PairEnd* e : {&a, &b}) {
+    if (!e->sock.set_dscp(o.dscp)) std::fprintf(stderr, "note: DSCP %d refused on %s\n", o.dscp, e->dev.c_str());
+    if (!e->sock.enable_rx_timestamps()) {
+      std::fprintf(stderr, "note: no kernel receive stamps on %s; reading time counts as delay\n",
+                   e->dev.c_str());
+    }
+    const auto m = stun_mapped(e->sock, server);
+    if (!m) {
+      std::fprintf(stderr,
+                   "no answer from the STUN server %s through %s within 3 s: does %s reach the "
+                   "internet, and does the server answer UDP?\n",
+                   server.to_string().c_str(), e->dev.c_str(), e->dev.c_str());
+      return 2;
+    }
+    e->mapped = *m;
+    std::fprintf(stderr, "%s: %s, seen from outside as %s\n", e->dev.c_str(),
+                 e->sock.local_endpoint().to_string().c_str(), m->to_string().c_str());
+  }
+  if (a.mapped.address() == b.mapped.address()) {
+    std::fprintf(stderr,
+                 "%s and %s reach the internet through the same public address: they are one "
+                 "network, or share its last router, so a datagram between them may turn round "
+                 "inside that router without crossing the internet. Use two networks, such as "
+                 "Wi-Fi and a phone's mobile data.\n",
+                 o.a.c_str(), o.b.c_str());
+    return 2;
+  }
+
+  std::random_device rd;
+  const std::uint32_t session = (static_cast<std::uint32_t>(rd()) << 2) | 1u;  // never 0
+  net::OneClockDirection ab(session), ba(session ^ 2u);
+  net::OneClockDirection hello_ab(session ^ 0x80000000u), hello_ba(session ^ 0x80000002u);
+  const std::size_t padding = o.size - wire::kHeaderSize;
+  if (!open_pair(a, b, hello_ab, hello_ba, padding)) {
+    std::fprintf(stderr,
+                 "the two ends did not reach each other within 5 s (%s heard %zu of %zu, %s "
+                 "heard %zu of %zu). A NAT that gives each destination a new port "
+                 "(symmetric), facing one that lets in only replies from the address and port "
+                 "it sent to, leaves no way through; another pair of networks may do better.\n",
+                 o.b.c_str(), hello_ab.received(), hello_ab.sent(), o.a.c_str(),
+                 hello_ba.received(), hello_ba.sent());
+    return 2;
+  }
+  std::fprintf(stderr, "the ends reach each other (%s heard %s after %zu hellos)\n", o.b.c_str(),
+               o.a.c_str(), hello_ab.sent());
+
+  const Nanos interval = static_cast<Nanos>(1e9 / o.rate);
+  const std::string sched = rt::prefer_low_latency(interval);
+  std::fprintf(stderr, "probing %s <-> %s at %.0f Hz for %.0f s, %zu bytes (%s)\n", o.a.c_str(),
+               o.b.c_str(), o.rate, o.duration, o.size, sched.c_str());
+  std::vector<std::uint8_t> in(wire::kMaxDatagram + 1), out;
+  net::UdpSocket* const both[2] = {&a.sock, &b.sock};
+  const Nanos start = monotonic_now();
+  const Nanos send_end = start + from_seconds(o.duration);
+  const Nanos grace = 2 * kNanosPerSecond;
+  Nanos next = start, stop_at = send_end;
+  bool sending = true;
+  std::size_t send_failures = 0, skipped = 0;
+  Nanos next_report = start + kNanosPerSecond;
+  // Datagrams of the other session on a socket: late hellos.
+  const auto drain = [&](PairEnd& e, net::OneClockDirection& dir, std::uint32_t hello) {
+    for (;;) {
+      Nanos rx = 0;
+      const auto n = e.sock.recv_from(in.data(), in.size(), nullptr, &rx);
+      if (!n) break;
+      const auto h = wire::decode_header(in.data(), *n);
+      if (h && h->session == hello) continue;
+      dir.on_datagram(in.data(), *n, rx);
+    }
+  };
+  for (;;) {
+    Nanos now = monotonic_now();
+    if (sending && (g_stop || now >= send_end)) {
+      sending = false;
+      stop_at = now + grace;
+      if (g_stop) std::fprintf(stderr, "interrupted; collecting late probes\n");
+    }
+    if (!sending && now >= stop_at) break;
+    if (sending && now >= next) {
+      if (now - next > 10 * interval) {
+        const Nanos missed = (now - next) / interval;
+        skipped += static_cast<std::size_t>(missed);
+        next += missed * interval;
+      }
+      wire::encode_padded(ab.next(monotonic_now()), padding, out);
+      if (!a.sock.send_to(a.peer, out.data(), out.size())) ++send_failures;
+      wire::encode_padded(ba.next(monotonic_now()), padding, out);
+      if (!b.sock.send_to(b.peer, out.data(), out.size())) ++send_failures;
+      next += interval;
+      now = monotonic_now();
+    }
+    const Nanos deadline = sending ? std::min(next, send_end) : stop_at;
+    if (deadline > now) net::wait_any_readable(both, 2, deadline - now);
+    drain(b, ab, hello_ab.session());
+    drain(a, ba, hello_ba.session());
+    now = monotonic_now();
+    if (now >= next_report) {
+      std::fprintf(stderr, "  %5.1f s  sent %zu each way  %s->%s %zu  %s->%s %zu\n",
+                   to_seconds(now - start), ab.sent(), o.a.c_str(), o.b.c_str(), ab.received(),
+                   o.b.c_str(), o.a.c_str(), ba.received());
+      next_report += kNanosPerSecond;
+    }
+  }
+
+  const net::OneClockReport rab = net::analyze_one_clock(ab), rba = net::analyze_one_clock(ba);
+  const std::string nab = o.a + "->" + o.b, nba = o.b + "->" + o.a;
+  std::printf("pair %s and %s, %zu-byte probes at %.0f Hz, one clock, %s\n", o.a.c_str(),
+              o.b.c_str(), o.size, o.rate, utc_now().c_str());
+  std::printf("probes %zu each way  duplicates %zu/%zu  stray %zu/%zu  send failures %zu  skipped %zu\n",
+              rab.dir.sent, rab.duplicates, rba.duplicates, ab.stray(), ba.stray(), send_failures,
+              skipped);
+  print_delay((nab + " ms").c_str(), rab.dir.delay);
+  print_delay((nba + " ms").c_str(), rba.dir.delay);
+  print_direction(nab.c_str(), rab.dir);
+  print_direction(nba.c_str(), rba.dir);
+  if (rab.dir.delay.count > 0 && rba.dir.delay.count > 0) {
+    std::printf("%s minus %s: %.3f ms at the minimum, %.3f ms at the median; halving the round "
+                "trip, as measure does, would put %.3f ms on each at the minimum\n",
+                nab.c_str(), nba.c_str(), (rab.dir.delay.min - rba.dir.delay.min) / 1e6,
+                (rab.dir.delay.p50 - rba.dir.delay.p50) / 1e6,
+                (rab.dir.delay.min + rba.dir.delay.min) / 2e6);
+  }
+
+  if (!o.out.empty()) {
+    char meta[256];
+    std::snprintf(meta, sizeof meta, "tuushin-probe pair, %zu bytes at %.0f Hz, %.0f s, %s", o.size,
+                  o.rate, o.duration, utc_now().c_str());
+    net::Trace tab = rab.trace, tba = rba.trace;
+    tab.comments.insert(tab.comments.begin(), std::string(meta) + ", " + nab);
+    tba.comments.insert(tba.comments.begin(), std::string(meta) + ", " + nba);
+    tab.save_csv(o.out + ".ab.csv");
+    tba.save_csv(o.out + ".ba.csv");
+    std::printf("wrote %s.ab.csv (%s), %s.ba.csv (%s)\n", o.out.c_str(), nab.c_str(),
+                o.out.c_str(), nba.c_str());
+  }
+  return ab.received() > 0 && ba.received() > 0 ? 0 : 2;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -401,6 +698,25 @@ int main(int argc, char** argv) {
       }
       if (o.host.empty()) throw std::runtime_error("measure needs a HOST");
       return run_measure(o);
+    }
+    if (mode == "pair") {
+      PairOptions o;
+      for (; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--a") o.a = next();
+        else if (a == "--b") o.b = next();
+        else if (a == "--stun") o.stun = next();
+        else if (a == "--rate") o.rate = parse_double(next(), "rate");
+        else if (a == "--duration") o.duration = parse_double(next(), "duration");
+        else if (a == "--size") o.size = static_cast<std::size_t>(parse_double(next(), "size"));
+        else if (a == "--dscp") o.dscp = static_cast<int>(parse_double(next(), "dscp"));
+        else if (a == "--out") o.out = next();
+        else throw std::runtime_error("unknown option " + a);
+      }
+      if (o.a.empty() || o.b.empty() || o.stun.empty()) {
+        throw std::runtime_error("pair needs --a, --b and --stun");
+      }
+      return run_pair(o);
     }
     usage();
     return 1;

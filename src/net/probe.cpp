@@ -317,4 +317,72 @@ ProbeReport analyze_probes(const ProbeClient& client, Nanos clock_window) {
   return rep;
 }
 
+// --------------------------------------------------------------- one clock
+
+wire::Header OneClockDirection::next(Nanos t) {
+  Record r;
+  r.sent = t;
+  records_.push_back(r);
+  wire::Header h;
+  h.type = wire::PacketType::kProbe;
+  h.session = session_;
+  h.seq = static_cast<std::uint32_t>(records_.size());
+  h.send_time = t;
+  return h;
+}
+
+bool OneClockDirection::on_datagram(const std::uint8_t* data, std::size_t size, Nanos t) {
+  const auto h = wire::decode_header(data, size);
+  if (!h || h->type != wire::PacketType::kProbe || h->session != session_ || h->seq == 0 ||
+      h->seq > records_.size()) {
+    ++stray_;
+    return false;
+  }
+  Record& r = records_[h->seq - 1];
+  if (r.received >= 0) {
+    ++r.duplicates;
+  } else {
+    r.received = t;
+    ++received_;
+  }
+  return true;
+}
+
+OneClockReport analyze_one_clock(const OneClockDirection& d) {
+  OneClockReport rep;
+  const auto& recs = d.records();
+  if (recs.empty()) return rep;
+  const Nanos t0 = recs.front().sent;
+  std::vector<double> delays;
+  std::vector<std::pair<Nanos, double>> arrivals;
+  std::vector<bool> lost(recs.size(), false);
+  Nanos latest = INT64_MIN;
+  for (std::size_t k = 0; k < recs.size(); ++k) {
+    const auto& r = recs[k];
+    rep.dir.sent++;
+    rep.duplicates += static_cast<std::size_t>(r.duplicates);
+    if (r.received < 0) {
+      lost[k] = true;
+      rep.dir.lost++;
+      rep.trace.entries.push_back({r.sent - t0, -1});
+      continue;
+    }
+    // A send stamp is read just before the system call and a receive stamp
+    // by the kernel, so a delay cannot come out negative but by a fault of
+    // the clocks; a trace would read it as a loss.
+    const Nanos delay = std::max<Nanos>(0, r.received - r.sent);
+    delays.push_back(static_cast<double>(delay));
+    arrivals.emplace_back(r.received, static_cast<double>(delay));
+    if (r.received < latest) rep.dir.reordered++;
+    latest = std::max(latest, r.received);
+    rep.trace.entries.push_back({r.sent - t0, delay});
+  }
+  rep.dir.longest_burst = longest_run(lost);
+  rep.dir.delay = delay_stats(std::move(delays), std::move(arrivals));
+  rep.trace.comments.push_back(
+      "one clock: sent and received on one host, so each delay is a difference of two readings "
+      "of the same clock, with no clock model and no assumption about the other direction");
+  return rep;
+}
+
 }  // namespace tuushin::net
