@@ -171,6 +171,28 @@ TEST_CASE(remote_needs_calibration_or_permission) {
   CHECK(threw);
 }
 
+TEST_CASE(remote_skip_connects_to_look) {
+  // kSkip: an uncalibrated device connects all the same, to read its Info
+  // and its encoder, and is left as it was.
+  RemoteConfig cfg;
+  cfg.calibrate = Calibrate::kSkip;
+  Bench b(quiet(), 0.5e-3, cfg);
+  const double at = b.link->plant().angle();
+  b.dev->connect();
+  CHECK(!(b.dev->info().flags & kInfoCalibrated));
+  CHECK(!b.logged("calibrating"));
+  b.link->advance_to(b.link->time() + 0.01, b.dev.get());
+  const State s = b.dev->latest_state();
+  CHECK(!(s.flags & kStateCalibrated));
+  CHECK(s.time_us > 0);  // a State has come
+  CHECK(std::fabs(b.link->plant().angle() - at) < 1e-9);
+  // The firmware will not drive it: a command leaves the driver off.
+  b.run(0.01, 1.0);
+  CHECK(!b.link->hal().driver_on());
+  CHECK(b.logged("not calibrated"));
+  CHECK(std::fabs(b.link->plant().angle() - at) < 1e-9);
+}
+
 TEST_CASE(remote_force_turns_the_knob_against_a_hand) {
   for (bool reverse : {false, true}) {
     RemoteConfig cfg;
@@ -364,6 +386,8 @@ TEST_CASE(remote_device_spec) {
   CHECK(c.transport == DeviceSpec::Transport::kTcp && c.host == "::1" && c.port == 5555);
   CHECK(!c.config.zero && c.config.calibrate == Calibrate::kAlways);
   CHECK(c.config.torque_limit == 0.05 && c.config.state_period == 500 * 1000);
+  // What the spec set, a tool's own defaults leave alone.
+  CHECK(c.calibrate_given && !a.calibrate_given && !a.damping_given);
   const DeviceSpec d = parse_device_spec("tcp:localhost:4000");
   CHECK(d.host == "localhost" && d.port == 4000);
   for (const char* bad : {"tcp:localhost", "serial:", "/dev/x,radius=-1", "/dev/x,what=1",

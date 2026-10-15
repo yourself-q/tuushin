@@ -26,7 +26,11 @@
 
 namespace tuushin::device {
 
-enum class Calibrate { kIfNeeded, kAlways, kNever };
+// What connect() does about the motor's electrical zero: find it if the
+// device does not know it, find it again, or never; kNever refuses a
+// device that does not know it, kSkip connects to it all the same, to look
+// at (its Info, its encoder), since it cannot drive until calibrated.
+enum class Calibrate { kIfNeeded, kAlways, kNever, kSkip };
 
 struct RemoteConfig {
   double radius = 0.02;  // m, where the hand holds the knob
@@ -66,7 +70,9 @@ struct DeviceSpec {
   std::uint16_t port = 0;
   int baud = 921600;
   RemoteConfig config;
-  bool damping_given = false;  // the spec set damping=, which a caller's default must not override
+  // The spec set these, which a caller's defaults must not override.
+  bool damping_given = false;
+  bool calibrate_given = false;
 };
 // Throws std::runtime_error on a malformed spec.
 DeviceSpec parse_device_spec(const std::string& spec);
@@ -123,6 +129,8 @@ class RemoteDevice final : public teleop::Device1D {
   void poll();
 
   const Info& info() const { return info_; }
+  // The newest State that has arrived, for a person watching the device.
+  State latest_state() const;
   // The device as the controllers see it, at the rim.
   double model_mass() const;          // kg: J / r^2, 0 if the device does not say
   double encoder_resolution() const;  // m

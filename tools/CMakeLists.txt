@@ -7,6 +7,9 @@ target_link_libraries(tuushin-probe PRIVATE tuushin)
 add_executable(tuushin-teleop tuushin_teleop.cpp)
 target_link_libraries(tuushin-teleop PRIVATE tuushin)
 
+add_executable(tuushin-device tuushin_device.cpp)
+target_link_libraries(tuushin-device PRIVATE tuushin)
+
 add_executable(tuushin-devsim tuushin_devsim.cpp)
 target_link_libraries(tuushin-devsim PRIVATE tuushin_fw)
 

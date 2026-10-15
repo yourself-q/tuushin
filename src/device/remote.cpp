@@ -109,6 +109,7 @@ DeviceSpec parse_device_spec(const std::string& spec) {
       else if (value == "always") c.calibrate = Calibrate::kAlways;
       else if (value == "never") c.calibrate = Calibrate::kNever;
       else throw std::runtime_error("calibrate must be auto, always or never: " + value);
+      d.calibrate_given = true;
     } else if (key == "nozero") {
       c.zero = false;
     } else {
@@ -416,7 +417,7 @@ void RemoteDevice::connect() {
                                    ? "the device refused to calibrate"
                                    : "the device's calibration failed (its log says why)");
     }
-  } else if (!calibrated) {
+  } else if (!calibrated && cfg_.calibrate == Calibrate::kNever) {
     throw std::runtime_error("the device is not calibrated, and calibrate=never");
   }
 
@@ -562,6 +563,11 @@ Nanos RemoteDevice::least_round_trip() const {
 RemoteStats RemoteDevice::stats() const {
   std::lock_guard<std::mutex> lk(mu_);
   return stats_;
+}
+
+State RemoteDevice::latest_state() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return state_;
 }
 
 }  // namespace tuushin::device
