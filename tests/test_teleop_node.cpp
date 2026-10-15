@@ -38,6 +38,26 @@ std::optional<HapticLink::Received> deliver(net::UdpSocket& sock, HapticLink& li
   return link.on_datagram(buf.data(), *n, from, rx);
 }
 
+// A device that fails at a given time, as a link to a real one that closes.
+class FailingDevice final : public Device1D {
+ public:
+  FailingDevice(Device1D& inner, Nanos fail_at) : inner_(inner), fail_at_(fail_at) {}
+  double read_position(Nanos now) override {
+    if (now >= fail_at_) failed_ = true;
+    return inner_.read_position(now);
+  }
+  double velocity() const override { return inner_.velocity(); }
+  void command_force(double f) override { inner_.command_force(f); }
+  double contact_force() const override { return inner_.contact_force(); }
+  Nanos force_cut_after() const override { return inner_.force_cut_after(); }
+  const char* fault() const override { return failed_ ? "the link to the device closed" : nullptr; }
+
+ private:
+  Device1D& inner_;
+  Nanos fail_at_;
+  bool failed_ = false;
+};
+
 }  // namespace
 
 TEST_CASE(seq_window_sorts_new_late_and_duplicate) {
@@ -273,4 +293,61 @@ TEST_CASE(nodes_run_a_session_over_loopback) {
   CHECK(s.max_position > 0.5 * rep.max_position);  // the slave followed
   CHECK(s.max_position < 2.0 * rep.max_position);
   CHECK(std::fabs(s.slave_net - rep.slave_net) < 1e-9);  // the final books arrived
+}
+
+TEST_CASE(a_device_fault_ends_the_session) {
+  // The slave's device fails 400 ms into the session: the slave ends it as a
+  // stop would, tells the master, and stops serving, since no later session
+  // could go on; then the same with the master's device.
+  for (const bool at_slave : {true, false}) {
+    net::UdpSocket slave_sock = bind_loopback();
+    net::UdpSocket master_sock = bind_loopback();
+    const net::Endpoint slave_ep = peer_of(slave_sock);
+    const Nanos period = kNanosPerMilli;
+    const Nanos start = monotonic_now();
+    const Nanos fail_at = start + 400 * kNanosPerMilli;
+    const Nanos never = start + 3600 * kNanosPerSecond;
+
+    WallParams wall;
+    SimulatedSlave slave_sim(1.0, 2.0, wall, period, 10, start, 0.0);
+    FailingDevice slave_dev(slave_sim, at_slave ? fail_at : never);
+    SlaveNodeConfig scfg;
+    scfg.control.dt = period;
+    scfg.control.passivity = Passivity::kReflective;
+    scfg.idle_timeout = 3 * kNanosPerSecond;
+    std::atomic<bool> stop{false};
+    std::vector<SlaveSessionReport> slave_reports;
+    std::thread slave(
+        [&] { slave_reports = run_slave_node(slave_sock, slave_dev, scfg, {}, &stop); });
+
+    OperatorParams op;
+    SimulatedMaster master_sim(0.2, 0.5, op, period, 10, start);
+    FailingDevice master_dev(master_sim, at_slave ? never : fail_at);
+    MasterNodeConfig mcfg;
+    mcfg.control.dt = period;
+    mcfg.control.passivity = Passivity::kReflective;
+    mcfg.control.model_mass = 0.2;
+    mcfg.duration = 3 * kNanosPerSecond;
+    const auto rep = run_master_node(master_sock, slave_ep, master_dev, mcfg, nullptr);
+    const Nanos master_done = monotonic_now();
+    // A failed slave device stopped the slave node on its own.
+    if (!at_slave) stop.store(true);
+    slave.join();
+
+    // Well before the 3 s the session was to run.
+    CHECK(master_done - start < 1500 * kNanosPerMilli);
+    REQUIRE(slave_reports.size() == 1);
+    const auto& s = slave_reports[0];
+    CHECK(rep.slave_final);
+    CHECK(std::fabs(s.slave_net - rep.slave_net) < 1e-9);  // the final books arrived
+    if (at_slave) {
+      CHECK(s.device_fault == "the link to the device closed");
+      CHECK(rep.device_fault.empty());
+      CHECK(rep.ended_by_slave);
+    } else {
+      CHECK(rep.device_fault == "the link to the device closed");
+      CHECK(s.device_fault.empty());
+      CHECK(s.ended_by_final);
+    }
+  }
 }

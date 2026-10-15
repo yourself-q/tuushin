@@ -557,6 +557,7 @@ int run_master(const Options& o) {
               static_cast<unsigned long long>(rep.ticks),
               static_cast<unsigned long long>(rep.skipped), 100.0 * rep.master_pc_active);
   if (rep.ended_by_slave) std::printf("the slave ended the session\n");
+  if (!rep.device_fault.empty()) std::printf("ended by the device: %s\n", rep.device_fault.c_str());
   if (rep.rejoins) {
     std::printf("rendezvous: the slave announced anew %llu times during the session\n",
                 static_cast<unsigned long long>(rep.rejoins));
@@ -634,7 +635,9 @@ int run_slave(const Options& o) {
                 r.master.canonical().to_string().c_str(),
                 r.relayed ? " through the relay" : "", scheme_name(r.scheme),
                 r.authenticated ? "authenticated" : "not authenticated",
-                r.ended_by_final ? "the master" : "timeout or stop");
+                !r.device_fault.empty() ? r.device_fault.c_str()
+                : r.ended_by_final      ? "the master"
+                                        : "timeout or stop");
     std::printf("%llu ticks (%llu skipped), slave PC active %.1f %%\n",
                 static_cast<unsigned long long>(r.ticks), static_cast<unsigned long long>(r.skipped),
                 100.0 * r.slave_pc_active);

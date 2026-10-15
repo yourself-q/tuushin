@@ -319,7 +319,8 @@ TEST_CASE(fw_watchdog_cuts_and_restores) {
     }
   }
   CHECK(saw_cut);
-  CHECK(std::fabs(rig.plant.motor_torque()) < 1e-4);
+  CHECK(rig.plant.motor_torque() == 0.0);
+  CHECK(!rig.hal.driver_on());
   // The next command restores it.
   sending = true;
   rig.states.clear();

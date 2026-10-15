@@ -24,6 +24,8 @@ add_library(tuushin
   src/crypto/legacy_digest.cpp
   src/crypto/noise.cpp
   src/device/proto.cpp
+  src/device/remote.cpp
+  src/device/stream.cpp
   src/net/channel.cpp
   src/net/clock_sync.cpp
   src/net/hops.cpp

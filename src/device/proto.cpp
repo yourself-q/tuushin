@@ -300,6 +300,18 @@ bool decode_log(const Message& msg, char* text, std::size_t cap) {
   return true;
 }
 
+const char* fault_name(Fault f) {
+  switch (f) {
+    case Fault::kNone: return "none";
+    case Fault::kEncoder: return "encoder";
+    case Fault::kEncoderJump: return "encoder jump";
+    case Fault::kOverspeed: return "overspeed";
+    case Fault::kCalibration: return "calibration";
+    case Fault::kSupply: return "supply";
+  }
+  return "unknown";
+}
+
 bool FrameReader::push(std::uint8_t byte, Message* out) {
   if (byte != 0) {
     if (n_ < sizeof raw_) {

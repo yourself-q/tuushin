@@ -32,6 +32,9 @@ class Device1D {
   // was cut did no work for the rest of the sample, and booking it as if it
   // had credits energy that never entered.
   virtual Nanos force_cut_after() const { return 0; }
+  // Why the device cannot go on (a latched fault, a link that went
+  // quiet), or nullptr while it can. A node ends its session on it.
+  virtual const char* fault() const { return nullptr; }
 };
 
 struct OperatorParams {

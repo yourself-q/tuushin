@@ -44,6 +44,7 @@ DeviceCore::DeviceCore(Hal& hal, const DeviceConfig& cfg)
 
 void DeviceCore::begin() {
   hal_.enable_driver(false);
+  driving_ = false;
   hal_.set_duties(0.0f, 0.0f, 0.0f);
   Calibration c;
   if (hal_.load_calibration(&c) && c.valid && (c.direction == 1 || c.direction == -1)) cal_ = c;
@@ -126,17 +127,17 @@ void DeviceCore::tick() {
   } else if (enabled_) {
     const float host = cut_ ? 0.0f : clampf(cmd_.torque, -torque_limit_, torque_limit_);
     saturated_ = !cut_ && host != cmd_.torque;
-    const float damp = -damping_ * omega;
-    const float dir = static_cast<float>(cal_.direction);
-    float out = 0.0f;
-    const float uq = q_voltage(cfg_.motor, dir * (host + damp), dir * omega, voltage_limit(vbus), &out);
-    const float total = dir * out;
-    if (std::fabs(total - (host + damp)) > 1e-4f * cfg_.max_torque) saturated_ = true;
-    // A clamp by the voltage takes from the host's torque first.
-    applied_ = total - damp;
-    const BridgeVoltages v = space_vector(0.0f, uq, electrical_angle(), vbus);
-    hal_.set_duties(v.a / vbus, v.b / vbus, v.c / vbus);
+    if (host == 0.0f && damping_ == 0.0f) {
+      // No torque to make: open the windings, which then carry no current
+      // at all, instead of driving against an estimate of the back-EMF,
+      // whose error (the velocity estimate's lag) would make some.
+      drive(false);
+    } else {
+      drive(true);
+      foc(host, omega, vbus);
+    }
   }
+
 
   if (static_cast<std::uint32_t>(now - last_state_us_) >= state_period_us_) {
     last_state_us_ = now;
@@ -259,7 +260,7 @@ void DeviceCore::on_set(const Set& s) {
 void DeviceCore::start_calibration(std::uint32_t now) {
   cal_phase_ = CalPhase::kSettle0;
   cal_start_us_ = now;
-  hal_.enable_driver(true);
+  drive(true);
 }
 
 void DeviceCore::run_calibration(std::uint32_t now) {
@@ -315,8 +316,7 @@ void DeviceCore::run_calibration(std::uint32_t now) {
   }
 
   // Done: judge it.
-  hal_.set_duties(0.0f, 0.0f, 0.0f);
-  hal_.enable_driver(false);
+  drive(false);
   const float p = static_cast<float>(cfg_.motor.pole_pairs);
   const float moved = cal_turn_[1] - cal_turn_[0];
   const float back = cal_turn_[2] - cal_turn_[0];
@@ -359,22 +359,38 @@ void DeviceCore::latch(Fault f) {
   set_enabled(false);
   if (cal_phase_ != CalPhase::kNone) {
     cal_phase_ = CalPhase::kNone;
-    hal_.set_duties(0.0f, 0.0f, 0.0f);
-    hal_.enable_driver(false);
+    drive(false);
   }
-  static const char* const kWhat[] = {"none", "encoder", "encoder jump", "overspeed",
-                                      "calibration", "supply"};
-  const auto i = static_cast<unsigned>(f);
   char text[kMaxLogText + 1];
-  std::snprintf(text, sizeof text, "fault: %s; driver off", i < 6 ? kWhat[i] : "?");
+  std::snprintf(text, sizeof text, "fault: %s; driver off", fault_name(f));
   log(text);
+}
+
+void DeviceCore::foc(float host, float omega, float vbus) {
+  const float damp = -damping_ * omega;
+  const float dir = static_cast<float>(cal_.direction);
+  float out = 0.0f;
+  const float uq = q_voltage(cfg_.motor, dir * (host + damp), dir * omega, voltage_limit(vbus), &out);
+  const float total = dir * out;
+  if (std::fabs(total - (host + damp)) > 1e-4f * cfg_.max_torque) saturated_ = true;
+  // A clamp by the voltage takes from the host's torque first.
+  applied_ = total - damp;
+  const BridgeVoltages v = space_vector(0.0f, uq, electrical_angle(), vbus);
+  hal_.set_duties(v.a / vbus, v.b / vbus, v.c / vbus);
+}
+
+void DeviceCore::drive(bool on) {
+  if (on == driving_) return;
+  driving_ = on;
+  if (!on) hal_.set_duties(0.0f, 0.0f, 0.0f);
+  hal_.enable_driver(on);
 }
 
 void DeviceCore::set_enabled(bool on) {
   if (on == enabled_) return;
   enabled_ = on;
-  if (!on) hal_.set_duties(0.0f, 0.0f, 0.0f);
-  hal_.enable_driver(on);
+  // On: the next tick decides whether the bridge drives.
+  if (!on) drive(false);
   applied_ = 0.0f;
 }
 

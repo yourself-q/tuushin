@@ -171,6 +171,7 @@ struct MasterNodeReport {
   bool slave_answered = false;
   bool slave_final = false;     // the slave's final books arrived
   bool ended_by_slave = false;  // the slave ended the session (it was stopped)
+  std::string device_fault;     // the device's fault that ended it, if one did
   double master_net = 0.0;   // J into the teleoperator at the master port
   double slave_net = 0.0;    // J at the slave port, last reported
   // Minimum over time of master_net + slave_net with the slave's reports
@@ -254,6 +255,9 @@ struct SlaveSessionReport {
   net::DelayStats lateness;
   HapticLink::Counters link;
   bool ended_by_final = false;  // otherwise by idle timeout or stop
+  // The device's fault that ended it, if one did; the node then stops
+  // serving, since no later session could go on either.
+  std::string device_fault;
   double slave_net = 0.0;
   double max_position = 0.0;
   double max_force = 0.0;

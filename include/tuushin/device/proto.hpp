@@ -179,6 +179,9 @@ struct Message {
   std::size_t size;
 };
 
+// A fault's name for a person: "encoder", "overspeed", ...; "none" for kNone.
+const char* fault_name(Fault f);
+
 // Each fills `m` from a message of its type; false if the type or the size
 // is wrong. A longer body than this version knows is accepted, and the rest
 // ignored, so that a later version can append fields.

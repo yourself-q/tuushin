@@ -16,7 +16,8 @@
 // Safety, in the order a tick applies it:
 //  - the driver is off until the host enables it, and goes off again on a
 //    command without kCmdEnable, on a fault, or when no command has come
-//    for the link timeout (the host is gone);
+//    for the link timeout (the host is gone); while enabled, it leaves the
+//    windings open whenever there is no torque to make;
 //  - the watchdog cuts the torque to 0 when no command has come for its
 //    timeout, as haptic devices do when the host stalls, and the next
 //    command restores it;
@@ -116,6 +117,9 @@ class DeviceCore {
   void run_calibration(std::uint32_t now);
   void latch(device::Fault f);
   void set_enabled(bool on);
+  // The bridge: driving the windings, or open (no current).
+  void drive(bool on);
+  void foc(float host, float omega, float vbus);
   void send(const std::uint8_t* frame, std::size_t n);
   void log(const char* text);
   void send_state(std::uint32_t now);
@@ -137,7 +141,8 @@ class DeviceCore {
   std::uint32_t watchdog_us_, state_period_us_, link_timeout_us_;
   float torque_limit_, velocity_limit_, damping_;
 
-  bool enabled_ = false;
+  bool enabled_ = false;  // the host's: the device applies its commands
+  bool driving_ = false;
   device::Fault fault_ = device::Fault::kNone;
   bool have_cmd_ = false;
   device::Command cmd_;

@@ -608,6 +608,12 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
     if (rejoin) rejoin->tick(now, last_rx, link);
 
     const double x = device.read_position(now);
+    if (ending_since < 0) {
+      if (const char* f = device.fault()) {
+        ending_since = now;
+        rep.device_fault = f;
+      }
+    }
     const auto& port = ctl.port();
     const bool final = ending_since >= 0;
     // While the session ends the actuator is off and the controller no
@@ -700,7 +706,9 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
   socket.enable_rx_timestamps();
   std::vector<SlaveSessionReport> reports;
   std::vector<std::uint8_t> buf(wire::kMaxDatagram + 1);
-  auto stopped = [&] { return stop && stop->load(); };
+  // A device that cannot go on stops the node as a stop would.
+  bool device_failed = false;
+  auto stopped = [&] { return (stop && stop->load()) || device_failed; };
   std::uint32_t last_refused = 0;
 
   // Answered hellos waiting for the master's first sealed sample. A hello is
@@ -796,6 +804,7 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
       }
       const Nanos now = monotonic_now();
       device.read_position(now);
+      if (device.fault()) device_failed = true;
       paths.service(now);
       // Told as soon as both the trace and where the server sees this end
       // are known.
@@ -1017,6 +1026,13 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
       }
 
       const double x = device.read_position(now);
+      if (stop_since < 0) {
+        if (const char* f = device.fault()) {
+          stop_since = now;
+          rep.device_fault = f;
+          device_failed = true;
+        }
+      }
       const double fc = device.contact_force();
       const bool final = master_final_at >= 0 || stop_since >= 0;
       // As at the master: once the session ends the actuator is off and the

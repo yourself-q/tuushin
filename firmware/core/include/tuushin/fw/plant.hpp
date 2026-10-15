@@ -124,6 +124,8 @@ class SimHal : public Hal {
   // The host's end of the link.
   void host_write(const std::uint8_t* buf, std::size_t n);
   std::size_t host_read(std::uint8_t* buf, std::size_t cap);
+  // Whether bytes for the host have arrived by now.
+  bool host_readable() const { return !to_host_.empty() && to_host_.front().first <= now_; }
 
   bool driver_on() const { return driver_; }
   // Fails the encoder from now on, as a loose wire does.
