@@ -314,8 +314,8 @@ tax as before):
 | one-way delay | worst true margin: resolution known | not known | exact encoders | force displayed: known | no rise hold | tax prepaid | exact encoders |
 |---|---|---|---|---|---|---|---|
 | 10 ms | 0 J | −7.5e−6 J | 0 J | 92 % | 28 % | 32 % | 84 % |
-| 50 ms | 0 J | −7.5e−6 J | 0 J | 17 % | 13 % | 12 % | 26 % |
-| 100 ms | 0 J | −4.0e−6 J | 0 J | 10 % | 7 % | 4 % | 12 % |
+| 50 ms | 0 J | −7.5e−6 J | 0 J | 16 % | 13 % | 12 % | 26 % |
+| 100 ms | 0 J | −4.0e−6 J | 0 J | 11 % | 7 % | 4 % | 12 % |
 
 *True margin* is minus the work the actuators really did, which the books
 see only through the encoders. *Force displayed* is the force on the master
@@ -342,8 +342,46 @@ resolution: on motions of 0.15 to 0.3 Hz the master conveys 63, 14 and
 what costs them: it more than triples the share at 10 ms, leaves it at
 50 ms and raises it by a quarter at 100 ms (before the model error margin
 it lowered it by a sixth to a quarter at 50 and 100 ms). The books, which pay the worst case of
-every rise, fall at most 0.3 mJ below zero, against 7.8 mJ with the
-prepaid tax.
+every rise, fall at most 0.4 mJ below zero, against 7.8 mJ with the
+prepaid tax. (The columns other than *known* were measured before the
+controllers estimated the reading noise, below; with it the known column
+moved from 92, 17 and 10 % to 92, 16 and 11 %.)
+
+**Encoders that dither.** A magnetic encoder (MT6701, AS5047P) does not
+only round: its readings also wander by about half a count or more. The
+filter and the predictor took a reading's error to be the quantization's,
+uniform over a count (q²/12); told less than the truth, the filter trusts
+each reading too much, its innovations come out larger than it expects,
+covariance matching takes that for a hand pushing faster and raises the
+force rate to its bound, and the predictions spread too wide for the PCs
+to let any force through. So the controllers estimate the variance of a
+reading's error online (`control/reading_noise.hpp`) from second
+differences of the readings, the difference-based estimators of
+nonparametric regression (Rice, Ann. Statist. 1984; Gasser, Sroka and
+Jennen-Steinmetz, Biometrika 1986), with two changes. A quantized sawtooth
+makes second differences of one count without any noise, 1.4 times q²/12
+by their mean and 4.4 times by their median, so only what lies beyond a
+count is counted, and the estimate is the variance whose Gaussian
+truncated second moment explains it; quantization alone then gives
+q²/12 exactly. And the change of velocity the device model expects from
+the forces it knows is subtracted first, since on a micrometre encoder a
+hand's acceleration alone makes two counts. On readings with 0.1 to 2
+counts of noise it comes out within 6 % of the truth on average.
+
+Nine motions as above with half a count of Gaussian noise added before
+the rounding at both ends (`tuushin-sim --master-encoder-noise 0.5
+--slave-encoder-noise 0.5`, and `--fixed-reading-noise` for q²/12):
+
+| one-way delay | worst true margin: noise estimated | taken as q²/12 | force displayed: estimated | taken as q²/12 | without the noise |
+|---|---|---|---|---|---|
+| 10 ms | −7.4e−9 J | −1.5e−7 J | 20 % | 0 % | 92 % |
+| 50 ms | −6.7e−9 J | −1.9e−8 J | 9 % | 0 % | 16 % |
+| 100 ms | −6.7e−9 J | −3.1e−7 J | 6 % | 0 % | 11 % |
+
+The tax bounds the misattributed work for errors within a count, which
+noise beyond a count breaks; here by nanojoules. The noise costs most at
+short delays, where the coarse encoders cost least: at 10 ms the master
+conveys a fifth of the contact force instead of nine tenths.
 
 ### Model mismatch
 
@@ -1117,7 +1155,9 @@ teleoperator, wants AWDL off.
   1.4 cm/s on a Touch, still never starts a force. A longer tax horizon
   lowers that threshold (eight samples started a force on a hand peaking
   at 0.94 cm/s) but in our runs let the actuators generate about a
-  microjoule.
+  microjoule. Encoders that dither cost far more: with half a count of
+  noise the master conveys a fifth of the contact force at 10 ms, and
+  under a tenth at 50 and 100 ms (Encoders that dither, above).
 - **Exact readings of a misdescribed device are covered nearly, not
   entirely.** The model error margin covers misses like those already
   seen; a miss larger than any before it is not, and over nine hand
