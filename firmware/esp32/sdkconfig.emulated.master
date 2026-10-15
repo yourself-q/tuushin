@@ -1,0 +1,3 @@
+# The emulated board as a master: once calibrated, a hand turns its knob
+# to and fro.
+CONFIG_TUUSHIN_EMULATED_HAND=y

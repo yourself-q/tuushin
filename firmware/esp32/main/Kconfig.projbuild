@@ -291,7 +291,11 @@ menu "tuushin device"
         config TUUSHIN_EMULATED_STEP_US
             int "The simulation's integration step (us)"
             depends on TUUSHIN_EMULATED
-            default 100
+            default 250
+            help
+                250 us integrates the knob about as closely as 100 us does,
+                where 500 us strays (fw/plant.hpp). Under QEMU a step costs
+                some 35 us, 60 us with the driver on.
 
         config TUUSHIN_EMULATED_NOISE_MILLICOUNTS
             int "Encoder noise (thousandths of a count)"

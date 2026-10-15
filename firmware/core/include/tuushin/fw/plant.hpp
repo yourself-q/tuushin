@@ -44,10 +44,18 @@ struct PlantParams {
   double supply = 12.0;  // V
   double start_angle = 0.3;  // rad, in the encoder's frame
   // The longest integration step (s). The knob against the stop rings at
-  // some 85 Hz, so a step of 100 us still integrates it closely; the
-  // emulated board (firmware/esp32), which has to keep up in real time
-  // without a double-precision FPU, takes such a step.
+  // some 85 Hz, so a coarse step still integrates it closely: driven into
+  // the stop by a host at 1 kHz and ticked once a millisecond, a 250 us
+  // step keeps the angle within 0.5 mrad rms (4 mrad at worst) of a 5 us
+  // one, about as a 100 us step does, where a 500 us step strays 4 mrad
+  // rms (14 at worst). The emulated board (firmware/esp32), which has to
+  // keep up in real time without a double-precision FPU, takes 250 us.
   double step = 20e-6;
+  // Computes the forces in single precision, keeping the state, the clock
+  // and the work in double. Where doubles are done in software (the
+  // emulated board) the forces' sines and tanh are most of the cost, and
+  // their float versions some five to ten times cheaper.
+  bool float_forces = false;
 };
 
 // Something the knob runs into as it turns up past `angle`: a spring and
@@ -96,13 +104,19 @@ class Plant {
   // Work done on the shaft by the motor so far (J).
   double motor_work() const { return work_; }
   double hand_torque() const;
-  double stop_torque() const { return stop_at(theta_, omega_); }
+  double stop_torque() const;
   const PlantParams& params() const { return p_; }
 
  private:
-  double torque_at(double theta, double omega) const;
-  double hand_at(double t, double theta, double omega) const;
-  double stop_at(double theta, double omega) const;
+  // The forces at a state, computed in F (PlantParams::float_forces).
+  template <class F>
+  F torque_at(double theta, double omega) const;
+  template <class F>
+  F hand_at(double t, double theta, double omega) const;
+  template <class F>
+  F stop_at(double theta, double omega) const;
+  template <class F>
+  void integrate(double t);
 
   PlantParams p_;
   HandParams hand_;

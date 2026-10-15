@@ -18,6 +18,7 @@ fw::PlantParams EmulatedHal::plant_params() {
   p.supply = CONFIG_TUUSHIN_SUPPLY_MV * 1e-3;
   p.encoder_noise = CONFIG_TUUSHIN_EMULATED_NOISE_MILLICOUNTS * 1e-3;
   p.step = CONFIG_TUUSHIN_EMULATED_STEP_US * 1e-6;
+  p.float_forces = true;  // the chip's FPU is single precision
   return p;
 }
 
@@ -31,10 +32,23 @@ fw::DeviceConfig EmulatedHal::config() {
 }
 
 void EmulatedHal::advance() {
+  // How far behind the motor may fall before it stands still (us).
+  constexpr std::int64_t kMaxLagUs = 4 * CONFIG_TUUSHIN_TICK_US;
   const std::int64_t start = esp_timer_get_time();
-  plant_.advance(static_cast<double>(start - t0_us_) * 1e-6);
-  const std::uint32_t took = static_cast<std::uint32_t>(esp_timer_get_time() - start);
-  if (took > worst_us_) worst_us_ = took;
+  std::int64_t target = start - t0_us_;
+  const std::int64_t at = static_cast<std::int64_t>(plant_.time() * 1e6);
+  if (target - at > kMaxLagUs) {
+    const std::int64_t skip = target - at - kMaxLagUs;
+    t0_us_ += skip;
+    lost_us_ += skip;
+    target -= skip;
+  }
+  if (target <= at) return;
+  plant_.advance(static_cast<double>(target) * 1e-6);
+  const std::int64_t took = esp_timer_get_time() - start;
+  busy_us_ += took;
+  covered_us_ += target - at;
+  if (took > worst_us_) worst_us_ = static_cast<std::uint32_t>(took);
 }
 
 std::uint32_t EmulatedHal::take_worst_integration_us() {

@@ -69,6 +69,7 @@ struct Snapshot {
   double t, angle, torque, work;
   bool driving, calibrating, fault;
   std::uint32_t worst_integration_us;
+  std::int64_t busy_us, covered_us, lost_us;
 };
 Snapshot g_snap = {};
 double g_calibrated_at = -1.0, g_work_at_calibration = 0.0;
@@ -84,6 +85,9 @@ void take_snapshot() {
   s.driving = g_core->enabled();
   s.calibrating = (g_core->last_state().flags & device::kStateCalibrating) != 0;
   s.fault = g_core->fault() != device::Fault::kNone;
+  s.busy_us = g_hal->busy_us();
+  s.covered_us = g_hal->covered_us();
+  s.lost_us = g_hal->lost_us();
   s.worst_integration_us = 0;
   taskENTER_CRITICAL(&g_snap_lock);
   s.worst_integration_us = g_snap.worst_integration_us;
@@ -163,9 +167,12 @@ void servo(void*) {
 #if CONFIG_TUUSHIN_EMULATED
 
 // Once a second on the console (UART1): what the simulated motor is doing,
-// and how the servo loop keeps up.
+// and how the servo loop keeps up: the integration's load is the time it
+// took over the motor time it covered in the last second, and the motor
+// stands still for what it could not cover (EmulatedHal).
 void report() {
   bool told_calibration = false;
+  std::int64_t last_busy = 0, last_covered = 0;
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(1000));
     taskENTER_CRITICAL(&g_snap_lock);
@@ -181,17 +188,24 @@ void report() {
       told_calibration = true;
       std::printf("emu: calibrated at %.3f s, %.4f J of motor work so far\n", cal_at, cal_work);
     }
+    const std::int64_t covered = s.covered_us - last_covered;
+    const int load = covered > 0 ? static_cast<int>(100 * (s.busy_us - last_busy) / covered) : 0;
+    last_busy = s.busy_us;
+    last_covered = s.covered_us;
     std::printf("emu: t %.1f s  angle %+.3f rad  %+.4f N m  work %.4f J%s%s%s  ticks %" PRIu32
-                "  missed %" PRIu32 "  worst tick %" PRIu32 " us (integration %" PRIu32 " us)  timer restarts %" PRIu32 "\n",
+                "  missed %" PRIu32 "  worst tick %" PRIu32 " us (integration %" PRIu32
+                " us, load %d%%, lost %lld ms)  timer restarts %" PRIu32 "\n",
                 s.t, s.angle, s.torque, s.work, s.driving ? "  driving" : "",
                 s.calibrating ? "  calibrating" : "", s.fault ? "  FAULT" : "", c.ticks, c.missed,
-                c.worst_tick_us, s.worst_integration_us, c.rearmed);
+                c.worst_tick_us, s.worst_integration_us, load, static_cast<long long>(s.lost_us / 1000),
+                c.rearmed);
   }
 }
 
 #endif
 
 }  // namespace
+
 
 extern "C" void app_main() {
   g_store.begin();

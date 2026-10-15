@@ -1,0 +1,3 @@
+# The emulated board as a slave: once calibrated, its knob has an object
+# half a radian on (tools/emu_lab.sh).
+CONFIG_TUUSHIN_EMULATED_STOP=y

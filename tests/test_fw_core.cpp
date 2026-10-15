@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -434,4 +436,53 @@ TEST_CASE(fw_zero_and_state_stream) {
   rig.run(0.002);
   CHECK(rig.core.count() == 0);
   CHECK(rig.states.back().count == 0);
+}
+
+TEST_CASE(fw_plant_float_forces_track_double) {
+  // The emulated board's plant (forces in float) against the same plant in
+  // double: the knob pushed both ways by a field a quarter turn ahead of
+  // the rotor, into a stop and back, or against a hand.
+  for (bool hand : {false, true}) {
+    PlantParams p;
+    p.step = 250e-6;
+    PlantParams pf = p;
+    pf.float_forces = true;
+    Plant a(p), b(pf);
+    for (Plant* pl : {&a, &b}) {
+      if (hand) {
+        HandParams h;
+        h.present = true;
+        h.ref_offset = p.start_angle;
+        pl->set_hand(h, 0.0);
+      } else {
+        StopParams s;
+        s.present = true;
+        s.angle = p.start_angle + 0.5;
+        pl->set_stop(s);
+      }
+      pl->enable(true);
+    }
+    double worst = 0.0, highest = p.start_angle;
+    for (int i = 1; i <= 2000; ++i) {
+      const double t = i * 1e-3;
+      const double m = 0.3 * std::sin(2 * 3.14159265 * 2.0 * t);
+      for (Plant* pl : {&a, &b}) {
+        const double te = p.pole_pairs * pl->angle() - p.electrical_offset;
+        const double phi = te + (m >= 0 ? 1.0 : -1.0) * kTwoPiD / 4;
+        const double k = 0.5 * std::fabs(m);
+        pl->set_duties(0.5 + k * std::cos(phi), 0.5 + k * std::cos(phi - kTwoPiD / 3),
+                       0.5 + k * std::cos(phi + kTwoPiD / 3));
+        pl->advance(t);
+      }
+      worst = std::max(worst, std::fabs(a.angle() - b.angle()));
+      highest = std::max(highest, a.angle());
+    }
+    // Well under a count (0.38 mrad); the work to well under a microjoule.
+    CHECK(worst < 0.05e-3);
+    CHECK(std::fabs(a.motor_work() - b.motor_work()) < 1e-6 * (1.0 + std::fabs(a.motor_work())));
+    CHECK(std::fabs(a.motor_work()) > 1e-3);  // the knob was driven
+    if (!hand) CHECK(highest > p.start_angle + 0.5 + 0.01);  // into the stop
+    std::printf("  %s: float forces %.4f mrad from double at worst, work %.6f vs %.6f J, highest %.3f rad\n",
+                hand ? "hand" : "stop", worst * 1e3, b.motor_work(), a.motor_work(), highest);
+  }
 }

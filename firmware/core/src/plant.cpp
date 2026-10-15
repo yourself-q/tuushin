@@ -27,31 +27,35 @@ void Plant::set_hand(const HandParams& h, double t0) {
   hand_t0_ = t0;
 }
 
-double Plant::torque_at(double theta, double omega) const {
-  if (!enabled_) return 0.0;
-  const double mean = (va_ + vb_ + vc_) / 3.0;
-  const double a = va_ - mean, b = vb_ - mean, c = vc_ - mean;
-  const double alpha = a;
-  const double beta = (b - c) / std::sqrt(3.0);
-  const double dir = p_.direction >= 0 ? 1.0 : -1.0;
-  const double te = dir * p_.pole_pairs * theta - p_.electrical_offset;
-  const double vq = -alpha * std::sin(te) + beta * std::cos(te);
-  const double emf = p_.kt / 1.5 * dir * omega;
-  const double iq = (vq - emf) / p_.phase_resistance;
-  return dir * p_.kt * iq;
+template <class F>
+F Plant::torque_at(double theta, double omega) const {
+  if (!enabled_) return F(0);
+  const F va = F(va_), vb = F(vb_), vc = F(vc_);
+  const F mean = (va + vb + vc) / F(3);
+  const F a = va - mean, b = vb - mean, c = vc - mean;
+  const F alpha = a;
+  const F beta = (b - c) / std::sqrt(F(3));
+  const F dir = p_.direction >= 0 ? F(1) : F(-1);
+  const F te = dir * F(p_.pole_pairs) * F(theta) - F(p_.electrical_offset);
+  const F vq = -alpha * std::sin(te) + beta * std::cos(te);
+  const F emf = F(p_.kt) / F(1.5) * dir * F(omega);
+  const F iq = (vq - emf) / F(p_.phase_resistance);
+  return dir * F(p_.kt) * iq;
 }
 
-double Plant::hand_at(double t, double theta, double omega) const {
-  if (!hand_.present) return 0.0;
-  const double w = 2.0 * kPiD * hand_.ref_freq;
-  const double s = t - hand_t0_;
-  const double ref = hand_.ref_offset + hand_.ref_amplitude * 0.5 * (1.0 - std::cos(w * s));
-  const double vref = hand_.ref_amplitude * 0.5 * w * std::sin(w * s);
-  return hand_.k * (ref - theta) + hand_.b * (vref - omega);
+template <class F>
+F Plant::hand_at(double t, double theta, double omega) const {
+  if (!hand_.present) return F(0);
+  const F w = F(2.0 * kPiD * hand_.ref_freq);
+  const F s = F(t - hand_t0_);
+  const F amp = F(hand_.ref_amplitude);
+  const F ref = F(hand_.ref_offset) + amp * F(0.5) * (F(1) - std::cos(w * s));
+  const F vref = amp * F(0.5) * w * std::sin(w * s);
+  return F(hand_.k) * (ref - F(theta)) + F(hand_.b) * (vref - F(omega));
 }
 
 double Plant::motor_torque() const {
-  return torque_at(theta_, omega_);
+  return torque_at<double>(theta_, omega_);
 }
 
 DeviceConfig device_config_for(const PlantParams& p, const char* name) {
@@ -69,23 +73,36 @@ DeviceConfig device_config_for(const PlantParams& p, const char* name) {
   return c;
 }
 
-double Plant::stop_at(double theta, double omega) const {
-  if (!stop_.present || theta <= stop_.angle) return 0.0;
-  return std::min(0.0, -stop_.k * (theta - stop_.angle) - stop_.b * omega);
+template <class F>
+F Plant::stop_at(double theta, double omega) const {
+  if (!stop_.present || theta <= stop_.angle) return F(0);
+  // The penetration in double: the stop's angle and the knob's are close.
+  return std::min(F(0), -F(stop_.k) * F(theta - stop_.angle) - F(stop_.b) * F(omega));
 }
 
 double Plant::hand_torque() const {
-  return hand_at(t_, theta_, omega_);
+  return hand_at<double>(t_, theta_, omega_);
+}
+
+double Plant::stop_torque() const {
+  return stop_at<double>(theta_, omega_);
 }
 
 void Plant::advance(double t) {
-  const double inertia = p_.inertia + (hand_.present ? hand_.inertia : 0.0);
+  if (p_.float_forces) integrate<float>(t);
+  else integrate<double>(t);
+}
+
+template <class F>
+void Plant::integrate(double t) {
+  const F inertia = F(p_.inertia + (hand_.present ? hand_.inertia : 0.0));
   auto accel = [&](double ti, double th, double om, double* motor) {
-    const double m = torque_at(th, om);
-    *motor = m;
-    const double cog = -p_.cogging * std::sin(p_.cogging_per_rev * th);
-    const double fric = -p_.viscous * om - p_.coulomb * std::tanh(om / 0.02);
-    return (m + cog + fric + hand_at(ti, th, om) + stop_at(th, om) + load_) / inertia;
+    const F m = torque_at<F>(th, om);
+    *motor = static_cast<double>(m);
+    const F cog = -F(p_.cogging) * std::sin(F(p_.cogging_per_rev) * F(th));
+    const F fric = -F(p_.viscous) * F(om) - F(p_.coulomb) * std::tanh(F(om) / F(0.02));
+    const F sum = m + cog + fric + hand_at<F>(ti, th, om) + stop_at<F>(th, om) + F(load_);
+    return static_cast<double>(sum / inertia);
   };
   while (t_ < t) {
     const double h = std::min(p_.step, t - t_);
