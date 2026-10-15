@@ -519,8 +519,11 @@ TEST_CASE(teleop_reflective_tdpa_estimates_the_forces_in_flight) {
   // exact readings both find them, and the teleoperator stays as passive
   // as with them told. With coarse encoders the master's estimate ends up
   // to 0.375 ms long, and at 10 ms the slave's stays at 4 ms, its readings
-  // never telling it from 2 ms: long, the side that holds the forces back,
-  // and the teleoperator generates nothing.
+  // never telling it from 2 ms: mostly long, the side that holds the
+  // forces back, and the teleoperator generates nothing. Where it lands
+  // depends on the last bits of the libm's sines: with glibc the slave's
+  // ends up a step of the grid short at 100 ms (1.9375 ms), and the
+  // teleoperator still generates nothing.
   struct Lag {
     Nanos delay, jitter;
   };
@@ -547,8 +550,8 @@ TEST_CASE(teleop_reflective_tdpa_estimates_the_forces_in_flight) {
     cfg.master_actuation_delay_max = cfg.slave_actuation_delay_max = from_millis(4.0);
     const auto r = run(cfg, from_millis(ms));
     CHECK(!r.diverged);
-    CHECK(r.master_actuation_delay >= from_millis(2.0));
-    CHECK(r.slave_actuation_delay >= from_millis(2.0));
+    CHECK(r.master_actuation_delay >= from_millis(2.0) - from_millis(0.25));
+    CHECK(r.slave_actuation_delay >= from_millis(2.0) - from_millis(0.25));
     CHECK(r.max_book_excess < 1e-12);
     CHECK(r.min_true_margin > -1e-9);
   }
