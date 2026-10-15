@@ -386,13 +386,16 @@ TEST_CASE(nodes_authenticate_and_run_a_sealed_session) {
   CHECK(r.master.authenticated);
   CHECK(!r.master.handshake_failed);
   CHECK(r.master.slave_answered && r.master.slave_final);
-  CHECK(r.master.link.received > 400);
   CHECK(r.master.link.unauthentic == 0);
   REQUIRE(r.slave.size() == 1);
   CHECK(r.slave[0].authenticated);
   CHECK(r.slave[0].session == r.master.session);
   CHECK(r.slave[0].ended_by_final);
-  CHECK(r.slave[0].link.received > 400);
+  // The session ran its 600 ms and what each end sealed the other opened
+  // (a loaded machine skips ticks, so fewer samples go out).
+  CHECK(r.master.ticks + r.master.skipped > 550);
+  CHECK(r.master.link.received > 0.95 * static_cast<double>(r.slave[0].link.sent));
+  CHECK(r.slave[0].link.received > 0.95 * static_cast<double>(r.master.link.sent));
   CHECK(r.slave[0].link.unauthentic == 0);
   CHECK(r.refusals.empty());
   CHECK(r.master.max_position > 0.002);

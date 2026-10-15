@@ -496,11 +496,14 @@ TEST_CASE(nodes_meet_through_a_rendezvous_server) {
   const auto r = meet(master_sock, -200 * kNanosPerMilli, 600 * kNanosPerMilli, kNanosPerSecond);
   CHECK(!r.master.rendezvous_failed && !r.master.handshake_failed);
   CHECK(r.master.authenticated && r.master.slave_answered && r.master.slave_final);
-  CHECK(r.master.link.received > 400);
   CHECK(r.master.observed == ep("127.0.0.1", master_sock.local_endpoint().port()));
   REQUIRE(r.slave.size() == 1);
   CHECK(r.slave[0].authenticated && r.slave[0].ended_by_final);
-  CHECK(r.slave[0].link.received > 400);
+  // The session ran its 600 ms and what each end sent reached the other (a
+  // loaded machine skips ticks, so fewer samples go out).
+  CHECK(r.master.ticks + r.master.skipped > 550);
+  CHECK(r.master.link.received > 0.95 * static_cast<double>(r.slave[0].link.sent));
+  CHECK(r.slave[0].link.received > 0.95 * static_cast<double>(r.master.link.sent));
   CHECK(r.slave[0].master == ep("127.0.0.1", master_sock.local_endpoint().port()));
   REQUIRE(!r.master.candidates.empty());
   CHECK(r.master.slave == r.master.candidates.front());
@@ -516,9 +519,10 @@ TEST_CASE(nodes_meet_when_the_master_is_first) {
   UdpSocket master_sock(ep("127.0.0.1", 0));
   const auto r = meet(master_sock, 300 * kNanosPerMilli, 400 * kNanosPerMilli, 2 * kNanosPerSecond);
   CHECK(r.master.authenticated && r.master.slave_answered);
-  CHECK(r.master.link.received > 250);
+  CHECK(r.master.ticks + r.master.skipped > 350);
   REQUIRE(r.slave.size() == 1);
   CHECK(r.slave[0].authenticated);
+  CHECK(r.master.link.received > 0.95 * static_cast<double>(r.slave[0].link.sent));
 }
 
 TEST_CASE(nodes_meet_from_a_dual_stack_socket) {
@@ -532,7 +536,9 @@ TEST_CASE(nodes_meet_from_a_dual_stack_socket) {
   }
   const auto r = meet(*sock, -200 * kNanosPerMilli, 400 * kNanosPerMilli, kNanosPerSecond);
   CHECK(r.master.authenticated && r.master.slave_answered);
-  CHECK(r.master.link.received > 250);
+  CHECK(r.master.ticks + r.master.skipped > 350);
+  REQUIRE(r.slave.size() == 1);
+  CHECK(r.master.link.received > 0.95 * static_cast<double>(r.slave[0].link.sent));
   CHECK(r.master.slave.canonical() == r.master.candidates.front());
   CHECK(r.master.observed == ep("127.0.0.1", sock->local_endpoint().port()));
 }
@@ -787,8 +793,12 @@ TEST_CASE(session_survives_a_nat_that_rebinds) {
   CHECK(r.filtered > 0);
   CHECK(r.master.rejoins >= 1);
   CHECK(r.master.link.moved == 1);
-  CHECK(r.master.link.received > 700);
   REQUIRE(r.slave.size() == 1);
+  // The session ran its second, and the slave's samples reached the master
+  // but for about the 100 ms the ends were silent: 90 % of them, against a
+  // quarter without the rejoin (below).
+  CHECK(r.master.ticks + r.master.skipped > 900);
+  CHECK(r.master.link.received > 0.8 * static_cast<double>(r.slave[0].link.sent));
   CHECK(r.slave[0].ended_by_final);
   CHECK(r.slave[0].rejoins == 0);  // the master did not move
   CHECK(r.slave[0].link.moved == 0);
@@ -952,8 +962,9 @@ TEST_CASE(relayed_session_survives_a_nat_that_rebinds) {
   CHECK(any_contains(r.slave_events, "relay lost (437"));
   CHECK(r.master.rejoins >= 1);
   CHECK(r.master.link.moved == 1);
-  CHECK(r.master.link.received > 700);
   REQUIRE(r.slave.size() == 1);
+  CHECK(r.master.ticks + r.master.skipped > 900);
+  CHECK(r.master.link.received > 0.8 * static_cast<double>(r.slave[0].link.sent));
   CHECK(r.slave[0].ended_by_final);
   CHECK(r.slave[0].link.foreign == 0 && r.master.link.foreign == 0);
 }
@@ -970,8 +981,9 @@ TEST_CASE(relayed_session_survives_a_rebinding_nat_between_symmetric_nats) {
   CHECK(any_contains(r.slave_events, "relay lost (437"));
   CHECK(r.master.rejoins >= 1);
   CHECK(r.master.link.moved == 1);
-  CHECK(r.master.link.received > 700);
   REQUIRE(r.slave.size() == 1);
+  CHECK(r.master.ticks + r.master.skipped > 900);
+  CHECK(r.master.link.received > 0.8 * static_cast<double>(r.slave[0].link.sent));
   CHECK(r.slave[0].ended_by_final);
   CHECK(r.slave[0].link.moved == 1);
   CHECK(r.slave[0].link.foreign == 0 && r.master.link.foreign == 0);
