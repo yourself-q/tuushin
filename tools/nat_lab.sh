@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # NAT traversal lab: a master and a slave behind Linux NATs that meet through
 # a rendezvous server, all in network namespaces on one Linux host. Needs
-# root, iproute2, iptables and conntrack (for the report); run it in a
-# privileged container on other systems:
+# root, iproute2, iptables and conntrack (for the report), and coturn for
+# --turn; run it in a privileged container on other systems:
 #
 #   docker run --rm -it --privileged -v "$PWD:/src" ubuntu:24.04 bash
-#   apt-get install g++ cmake pkg-config libsodium-dev iproute2 iptables conntrack
+#   apt-get install g++ cmake pkg-config libsodium-dev iproute2 iptables conntrack coturn
 #   cmake -S /src -B /tmp/b && cmake --build /tmp/b && /src/tools/nat_lab.sh --build /tmp/b
 #
 # Topology. Both homes use the same private prefix, as homes often do, so the
@@ -55,6 +55,10 @@
 #                          forgot it) and forgets its mappings; the session
 #                          must survive it (the master's link follows the
 #                          slave, and the slave is ended by the master)
+#   --turn                 run a TURN server (coturn) next to the rendezvous
+#                          server, on 192.0.2.10:3478, and give the slave a
+#                          relay there (--turn); the PASS line says whether
+#                          the session ran through it
 #   --keep DIR             keep the logs in DIR
 #
 # Prints one line: PASS or FAIL, the scenario, and the time from the master's
@@ -76,6 +80,7 @@ NAT_A_INPUT=drop
 NAT_B_INPUT=drop
 MASTER_FIRST=0
 REBIND_AT=
+TURN=0
 KEEP=
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -92,6 +97,7 @@ while [ $# -gt 0 ]; do
     --nat-a-input) NAT_A_INPUT=$2; shift ;;
     --master-first) MASTER_FIRST=1 ;;
     --rebind-at) REBIND_AT=$2; shift ;;
+    --turn) TURN=1 ;;
     --keep) KEEP=$2; shift ;;
     *) echo "unknown option $1" >&2; exit 1 ;;
   esac
@@ -241,6 +247,19 @@ KEY=$LOG/key
 rm -f "$KEY"
 "$TOOL" keygen "$KEY" 2>/dev/null
 nsx server "$TOOL" rendezvous --port 47200 >"$LOG/server.out" 2>"$LOG/server.err" &
+RELAY=
+if [ "$TURN" = 1 ]; then
+  command -v turnserver >/dev/null || { echo "--turn needs coturn's turnserver" >&2; exit 1; }
+  printf 'lab-secret\n' >"$LOG/turn-pass"
+  chmod 600 "$LOG/turn-pass"
+  # Long-term credentials, UDP only, relayed addresses on the server's own.
+  nsx server turnserver -n --listening-ip=192.0.2.10 --relay-ip=192.0.2.10 \
+    --listening-port=3478 --lt-cred-mech --user=lab:lab-secret --realm=tuushin.lab \
+    --fingerprint --no-tcp --no-tls --no-dtls --no-cli --no-tcp-relay \
+    --log-file=stdout --simple-log >"$LOG/turn.out" 2>&1 &
+  RELAY="--turn 192.0.2.10 --turn-user lab --turn-pass-file $LOG/turn-pass"
+  sleep 0.3
+fi
 sleep 0.2
 
 PRIME=
@@ -248,7 +267,7 @@ PRIME=
 start_slave() {
   # shellcheck disable=SC2086
   nsx slave "$TOOL" slave --once --no-rt --key-file "$KEY" --rendezvous 192.0.2.10 $PRIME \
-    >"$LOG/slave.out" 2>"$LOG/slave.err" &
+    $RELAY >"$LOG/slave.out" 2>"$LOG/slave.err" &
 }
 DURATION=2
 # Enough session left after the rebinding whenever the meeting took.
@@ -285,6 +304,7 @@ SCENARIO="$SCENARIO lan-delay=${MASTER_LAN_DELAY}/${SLAVE_LAN_DELAY}ms"
 SCENARIO="$SCENARIO input=$NAT_A_INPUT/$NAT_B_INPUT"
 SCENARIO="$SCENARIO master-first=$MASTER_FIRST prime-hops=${PRIME_HOPS:-default}"
 [ -z "$REBIND_AT" ] || SCENARIO="$SCENARIO rebind-at=${REBIND_AT}s"
+[ "$TURN" = 0 ] || SCENARIO="$SCENARIO turn"
 OK=0
 if [ "$RC" = 0 ] && grep -q "^authenticated" "$LOG/master.out"; then
   OK=1

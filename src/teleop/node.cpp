@@ -141,22 +141,34 @@ bool prime(net::UdpSocket& socket, const std::vector<net::Endpoint>& to, int hop
 }
 
 // Keeps this end's relayed address announced through the rendezvous: the
-// new one after every allocation, none while there is none.
+// new one after every allocation, none while there is none. When the
+// rendezvous server sees this end at a new address, its NAT has likely
+// moved the relay's socket too, which the TURN server then no longer
+// knows; the TURN client is told to find out.
 class RelayAnnouncer {
  public:
   // Returns a line for the log if anything changed.
-  std::optional<std::string> update(const net::Paths& paths, net::RendezvousClient& rv) {
-    const net::TurnClient* turn = paths.turn();
+  std::optional<std::string> update(net::Paths& paths, net::RendezvousClient& rv, Nanos now) {
+    net::TurnClient* turn = paths.turn();
     if (!turn) return std::nullopt;
+    if (rv.observed() != observed_) {
+      if (observed_.valid()) turn->check(now);
+      observed_ = rv.observed();
+    }
     if (turn->allocated() && turn->allocations() != allocations_) {
+      // A loss and the new allocation can come between two calls.
+      const bool untold = allocations_ != 0 && !lost_told_;
       allocations_ = turn->allocations();
+      lost_told_ = false;
       rv.set_relays({turn->relayed()});
-      return "relay allocated at " + turn->relayed().to_string() + " on " +
+      return std::string(untold ? "relay lost (" + turn->last_error() + "), and " : "") +
+             "relay allocated at " + turn->relayed().to_string() + " on " +
              turn->server().to_string() + ", which sees this end at " +
              turn->mapped().to_string();
     }
     if (!turn->allocated() && !rv.relays().empty()) {
       rv.set_relays({});
+      lost_told_ = true;
       return "relay lost (" + turn->last_error() + "); allocating again";
     }
     if (turn->failed() && !failed_) {
@@ -168,7 +180,9 @@ class RelayAnnouncer {
 
  private:
   std::uint64_t allocations_ = 0;
+  bool lost_told_ = false;
   bool failed_ = false;
+  net::Endpoint observed_;
 };
 
 // The rendezvous during a session (RendezvousConfig::rejoin_after): looks
@@ -210,6 +224,8 @@ class SessionRejoin {
     if (silent) {
       if (now >= next_rejoin_) {
         rv_.refresh_now();
+        // A NAT that moved this end's socket moved the relay's too.
+        if (net::TurnClient* turn = paths_.turn()) turn->check(now);
         next_rejoin_ = now + net::RendezvousClient::kRetryInterval;
       }
     } else {
@@ -675,7 +691,7 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
       device.read_position(now);
       paths.service(now);
       if (rv) {
-        if (const auto line = relay_announcer.update(paths, *rv)) tell(*line);
+        if (const auto line = relay_announcer.update(paths, *rv, now)) tell(*line);
         if (const auto reg = rv->poll(now); reg && rv_server) {
           socket.send_to(*rv_server, reg->data(), reg->size());
         }
@@ -880,7 +896,7 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
       ticker.taken(now);
       if (rejoin) rejoin->tick(now, last_rx);
       if (rv) {
-        if (const auto line = relay_announcer.update(paths, *rv)) tell(*line);
+        if (const auto line = relay_announcer.update(paths, *rv, now)) tell(*line);
       }
 
       const double x = device.read_position(now);

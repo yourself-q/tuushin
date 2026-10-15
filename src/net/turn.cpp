@@ -22,13 +22,20 @@ std::uint16_t get16(const std::uint8_t* p) {
 }
 
 // "437 Allocation Mismatch", from ERROR-CODE, for logs.
+// The code and the reason phrase, for logs. The phrase is the server's
+// text: it ends at a NUL (coturn counts its terminator in the length), and
+// control characters, which could rewrite a terminal, become '?'.
 std::string error_text(const stun::Message& m) {
   const auto code = m.error_code();
   if (!code) return "error response without ERROR-CODE";
   std::string s = std::to_string(*code);
   std::size_t n = 0;
   const std::uint8_t* p = m.find(stun::attr::kErrorCode, &n);
-  if (p && n > 4) s += " " + std::string(reinterpret_cast<const char*>(p + 4), n - 4);
+  if (!p || n <= 4) return s;
+  s += ' ';
+  for (std::size_t i = 4; i < n && p[i] != 0; ++i) {
+    s += p[i] < 0x20 || p[i] == 0x7f ? '?' : static_cast<char>(p[i]);
+  }
   return s;
 }
 
@@ -440,6 +447,11 @@ void TurnClient::fail(const std::string& why) {
   last_error_ = why;
   transactions_.clear();
   state_ = State::kFailed;
+}
+
+void TurnClient::check(Nanos now) {
+  if (state_ == State::kAllocated) refresh_at_ = std::min(refresh_at_, now);
+  if (state_ == State::kWaiting) retry_at_ = std::min(retry_at_, now);
 }
 
 void TurnClient::release() {

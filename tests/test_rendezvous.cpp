@@ -811,20 +811,25 @@ TEST_CASE(session_is_lost_to_a_rebinding_nat_without_the_rejoin) {
 
 namespace {
 
-struct Symmetric {
+struct Relayed {
   MasterNodeReport master;
   std::vector<SlaveSessionReport> slave;
   std::vector<std::string> slave_events;
-  std::uint64_t relayed_datagrams = 0;  // passed on by the TURN server to the master
+  std::uint64_t relayed_datagrams = 0;  // passed on by the TURN server
+  std::uint64_t allocations = 0;
 };
 
-// A master and a slave, each behind a NAT that picks a new outside port for
-// every destination and filters by address and port: the server announces
-// to each end the port the other's NAT uses towards the server, and no
-// other datagram is let in there, so no direct path opens. With `turn`, the
-// slave allocates a relay on a TURN server outside both NATs, and the
-// server announces its address to the master.
-Symmetric symmetric(bool turn) {
+// A master behind a NAT with `master_mapping` and a slave behind one that
+// picks a new outside port for every destination ("symmetric"), both
+// filtering by address and port: the server announces to each end the port
+// the other's NAT uses towards the server, which lets no one else in, and
+// a symmetric NAT sends to anyone else from a port nobody was told of, so
+// no direct path opens. With `turn`, the slave allocates a relay on a TURN
+// server outside both NATs, and the server announces its address to the
+// master. With `rebind`, the slave's NAT forgets its mappings once the
+// session runs, the relay's included, which the TURN server then no
+// longer knows.
+Relayed relayed_session(test::SimNat::Mapping master_mapping, bool turn, bool rebind = false) {
   using test::SimNat;
   UdpSocket server_sock(ep("127.0.0.1", 0));
   const Endpoint server = ep("127.0.0.1", server_sock.local_endpoint().port());
@@ -834,8 +839,7 @@ Symmetric symmetric(bool turn) {
   turn_server.start();
 
   UdpSocket master_sock(ep("127.0.0.1", 0)), slave_sock(ep("127.0.0.1", 0));
-  SimNat master_nat(server, SimNat::Mapping::kAddressPortDependent,
-                    SimNat::Filtering::kAddressPortDependent);
+  SimNat master_nat(server, master_mapping, SimNat::Filtering::kAddressPortDependent);
   SimNat slave_nat(server, SimNat::Mapping::kAddressPortDependent,
                    SimNat::Filtering::kAddressPortDependent);
   const crypto::Key psk = crypto::random_key();
@@ -851,7 +855,7 @@ Symmetric symmetric(bool turn) {
   master_nat.start();
   slave_nat.start();
 
-  Symmetric out;
+  Relayed out;
   std::mutex mu;
   const Nanos period = kNanosPerMilli;
   SimulatedSlave slave_dev(1.0, 2.0, WallParams{}, period, 10, monotonic_now(), 0.0);
@@ -871,21 +875,33 @@ Symmetric symmetric(bool turn) {
   std::thread slave([&] { out.slave = run_slave_node(slave_sock, slave_dev, scfg, hooks, &stop_slave); });
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
+  std::atomic<bool> master_done{false};
+  std::thread rebinder([&] {
+    if (!rebind) return;
+    while (!master_done.load() && slave_nat.delivered() < 300) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    slave_nat.rebind();
+  });
+
   SimulatedMaster master_dev(0.2, 0.5, OperatorParams{}, period, 10, monotonic_now());
   master_dev.set_watchdog(2 * period);
   MasterNodeConfig mcfg;
   mcfg.control.dt = period;
   mcfg.control.model_mass = 0.2;
-  mcfg.duration = 600 * kNanosPerMilli;
+  mcfg.duration = rebind ? kNanosPerSecond : 600 * kNanosPerMilli;
   mcfg.psk = psk;
   mcfg.hello_interval = 50 * kNanosPerMilli;
   mcfg.handshake_timeout = 1500 * kNanosPerMilli;
   mcfg.rendezvous = master_rc;
   out.master = run_master_node(master_sock, Endpoint{}, master_dev, mcfg);
+  master_done.store(true);
+  rebinder.join();
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   stop_slave.store(true);
   slave.join();
   out.relayed_datagrams = turn_server.data_indications() + turn_server.channel_data();
+  out.allocations = turn_server.allocations();
   stop_server.store(true);
   srv.join();
   return out;
@@ -894,7 +910,7 @@ Symmetric symmetric(bool turn) {
 }  // namespace
 
 TEST_CASE(session_runs_through_the_relay_between_symmetric_nats) {
-  const auto r = symmetric(true);
+  const auto r = relayed_session(test::SimNat::Mapping::kAddressPortDependent, true);
   REQUIRE(!r.master.rendezvous_failed && !r.master.handshake_failed);
   CHECK(any_contains(r.slave_events, "relay allocated at"));
   REQUIRE(r.master.relays.size() == 1);
@@ -911,9 +927,29 @@ TEST_CASE(session_runs_through_the_relay_between_symmetric_nats) {
 TEST_CASE(symmetric_nats_meet_but_cannot_open_a_path_without_a_relay) {
   // The control: the same NATs and no relay. Both ends learn each other,
   // and every hello stops at the slave's NAT.
-  const auto r = symmetric(false);
+  const auto r = relayed_session(test::SimNat::Mapping::kAddressPortDependent, false);
   CHECK(!r.master.rendezvous_failed);
   CHECK(r.master.candidates.size() == 1 && r.master.relays.empty());
   CHECK(r.master.handshake_failed && !r.master.authenticated);
   CHECK(r.slave.empty());
+}
+
+TEST_CASE(relayed_session_survives_a_nat_that_rebinds) {
+  // The slave's NAT forgets the relay's mapping with the others. The
+  // slave's silence makes its TURN client refresh at once, which the
+  // server answers with 437 from the new address; the client allocates
+  // again, the slave announces the new relay, the master punches towards
+  // it, and the master's link follows the slave's samples there. (The
+  // master's NAT maps independently of the destination: one that does not
+  // would give the punch a port the slave's samples are not sent to.)
+  const auto r = relayed_session(test::SimNat::Mapping::kEndpointIndependent, true, true);
+  REQUIRE(r.master.authenticated && r.master.relayed);
+  CHECK(r.allocations == 2);
+  CHECK(any_contains(r.slave_events, "relay lost (437"));
+  CHECK(r.master.rejoins >= 1);
+  CHECK(r.master.link.moved == 1);
+  CHECK(r.master.link.received > 700);
+  REQUIRE(r.slave.size() == 1);
+  CHECK(r.slave[0].ended_by_final);
+  CHECK(r.slave[0].link.foreign == 0 && r.master.link.foreign == 0);
 }

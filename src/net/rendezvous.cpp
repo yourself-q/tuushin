@@ -182,12 +182,12 @@ bool RendezvousServer::on_datagram(const std::uint8_t* data, std::size_t size,
 
   const Endpoint source = from.canonical();
   auto unique = [](const std::vector<Endpoint>& v) {
-    std::vector<Endpoint> out;
+    std::vector<Endpoint> u;
     for (const auto& c : v) {
       const Endpoint e = c.canonical();
-      if (std::find(out.begin(), out.end(), e) == out.end()) out.push_back(e);
+      if (std::find(u.begin(), u.end(), e) == u.end()) u.push_back(e);
     }
-    return out;
+    return u;
   };
   std::vector<Endpoint> host = unique(m->candidates);
   std::vector<Endpoint> relays = unique(m->relays);

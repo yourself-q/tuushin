@@ -115,6 +115,13 @@ class TurnClient {
   // Asks for a channel to `peer` (address and port), and its permission.
   // Idempotent.
   void bind_channel(const Endpoint& peer);
+  // Finds out at once whether the server still knows the allocation: a
+  // Refresh now, unless one is on its way, and an Allocate now if one is
+  // waiting to be tried again. For when the caller has reason to think
+  // this end's NAT has moved it (its peers fell silent, another server
+  // sees this end at a new address), so that a lost allocation shows
+  // within a round trip, not at the next keepalive.
+  void check(Nanos now);
   // Deletes the allocation (a Refresh with lifetime 0); poll() sends it and
   // then nothing more.
   void release();

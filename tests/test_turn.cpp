@@ -303,6 +303,57 @@ TEST_CASE(turn_allocates_again_after_437) {
   CHECK(c.channel_bound(kPeer));
 }
 
+TEST_CASE(turn_check_refreshes_at_once) {
+  TurnClient c(kServer, kUser, kPass);
+  CHECK(c.poll(0));  // the first Allocate, lost
+  c.check(kNanosPerMilli);  // nothing to check before an allocation
+  CHECK(!c.poll(kNanosPerMilli));
+
+  TurnClient d(kServer, kUser, kPass);
+  allocate(d, 0);
+  const Nanos t = kNanosPerSecond;  // long before the keepalive
+  CHECK(!d.poll(t));
+  d.check(t);
+  CHECK(d.next_due() == t);
+  const auto refresh = parse(*d.poll(t));
+  CHECK(refresh.method() == stun::method::kRefresh);
+  // Another check while that Refresh is on its way adds nothing.
+  d.check(t);
+  CHECK(!d.poll(t));
+  // The answer tells: here, that this end's NAT moved it.
+  feed(d, error(refresh, 437), t);
+  CHECK(!d.allocated());
+  const auto again = parse(*d.poll(t));
+  CHECK(again.method() == stun::method::kAllocate);
+
+  // An Allocate waiting to be tried again is tried at once.
+  for (int i = 1; i < TurnClient::kMaxTransmissions; ++i) CHECK(d.poll(d.next_due()));
+  const Nanos gone = d.next_due();
+  CHECK(gone == t + 79 * TurnClient::kInitialRto);  // 39.5 s, RFC 8489, 6.2.1
+  CHECK(!d.poll(gone));
+  CHECK(d.next_due() == gone + TurnClient::kRetryDelay);
+  d.check(gone + kNanosPerSecond);
+  CHECK(d.next_due() == gone + kNanosPerSecond);
+  const auto retry = parse(*d.poll(gone + kNanosPerSecond));
+  CHECK(retry.method() == stun::method::kAllocate);
+}
+
+TEST_CASE(turn_error_text_is_safe_to_log) {
+  TurnClient c(kServer, kUser, kPass);
+  allocate(c, 0);
+  const auto refresh = parse(*c.poll(TurnClient::kKeepalive));
+  feed(c,
+       respond(
+           refresh, stun::Class::kError,
+           [](stun::Builder& b) {
+             b.add_error(437, std::string("Invalid \x1b[2Jallocation\n\0trailer", 31));
+           },
+           true),
+       TurnClient::kKeepalive);
+  CHECK(!c.allocated());
+  CHECK(c.last_error() == "437 Invalid ?[2Jallocation?");
+}
+
 TEST_CASE(turn_refused_peer_and_allocate_errors) {
   {
     TurnClient c(kServer, kUser, kPass);
