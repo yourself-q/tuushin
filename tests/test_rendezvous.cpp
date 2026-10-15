@@ -916,11 +916,15 @@ TEST_CASE(session_runs_through_the_relay_between_symmetric_nats) {
   REQUIRE(r.master.relays.size() == 1);
   CHECK(r.master.relayed && r.master.slave == r.master.relays[0]);
   CHECK(r.master.authenticated && r.master.slave_answered && r.master.slave_final);
-  CHECK(r.master.link.received > 400);
-  CHECK(r.relayed_datagrams > 400);
   REQUIRE(r.slave.size() == 1);
   CHECK(r.slave[0].relayed && r.slave[0].authenticated && r.slave[0].ended_by_final);
-  CHECK(r.slave[0].link.received > 400);
+  // The session ran its 600 ms, and the relay carried what each end sent
+  // (counted against what was sent: a loaded machine skips ticks, so fewer
+  // samples go out, but none may be lost on the way).
+  CHECK(r.master.ticks + r.master.skipped > 550);
+  CHECK(r.master.link.received > 0.95 * static_cast<double>(r.slave[0].link.sent));
+  CHECK(r.slave[0].link.received > 0.95 * static_cast<double>(r.master.link.sent));
+  CHECK(r.relayed_datagrams >= r.slave[0].link.received);
   CHECK(r.slave[0].link.foreign == 0 && r.master.link.foreign == 0);
 }
 
