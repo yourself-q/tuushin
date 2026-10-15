@@ -59,6 +59,9 @@ void usage() {
                "  --pc-confidence K     with encoders: PC predictions' confidence factor (1)\n"
                "  --pc-tax N            with encoders: samples a force rise may take to pay\n"
                "                        its quantization tax, 0 to pay at once (4)\n"
+               "  --pc-rise N           with encoders: samples a master force rise must be\n"
+               "                        affordable for on the expected motion, 0 = off (64)\n"
+               "  --slave-pc-rise N     the same at the slave (0)\n"
                "  --initial-energy E    reflect: energy in the store at start in J (0)\n"
                "  --deadband K          perceptual deadband with Weber fraction K, both ways\n"
                "  --wall-k K            wall stiffness in N/m (5000)\n"
@@ -111,6 +114,8 @@ Options parse(int argc, char** argv) {
     else if (a == "--fixed-force-rate") o.cfg.adapt_force_rate = false;
     else if (a == "--pc-confidence") o.cfg.pc_confidence = std::stod(next());
     else if (a == "--pc-tax") o.cfg.pc_tax_samples = std::stoi(next());
+    else if (a == "--pc-rise") o.cfg.master_pc_rise_samples = std::stoi(next());
+    else if (a == "--slave-pc-rise") o.cfg.slave_pc_rise_samples = std::stoi(next());
     else if (a == "--initial-energy") o.cfg.initial_energy = std::stod(next());
     else if (a == "--passivity") {
       const std::string p = next();

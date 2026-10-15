@@ -239,7 +239,20 @@ virtual wall non-passive. Told the resolution, the controllers
   T-AC 1970). Told 20 N/s, the filter misses the device's displacement by
   about four of its standard deviations, told 5 N/s by fifteen, and a
   four-sample horizon that trusts it lets the actuators generate up to
-  7 mJ at 50 ms. Adapted, it misses by about one.
+  7 mJ at 50 ms. Adapted, it misses by about one;
+- let a rise of the master's force go only as far as the expected motion
+  could keep paying for over the next 64 samples. Without that the force
+  chatters at the count rate with every constraint met: a count transition
+  shows the hand moving into the force, the force rises and pays its tax,
+  and by the next transition it has decayed again, so each cycle pays the
+  tax anew. With exact readings, the filter and the tax unchanged, the
+  chatter is a fifth, so the readings cause it, not the tax. The held force
+  may stay; only rises that would have to be taken back are declined.
+  Passivity does not rest on this, so it uses the mean prediction: with
+  the lower bound the master conveyed 11 % at 50 ms instead of 16 %. The
+  slave does not use it: there the displayed share rose, but the slave
+  pushed the wall about a third less hard and tracked worse at 10 ms
+  (4.8 mm against 3.0 mm).
 
 And every port pays its own excess first: when its output has run past
 what the other end granted, its next input covers that before any of it is
@@ -248,14 +261,15 @@ reported to the other end, which would otherwise spend it a second time.
 Reflective scheme, 55 µm master and 1 µm slave encoders, 20 s over nine
 hand motions (0.4 to 0.6 Hz, 3 to 5 cm; `tests/test_teleop1d.cpp` checks
 four of them, `tuushin-sim --master-encoder 55e-6 --slave-encoder 1e-6`
-runs the default one, and `--fixed-force-rate --pc-confidence 0 --pc-tax 0`
-prepays the tax as before):
+runs the default one, `--pc-rise 0` drops the rise hold, and
+`--fixed-force-rate --pc-confidence 0 --pc-tax 0 --pc-rise 0` prepays the
+tax as before):
 
-| one-way delay | worst true margin: resolution known | not known | exact encoders | force displayed: known | tax prepaid | exact encoders |
-|---|---|---|---|---|---|---|
-| 10 ms | 0 J | −4.8e−4 J | 0 J | 40 % | 32 % | 77 % |
-| 50 ms | 0 J | −0.79 J | −1.4e−4 J | 17 % | 12 % | 29 % |
-| 100 ms | 0 J | −1.14 J | −1.3e−4 J | 8 % | 4 % | 13 % |
+| one-way delay | worst true margin: resolution known | not known | exact encoders | force displayed: known | no rise hold | tax prepaid | exact encoders |
+|---|---|---|---|---|---|---|---|
+| 10 ms | 0 J | −4.8e−4 J | 0 J | 78 % | 40 % | 32 % | 77 % |
+| 50 ms | 0 J | −0.79 J | −1.4e−4 J | 16 % | 17 % | 12 % | 29 % |
+| 100 ms | 0 J | −1.14 J | −1.3e−4 J | 11 % | 8 % | 4 % | 13 % |
 
 *True margin* is minus the work the actuators really did, which the books
 see only through the encoders. *Force displayed* is the force on the master
@@ -265,15 +279,19 @@ Treating the readings as exact, the predictor differentiates quantization
 noise and the teleoperator generates up to a joule. Knowing the
 resolution, it generates nothing, also under the loop stalls above
 (`tests/test_teleop_stall.cpp`), and with the filter told a fifth of the
-default rate. The price is transparency. About half the force exact
-encoders convey reaches the operator. Most of the gain over the prepaid
-tax comes from the three slow motions: on the other six the two convey
-about the same, 43 against 47 % at 10 ms and 8 against 6 % at 100 ms.
-The displayed force also chatters more: its total variation is 1.5 times
-that with the prepaid tax, and 1.6 to 5 times that with exact encoders,
-since an adapted filter's estimates are noisier. The books, which pay
-the worst case of every rise, end at most 2.5 mJ below the true margin,
-against 7.8 mJ with the prepaid tax.
+default rate. The price is transparency at long delays. At 10 ms the
+operator feels as much of the contact force as with exact encoders, at
+50 ms a little over half of it, at 100 ms 87 %. On the six motions fast
+enough to pay a prepaid tax the master conveys 79, 18 and 13 %, against
+47, 18 and 6 % with the tax prepaid. The displayed force still chatters
+more than with exact encoders at 50 and 100 ms: its total variation is
+1.8 and 2.4 times theirs (and half of it at 10 ms), down from 4.4 and
+5.1 times without the rise hold, which removes 53 to 70 % of it. The hold
+costs slower hands some force: on motions of 0.15 to 0.3 Hz it doubles
+the share conveyed at 10 ms but lowers it by a sixth to a quarter at 50
+and 100 ms. The books, which pay the worst case of every rise, end at
+most 1.9 mJ below the true margin, against 7.8 mJ with the prepaid
+tax.
 
 ## Authentication
 
@@ -602,9 +620,10 @@ the slave kept sending to the master's port for the old relay.
   slave has seen; with `--hello-state`, across restarts too, so delete the
   file if a clock ran far ahead.
 - **Coarse encoders cost transparency.** With a 55 µm master encoder the
-  teleoperator stays passive, but about half the force exact encoders
-  convey reaches the operator, and it chatters more (Coarse encoders
-  above). A hand pressing into the wall slower than about q/(4 dt),
+  teleoperator stays passive and at 10 ms conveys as much of the contact
+  force as with exact encoders, but at 50 and 100 ms only 56 and 87 % of
+  what they convey, and the force chatters about twice as much (Coarse
+  encoders above). A hand pressing into the wall slower than about q/(4 dt),
   1.4 cm/s on a Touch, still never starts a force. A longer tax horizon
   lowers that threshold (eight samples started a force on a hand peaking
   at 0.94 cm/s) but in our runs let the actuators generate a few µJ.

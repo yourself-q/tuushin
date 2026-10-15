@@ -66,12 +66,17 @@ struct MasterConfig {
   // PC then predicts with the lower bound of `pc_confidence` standard
   // deviations, and a rise of the force repays its tax over
   // `pc_tax_samples` samples instead of within the coming one, which a
-  // master pressed slower than a count per sample cannot pay.
+  // master pressed slower than a count per sample cannot pay. A rise also
+  // goes no further than the force the expected motion could pay for over
+  // `pc_rise_samples` samples, so that the force does not rise on every
+  // count transition and decay before the next, paying the tax each time
+  // (0 lets it).
   double encoder_resolution = 0.0;
   double force_rate = 20.0;
   bool adapt_force_rate = true;
   double pc_confidence = 1.0;
   int pc_tax_samples = 4;
+  int pc_rise_samples = 64;
   bool deadband = false;
   codec::DeadbandParams deadband_params{0.1, 0.002, from_millis(100)};
 };
@@ -159,12 +164,15 @@ struct SlaveConfig {
   double model_mass = 1.0;  // kg
   int pc_hold_samples = 2;
   // As in MasterConfig. The velocity the coupling damps is still the one
-  // passed to step().
+  // passed to step(). The rise horizon is off by default: on the slave it
+  // holds back the coupling force against the environment, and in the
+  // simulator the robot then pressed into the wall about a third less hard.
   double encoder_resolution = 0.0;  // m
   double force_rate = 20.0;         // N/s
   bool adapt_force_rate = true;
   double pc_confidence = 1.0;
   int pc_tax_samples = 4;
+  int pc_rise_samples = 0;
   bool deadband = false;
   codec::DeadbandParams deadband_params{0.1, 0.05, from_millis(100)};
   // Between samples the slave extrapolates the master position with the last

@@ -345,7 +345,7 @@ TEST_CASE(predictive_pc_force_is_the_largest_affordable_with_the_tax) {
 
 TEST_CASE(predictor_spread_and_adaptation_need_a_resolution) {
   // With an exact encoder there is no filter: no spread, no adaptation, and
-  // so the confidence bound and the tax horizon change nothing.
+  // so the confidence bound and the tax and rise horizons change nothing.
   const double m = 0.2, dt = 1e-3;
   HeldMass dev{m, dt, 1.5};
   dev.v = 0.02;
@@ -358,7 +358,7 @@ TEST_CASE(predictor_spread_and_adaptation_need_a_resolution) {
   CHECK(pred.force_rate() == 20.0);
   for (double phi : {-6.0, -1.0, 0.5, 3.0, 12.0}) {
     for (double budget : {0.0, 1e-5, 1e-3}) {
-      CHECK(limit_force_predictive(budget, phi, pred, 2, 1.0, 4).value ==
+      CHECK(limit_force_predictive(budget, phi, pred, 2, 1.0, 4, 64).value ==
             limit_force_predictive(budget, phi, pred, 2).value);
     }
   }
@@ -451,11 +451,37 @@ TEST_CASE(predictive_pc_repays_the_tax_over_its_horizon) {
   CHECK(indebted.value >= safe.value && indebted.value < rise.value);
 }
 
-// Property, with the confidence bound and the tax horizon: the PC's force
-// meets every constraint it checks, and any larger force of the same sign
-// would not. Over one sample and the hold the bound is on the work's lower
-// confidence bound, without the tax when a horizon repays it; over the
-// horizon a rise must repay its tax and the books' deficit.
+TEST_CASE(predictive_pc_rises_only_as_far_as_it_could_hold) {
+  // A device coasting into the force at 3 cm/s, pushed by the hand just as
+  // hard as the force holds it back, 1 N. Its momentum repays the tax of a
+  // rise to several newtons over four samples, but such a force stops the
+  // device within tens of samples and then pushes it out: the rise would
+  // have to be taken back, its tax lost. Over 64 samples the expected
+  // motion pays for little more than the hand's push.
+  const double m = 0.2, dt = 1e-3, q = 55e-6, push = 1.0;
+  HeldMass dev{m, dt, push};
+  dev.v = 0.03;
+  DevicePredictor pred(m, dt, q);
+  for (int k = 0; k < 400; ++k) pred.observe(dev.step(push), push);
+  const double phi = 5.0;
+  const auto quick = limit_force_predictive(0.0, phi, pred, 2, 0.0, 4);
+  const auto lasting = limit_force_predictive(0.0, phi, pred, 2, 0.0, 4, 64);
+  CHECK(quick.value > 3.0);
+  CHECK(lasting.value > push && lasting.value < 1.5);
+  CHECK_NEAR(pred.hold_work(lasting.value, 64), 0.0, 1e-12);
+  // The held force, and a smaller one, may stay whatever the horizon.
+  for (double f : {push, 0.5 * push}) {
+    CHECK(limit_force_predictive(0.0, f, pred, 2, 0.0, 4, 64).value ==
+          limit_force_predictive(0.0, f, pred, 2, 0.0, 4).value);
+  }
+}
+
+// Property, with the confidence bound and the tax and rise horizons: the
+// PC's force meets every constraint it checks, and any larger force of the
+// same sign would not. Over one sample and the hold the bound is on the
+// work's lower confidence bound, without the tax when a horizon repays it;
+// over the tax horizon a rise must repay its tax and the books' deficit,
+// and over the rise horizon the expected work must stay above -budget.
 TEST_CASE(predictive_pc_force_is_the_largest_affordable_over_the_horizon) {
   Rng rng(17);
   const double dt = 1e-3;
@@ -482,7 +508,10 @@ TEST_CASE(predictive_pc_force_is_the_largest_affordable_over_the_horizon) {
     const double confidence = rng.bernoulli(0.3) ? 0.0 : 2.0 * rng.uniform();
     const int horizons[] = {0, 1, 4, 8};
     const int horizon = horizons[static_cast<int>(rng.uniform() * 4.0)];
-    const auto r = limit_force_predictive(budget, phi, pred, hold, confidence, horizon);
+    const int rises[] = {0, 0, 16, 64};
+    const int rise_horizon = rises[static_cast<int>(rng.uniform() * 4.0)];
+    const auto r =
+        limit_force_predictive(budget, phi, pred, hold, confidence, horizon, rise_horizon);
     // The least slack over the constraints; negative means violated.
     const auto slack = [&](double f) {
       const double b = std::max(0.0, budget), tax = quantization_tax(q, held, f);
@@ -495,6 +524,7 @@ TEST_CASE(predictive_pc_force_is_the_largest_affordable_over_the_horizon) {
       // A rise, beyond the rounding of a force scaled back to the kept one.
       const bool rise = tax > q * 1e-12 * std::fabs(phi);
       if (horizon > 0 && rise) s = std::min(s, budget + lcb(horizon) - tax);
+      if (rise_horizon > 0 && rise) s = std::min(s, b + pred.hold_work(f, rise_horizon));
       return s;
     };
     const bool sign_ok = r.value * phi >= 0.0 && std::fabs(r.value) <= std::fabs(phi);
@@ -506,8 +536,9 @@ TEST_CASE(predictive_pc_force_is_the_largest_affordable_over_the_horizon) {
       CHECK(sign_ok);
       CHECK(affordable);
       CHECK(largest);
-      std::printf("trial %d m %g q %g held %g phi %g budget %g hold %d conf %g horizon %d -> %g\n",
-                  trial, m, q, held, phi, budget, hold, confidence, horizon, r.value);
+      std::printf(
+          "trial %d m %g q %g held %g phi %g budget %g hold %d conf %g horizons %d %d -> %g\n",
+          trial, m, q, held, phi, budget, hold, confidence, horizon, rise_horizon, r.value);
       return;
     }
   }

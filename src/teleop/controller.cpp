@@ -68,7 +68,7 @@ MasterController::Step MasterController::step(Nanos now, double position, Nanos 
     const auto pc = cfg_.predictive_pc
                         ? control::limit_force_predictive(port_.budget(), f_reflected, dev_,
                                                           cfg_.pc_hold_samples, cfg_.pc_confidence,
-                                                          cfg_.pc_tax_samples)
+                                                          cfg_.pc_tax_samples, cfg_.pc_rise_samples)
                         : control::limit_force(port_, f_reflected, v_meas_, dt_);
     out.display_force = pc.value;
     out.pc_active = pc.active;
@@ -188,7 +188,7 @@ SlaveController::Step SlaveController::step(Nanos now, double position, double v
     const auto pc = cfg_.predictive_pc
                         ? control::limit_force_predictive(grant.slave, phi, dev_,
                                                           cfg_.pc_hold_samples, cfg_.pc_confidence,
-                                                          cfg_.pc_tax_samples)
+                                                          cfg_.pc_tax_samples, cfg_.pc_rise_samples)
                         : control::limit_force(grant.slave, phi, velocity, dt_);
     f_ctrl_ = -pc.value;
     out.pc_active = pc.active || grant.limited;

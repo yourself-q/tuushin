@@ -166,8 +166,8 @@ TEST_CASE(teleop_reflective_tdpa_stays_passive_on_coarse_encoders) {
   // the resolutions known the books never credit more than the actuators
   // took in, whatever the motion, so the true margin is that of the books'
   // guarantee: nothing is generated. The price is transparency: over nine
-  // hand motions at 10-100 ms the master conveys a little over half of the
-  // contact force it conveys with exact encoders.
+  // hand motions the master conveys as much of the contact force as with
+  // exact encoders at 10 ms, but only 56 % and 87 % of it at 50 and 100 ms.
   for (int ms : {10, 50, 100}) {
     for (double freq : {0.4, 0.6}) {
       for (double amplitude : {0.03, 0.05}) {
@@ -207,16 +207,40 @@ sim::Teleop1DConfig coarse(double freq, double amplitude) {
   return cfg;
 }
 
-// The PCs as they were before the confidence bound, the tax horizon and the
-// adaptation: the tax prepaid within the sample.
+// The PCs as they were before the confidence bound, the tax horizon, the
+// adaptation and the rise hold: the tax prepaid within the sample.
 sim::Teleop1DConfig prepaid(sim::Teleop1DConfig cfg) {
   cfg.adapt_force_rate = false;
   cfg.pc_confidence = 0.0;
   cfg.pc_tax_samples = 0;
+  cfg.master_pc_rise_samples = 0;
   return cfg;
 }
 
 }  // namespace
+
+TEST_CASE(teleop_coarse_encoder_rises_that_last_chatter_less) {
+  // Every count the master's reading moves into the force raises the
+  // affordable force, and every count it does not lowers it again: each
+  // rise pays the tax at once, and the force chatters at the count rate.
+  // Holding a rise to the force the expected motion could keep paying for
+  // over 64 samples removes one half to three quarters of the chatter on
+  // every hand motion, and costs no energy.
+  for (int ms : {10, 50, 100}) {
+    for (double freq : {0.4, 0.6}) {
+      for (double amplitude : {0.03, 0.05}) {
+        auto cfg = coarse(freq, amplitude);
+        const auto held = run(cfg, from_millis(ms));
+        cfg.master_pc_rise_samples = 0;
+        const auto unheld = run(cfg, from_millis(ms));
+        CHECK(!held.diverged);
+        CHECK(held.max_book_excess < 1e-12);
+        CHECK(held.min_true_margin > -1e-9);
+        CHECK(held.display_force_variation < 0.6 * unheld.display_force_variation);
+      }
+    }
+  }
+}
 
 TEST_CASE(teleop_coarse_encoder_forces_start_on_slow_motions) {
   // A rise of the master's force from zero costs the tax q |phi| at once.
@@ -225,14 +249,16 @@ TEST_CASE(teleop_coarse_encoder_forces_start_on_slow_motions) {
   // on a Touch at 1 kHz; a hand that presses slower never feels the wall,
   // for the master displays nothing, takes in nothing and so never earns
   // a budget. Repaid over four samples of predicted input, the force starts
-  // above about q / (4 dt), 1.4 cm/s. This hand peaks at 1.9 cm/s.
+  // above about q / (4 dt), 1.4 cm/s. This hand peaks at 1.9 cm/s. Holding
+  // each rise to what the expected motion could keep paying for lowers the
+  // peak (1.9 to 2.7 N against 2.8 to 5 N without), but the force starts.
   for (int ms : {10, 50, 100}) {
     const auto cfg = coarse(0.2, 0.03);
     const auto r = run(cfg, from_millis(ms));
     CHECK(!r.diverged);
     CHECK(r.max_book_excess < 1e-12);
     CHECK(r.min_true_margin > -1e-9);
-    CHECK(r.max_display_force > 2.0);
+    CHECK(r.max_display_force > 1.5);
     CHECK(run(prepaid(cfg), from_millis(ms)).max_display_force == 0.0);
   }
 }
@@ -243,7 +269,9 @@ TEST_CASE(teleop_coarse_encoder_pc_needs_an_honest_filter) {
   // when it changes several times faster trusts it too much: its
   // predictions miss by many of its own standard deviations, the lower
   // confidence bound is too high, and the actuators generate energy.
-  // Adapting the rate to the innovations restores the guarantee.
+  // Adapting the rate to the innovations restores the guarantee. Holding
+  // rises to what the mean prediction could keep paying for makes fewer of
+  // them and the energy generated three to five times smaller, not zero.
   for (int ms : {50, 100}) {
     auto cfg = coarse(0.6, 0.05);
     cfg.force_rate = 5.0;
@@ -251,6 +279,6 @@ TEST_CASE(teleop_coarse_encoder_pc_needs_an_honest_filter) {
     CHECK(!r.diverged);
     CHECK(r.min_true_margin > -1e-9);
     cfg.adapt_force_rate = false;
-    CHECK(run(cfg, from_millis(ms)).min_true_margin < -1e-3);
+    CHECK(run(cfg, from_millis(ms)).min_true_margin < -5e-4);
   }
 }

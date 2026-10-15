@@ -185,16 +185,38 @@ namespace tuushin::control {
 // the same, so it is not their correlation. The slow side is the safe one:
 // a rate too high costs transparency, not passivity.
 //
+// Rises that cannot last. With a coarse encoder the master's force chatters
+// with every constraint met: a count transition shows the hand moving into
+// the force, the PC lets the force rise and books its tax, and before the
+// next transition, which shows nothing until the hand has moved another
+// count, the force has decayed again. Each cycle pays the tax anew, so the
+// budget stays at zero. The readings, not the tax, cause it: with exact
+// readings and the filter and the tax unchanged, the force's total
+// variation at 50 ms is a fifth. With rise_samples = M a rise goes only as
+// far as the force could be held over M samples on the expected motion,
+// lambda * G0_M - lambda^2 * C_M >= -budget with G0_M the mean prediction,
+// which for long M is about the hand's estimated push H: the force the hand
+// is known to sustain. The held force may stay, so this declines only rises
+// that would have to be taken back. Passivity does not rest on it, so it
+// takes the mean; with the lower bound a force could rise only to H less
+// its uncertainty, and with M = 64 the master conveyed 11 % of the contact
+// force at 50 ms instead of 16 %. A limit on the rate of rise is no
+// substitute: at 50 N/s it halved the variation at 50 ms but cut the force
+// conveyed from 17 to 11 %.
+//
 // Measured in the 1-DoF simulator (reflective scheme, 55 um master and 1 um
 // slave encoders, 20 s over nine hand motions): with the filter, the tax and
 // the ports paying their own excess first (control/tdpa.hpp), the actuators
 // never generate energy at 10, 50 or 100 ms each way. Controllers that take
 // the readings as exact let the teleoperator generate up to 0.5 mJ, 0.8 J
-// and 1.1 J. The price is transparency: with adaptation, confidence 1 and
-// the tax repaid over four samples the master conveys 40, 17 and 8 % of the
-// contact force at 10, 50 and 100 ms, against 77, 29 and 13 % with exact
-// encoders. With the tax prepaid it conveyed 32, 12 and 4 %, and nothing
-// at all on the three motions too slow to pay it.
+// and 1.1 J. The price is transparency: with adaptation, confidence 1, the
+// tax repaid over four samples and rises held over 64 the master conveys
+// 78, 16 and 11 % of the contact force at 10, 50 and 100 ms, against 77, 29
+// and 13 % with exact encoders, and its force varies 0.5, 1.8 and 2.4 times
+// as much. Without the rise hold it conveyed 40, 17 and 8 % and its force
+// varied 1.6, 4.4 and 5.1 times as much. With the tax prepaid as well it
+// conveyed 32, 12 and 4 %, and nothing at all on the three motions too slow
+// to pay it.
 //
 // Sign convention: power into the controlled two-port is phi * dx, and the
 // device accelerates by -phi / m. At a haptic master phi is the displayed
@@ -301,11 +323,13 @@ double quantization_tax(double q, double prev, double phi);
 // the result counts as well: against each of those predictions when
 // `tax_samples` is 0, and otherwise only for a rise beyond the held force,
 // which must repay it and any deficit (a negative budget) from the work
-// predicted over `tax_samples` samples. The result's gain is the fraction
-// of the requested force that was removed, 1 - lambda. While the device is
-// not ready() the result is zero force.
+// predicted over `tax_samples` samples. With a resolution and
+// `rise_samples` > 0 such a rise also goes no further than the expected
+// work over `rise_samples` samples can pay for. The result's gain is the
+// fraction of the requested force that was removed, 1 - lambda. While the
+// device is not ready() the result is zero force.
 PcResult limit_force_predictive(double budget, double phi, const DevicePredictor& device,
                                 int hold_samples = 2, double confidence = 0.0,
-                                int tax_samples = 0);
+                                int tax_samples = 0, int rise_samples = 0);
 
 }  // namespace tuushin::control

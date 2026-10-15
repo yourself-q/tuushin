@@ -188,7 +188,8 @@ double quantization_tax(double q, double prev, double phi) {
 }
 
 PcResult limit_force_predictive(double budget, double phi, const DevicePredictor& device,
-                                int hold_samples, double confidence, int tax_samples) {
+                                int hold_samples, double confidence, int tax_samples,
+                                int rise_samples) {
   PcResult r;
   r.value = phi;
   if (phi == 0.0) return r;
@@ -212,6 +213,13 @@ PcResult limit_force_predictive(double budget, double phi, const DevicePredictor
   double l = affordable_scale_taxed(g(1.0), h(1.0), b, F, kept, tq);
   if (hold_samples > 1) {
     l = std::min(l, affordable_scale_taxed(g(hold_samples), h(hold_samples), b, F, kept, tq));
+  }
+  if (rise_samples > 0 && q > 0.0 && l * F > kept) {
+    // A rise, which pays a tax, goes no further than the force the expected
+    // motion could pay for over rise_samples samples; the held force may
+    // stay. This guards the tax, not passivity, so it takes the mean.
+    const double gm = phi * device.hold_base(rise_samples);
+    l = std::min(l, std::max(kept / F, affordable_scale(gm, h(rise_samples), b)));
   }
   if (tax_samples > 0 && q > 0.0 && l * F > kept) {
     // A rise must repay the books' deficit and its own tax within
