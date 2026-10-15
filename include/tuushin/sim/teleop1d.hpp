@@ -123,6 +123,14 @@ struct Teleop1DConfig {
   double master_encoder_resolution = 0.0;
   double slave_encoder_resolution = 0.0;
   bool encoder_resolution_known = true;
+  // With known resolutions, the predictors' Kalman filters and their use
+  // by the PCs (teleop::MasterConfig): the operator's least force rate in
+  // N/s and whether the filters may raise it, and the confidence factor
+  // and the tax horizon of limit_force_predictive.
+  double force_rate = 20.0;
+  bool adapt_force_rate = true;
+  double pc_confidence = 1.0;
+  int pc_tax_samples = 4;
   bool forward_deadband = false;
   codec::DeadbandParams forward_deadband_params{0.1, 0.002, from_millis(100)};
   bool backward_deadband = false;
@@ -149,6 +157,14 @@ struct Teleop1DResult {
   // over master penetration. Compare with the wall stiffness to see how much
   // softer the remote wall feels.
   double displayed_stiffness = 0.0;  // N/m
+  // What the master's passivity controller (and actuator limit) took away:
+  // RMS of the displayed force less the force the newest slave sample asked
+  // for. Unlike force_rmse it leaves out the delay and the coupling, which
+  // no passivity controller can fix.
+  double pc_force_rmse = 0.0;  // N
+  // Total variation of the displayed force per second, sum |f_k - f_{k-1}|
+  // over the run's length: how much it chatters.
+  double display_force_variation = 0.0;  // N/s
 
   double forward_packet_rate = 0.0;   // packets/s actually sent
   double backward_packet_rate = 0.0;

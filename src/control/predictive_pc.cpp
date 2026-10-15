@@ -16,11 +16,19 @@ constexpr double kInitialForceVar = 25.0;
 // at up to a decimetre per second and changed its push by ten newtons.
 constexpr double kLostVelocityVar = 1e-2;
 constexpr double kLostForceVar = 100.0;
+// Adapting the random walk: how fast its log-variance follows the
+// normalized innovations, per second; the most a single innovation counts
+// for (three standard deviations); and the largest factor on its variance,
+// 16^2 (16 times the rate).
+constexpr double kAdaptPerSecond = 3.0;
+constexpr double kAdaptNisClip = 9.0;
+constexpr double kAdaptLogMax = 5.545177444479562;  // 2 ln 16
 
 }  // namespace
 
-DevicePredictor::DevicePredictor(double mass, double dt, double resolution, double force_rate)
-    : dt_(dt), mass_(mass), q_(resolution) {
+DevicePredictor::DevicePredictor(double mass, double dt, double resolution, double force_rate,
+                                 bool adapt_force_rate)
+    : dt_(dt), mass_(mass), q_(resolution), force_rate_(force_rate), adapt_(adapt_force_rate) {
   if (!(mass > 0.0) || !(dt > 0.0)) {
     throw std::invalid_argument("DevicePredictor: mass and dt must be positive");
   }
@@ -92,17 +100,28 @@ void DevicePredictor::filter(double dx, double phi_held, double r, bool regular)
       for (int k = 0; k < 3; ++k) p[i][j] += fp[i][k] * f[j][k];
     }
   }
-  p[2][2] += h_walk_ * r;
+  p[2][2] += h_walk_ * (adapt_ ? std::exp(log_walk_) : 1.0) * r;
   // Update with the reading; the innovation is reading - estimate = -e.
   const double s = p[0][0] + noise_;
   const double k[3] = {p[0][0] / s, p[1][0] / s, p[2][0] / s};
   const double nu = -e_;
+  if (adapt_) {
+    // Covariance matching: a consistent filter's normalized innovation
+    // squared averages 1; more says it trusts its estimates of v and H too
+    // much, and the walk's variance grows until it does not.
+    const double nis = std::min(nu * nu / s, kAdaptNisClip);
+    log_walk_ = std::clamp(log_walk_ + kAdaptPerSecond * h * (nis - 1.0), 0.0, kAdaptLogMax);
+  }
   e_ += k[0] * nu;
   v_ += k[1] * nu;
   h_ += k[2] * nu;
   for (int i = 0; i < 3; ++i) {
     for (int j = 0; j < 3; ++j) p_[i][j] = p[i][j] - k[i] * p[0][j];
   }
+}
+
+double DevicePredictor::force_rate() const {
+  return adapt_ ? force_rate_ * std::exp(0.5 * log_walk_) : force_rate_;
 }
 
 double DevicePredictor::base() const {
@@ -129,6 +148,13 @@ double DevicePredictor::velocity_dt() const {
 
 double DevicePredictor::hold_base(double n) const {
   return n * velocity_dt() + n * n * c_ * external_force();
+}
+
+double DevicePredictor::hold_sd(double n) const {
+  if (q_ <= 0.0) return 0.0;
+  const double gv = n * dt_, gh = n * n * c_;
+  const double var = gv * gv * p_[1][1] + 2.0 * gv * gh * p_[1][2] + gh * gh * p_[2][2];
+  return std::sqrt(std::max(0.0, var));
 }
 
 namespace {
@@ -162,7 +188,7 @@ double quantization_tax(double q, double prev, double phi) {
 }
 
 PcResult limit_force_predictive(double budget, double phi, const DevicePredictor& device,
-                                int hold_samples) {
+                                int hold_samples, double confidence, int tax_samples) {
   PcResult r;
   r.value = phi;
   if (phi == 0.0) return r;
@@ -173,17 +199,34 @@ PcResult limit_force_predictive(double budget, double phi, const DevicePredictor
     return r;
   }
   const double b = std::max(0.0, budget);
-  // W(lambda) = lambda * g - lambda^2 * h with h > 0, less the tax, which
-  // is paid once whatever the horizon.
   const double q = device.resolution();
   const double F = std::fabs(phi);
   const double kept = phi * device.held_force() > 0.0 ? std::fabs(device.held_force()) : 0.0;
-  double l = affordable_scale_taxed(phi * device.base(), phi * phi * device.compliance(), b, F,
-                                    kept, q);
+  // W(lambda) = lambda * g - lambda^2 * h with h > 0 over n samples, its
+  // lower confidence bound with `confidence`.
+  auto g = [&](double n) { return phi * device.hold_base(n) - confidence * F * device.hold_sd(n); };
+  auto h = [&](double n) { return phi * phi * device.hold_compliance(n); };
+  // The tax is paid once whatever the horizon: within every horizon, or
+  // with tax_samples over that horizon alone.
+  const double tq = tax_samples > 0 ? 0.0 : q;
+  double l = affordable_scale_taxed(g(1.0), h(1.0), b, F, kept, tq);
   if (hold_samples > 1) {
-    l = std::min(l, affordable_scale_taxed(phi * device.hold_base(hold_samples),
-                                           phi * phi * device.hold_compliance(hold_samples), b,
-                                           F, kept, q));
+    l = std::min(l, affordable_scale_taxed(g(hold_samples), h(hold_samples), b, F, kept, tq));
+  }
+  if (tax_samples > 0 && q > 0.0 && l * F > kept) {
+    // A rise must repay the books' deficit and its own tax within
+    // tax_samples = N: the largest lambda >= kept / F with
+    // lambda * g(N) - lambda^2 * h(N) - q * (lambda * F - kept) >= -budget.
+    const double l0 = kept / F, gn = g(tax_samples) - q * F, hn = h(tax_samples);
+    const double c0 = q * kept + budget;
+    const double disc = gn * gn + 4.0 * hn * c0;
+    double ln = l0;
+    if (gn - hn + c0 >= 0.0) {
+      ln = 1.0;
+    } else if (disc >= 0.0) {
+      ln = std::max(l0, (gn + std::sqrt(disc)) / (2.0 * hn));
+    }
+    l = std::min(l, ln);
   }
   if (l >= 1.0) return r;  // the full force is affordable
   r.value = l * phi;

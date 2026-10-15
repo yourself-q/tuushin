@@ -343,6 +343,176 @@ TEST_CASE(predictive_pc_force_is_the_largest_affordable_with_the_tax) {
   }
 }
 
+TEST_CASE(predictor_spread_and_adaptation_need_a_resolution) {
+  // With an exact encoder there is no filter: no spread, no adaptation, and
+  // so the confidence bound and the tax horizon change nothing.
+  const double m = 0.2, dt = 1e-3;
+  HeldMass dev{m, dt, 1.5};
+  dev.v = 0.02;
+  DevicePredictor pred(m, dt, 0.0, 20.0, true);
+  for (int k = 0; k < 50; ++k) {
+    const double phi = (k % 7) * 0.5;
+    pred.observe(dev.step(phi), phi);
+  }
+  CHECK(pred.hold_sd(1.0) == 0.0 && pred.hold_sd(4.0) == 0.0);
+  CHECK(pred.force_rate() == 20.0);
+  for (double phi : {-6.0, -1.0, 0.5, 3.0, 12.0}) {
+    for (double budget : {0.0, 1e-5, 1e-3}) {
+      CHECK(limit_force_predictive(budget, phi, pred, 2, 1.0, 4).value ==
+            limit_force_predictive(budget, phi, pred, 2).value);
+    }
+  }
+}
+
+TEST_CASE(predictor_raises_its_force_rate_while_the_push_changes_fast) {
+  // A hand whose push swings by 3 N at 2 Hz changes it at up to 38 N/s; the
+  // filter is told 5 N/s. Its innovations then exceed their predicted
+  // spread, and so would its predictions: a fixed filter misses the device's
+  // displacement by many of its own standard deviations. The adapting one
+  // raises the rate until its spread is honest, and lowers it again once the
+  // push holds still.
+  const double m = 0.2, dt = 1e-3, q = 55e-6, k_wall = 300.0;
+  HeldMass dev{m, dt, 0.0};
+  DevicePredictor fixed(m, dt, q, 5.0), adapting(m, dt, q, 5.0, true);
+  auto reading = [&] { return std::round(dev.x / q) * q; };
+  double y = reading();
+  double z2_fixed = 0.0, z2_adapting = 0.0;
+  int n = 0;
+  const int swing = 3000, still = 5000;
+  for (int k = 0; k < swing + still; ++k) {
+    dev.H = k < swing ? 3.0 * std::sin(2.0 * 3.141592653589793 * 2.0 * k * dt) : 0.0;
+    if (k == swing) dev.v = 0.0;  // the hand stops the device and lets go
+    // A spring on the readings holds it near 0 while the push swings.
+    const double phi = k < swing ? k_wall * y : 0.0;
+    const double x0 = dev.x;
+    const double predicted_fixed = fixed.displacement(phi);
+    const double predicted_adapting = adapting.displacement(phi);
+    const double sd_fixed = fixed.hold_sd(1.0), sd_adapting = adapting.hold_sd(1.0);
+    dev.step(phi);
+    if (k >= 1000 && k < swing) {
+      const double dx = dev.x - x0;
+      z2_fixed += (dx - predicted_fixed) * (dx - predicted_fixed) / (sd_fixed * sd_fixed);
+      z2_adapting += (dx - predicted_adapting) * (dx - predicted_adapting) /
+                     (sd_adapting * sd_adapting);
+      ++n;
+    }
+    const double y1 = reading();
+    fixed.observe(y1 - y, phi);
+    adapting.observe(y1 - y, phi);
+    y = y1;
+    if (k == swing - 1) {
+      CHECK(fixed.force_rate() == 5.0);
+      CHECK(adapting.force_rate() > 15.0);
+      CHECK(adapting.force_rate() <= 16.0 * 5.0);
+    }
+  }
+  const double z_fixed = std::sqrt(z2_fixed / n), z_adapting = std::sqrt(z2_adapting / n);
+  CHECK(z_fixed > 3.0);
+  CHECK(z_adapting > 0.5 && z_adapting < 2.0);
+  CHECK(adapting.force_rate() < 5.0 * 1.05);
+}
+
+TEST_CASE(predictive_pc_repays_the_tax_over_its_horizon) {
+  // A device moving into the force at 3 cm/s covers 30 um per sample, less
+  // than a 55 um count. Prepaid within the sample, the tax of any rise from
+  // zero exceeds the input it can draw, so the force never starts however
+  // long the device keeps coming. Over four samples the device moves 120 um,
+  // and the predicted input repays the tax.
+  const double m = 0.2, dt = 1e-3, q = 55e-6;
+  HeldMass dev{m, dt, 0.0};
+  dev.v = 0.03;
+  DevicePredictor pred(m, dt, q);
+  for (int k = 0; k < 200; ++k) pred.observe(dev.step(0.0), 0.0);
+  const double phi = 2.0;
+  CHECK(limit_force_predictive(0.0, phi, pred, 2).value == 0.0);
+  const auto r = limit_force_predictive(0.0, phi, pred, 2, 0.0, 4);
+  CHECK(r.active && r.value > 1.0 && r.value < phi);
+  CHECK_NEAR(pred.hold_work(r.value, 4) - quantization_tax(q, 0.0, r.value), 0.0, 1e-15);
+  // With the confidence bound it asks for a little less, and the device,
+  // held for the four samples, really takes in more than the tax.
+  const auto safe = limit_force_predictive(0.0, phi, pred, 2, 1.0, 4);
+  CHECK(safe.value > 1.0 && safe.value < r.value);
+  HeldMass copy = dev;
+  const double x0 = copy.x;
+  for (int k = 0; k < 4; ++k) copy.step(safe.value);
+  CHECK(safe.value * (copy.x - x0) > quantization_tax(q, 0.0, safe.value));
+  // A force that is kept pays no tax, so the horizon does not limit it, nor
+  // a force that falls.
+  pred.observe(dev.step(safe.value), safe.value);
+  for (double f : {safe.value, 0.5 * safe.value}) {
+    CHECK(limit_force_predictive(0.0, f, pred, 2, 0.0, 4).value ==
+          limit_force_predictive(0.0, f, pred, 2).value);
+  }
+  // A rise beyond the kept force must still repay its own tax, and, from
+  // books in deficit, the deficit too.
+  const auto rise = limit_force_predictive(0.0, 3.0 * safe.value, pred, 2, 0.0, 4);
+  const auto indebted = limit_force_predictive(-1e-5, 3.0 * safe.value, pred, 2, 0.0, 4);
+  CHECK(rise.value > safe.value);
+  CHECK(indebted.value >= safe.value && indebted.value < rise.value);
+}
+
+// Property, with the confidence bound and the tax horizon: the PC's force
+// meets every constraint it checks, and any larger force of the same sign
+// would not. Over one sample and the hold the bound is on the work's lower
+// confidence bound, without the tax when a horizon repays it; over the
+// horizon a rise must repay its tax and the books' deficit.
+TEST_CASE(predictive_pc_force_is_the_largest_affordable_over_the_horizon) {
+  Rng rng(17);
+  const double dt = 1e-3;
+  for (int trial = 0; trial < 20000; ++trial) {
+    const double m = 0.05 + rng.uniform();
+    const double q = rng.bernoulli(0.1) ? 0.0 : rng.uniform() * 1e-4;
+    HeldMass dev{m, dt, rng.normal() * 3.0};
+    dev.v = rng.normal() * 0.05;
+    DevicePredictor pred(m, dt, q, 5.0 + 50.0 * rng.uniform(), rng.bernoulli(0.5));
+    double held = 0.0;
+    const int history = 4 + static_cast<int>(rng.uniform() * 40.0);
+    for (int k = 0; k < history; ++k) {
+      if (rng.bernoulli(0.3)) held = rng.bernoulli(0.3) ? 0.0 : rng.normal() * 5.0;
+      dev.H += rng.normal() * 0.2;
+      const double dx = dev.step(held);
+      pred.observe(q > 0.0 ? std::round(dev.x / q) * q - std::round((dev.x - dx) / q) * q : dx,
+                   held);
+    }
+    const double phi = rng.normal() * 8.0;
+    const double budget = rng.bernoulli(0.2)   ? -rng.exponential(2e-4)
+                          : rng.bernoulli(0.3) ? 0.0
+                                               : rng.exponential(5e-4);
+    const int hold = rng.bernoulli(0.5) ? 1 : 2;
+    const double confidence = rng.bernoulli(0.3) ? 0.0 : 2.0 * rng.uniform();
+    const int horizons[] = {0, 1, 4, 8};
+    const int horizon = horizons[static_cast<int>(rng.uniform() * 4.0)];
+    const auto r = limit_force_predictive(budget, phi, pred, hold, confidence, horizon);
+    // The least slack over the constraints; negative means violated.
+    const auto slack = [&](double f) {
+      const double b = std::max(0.0, budget), tax = quantization_tax(q, held, f);
+      const auto lcb = [&](double n) {
+        return pred.hold_work(f, n) - confidence * std::fabs(f) * pred.hold_sd(n);
+      };
+      const double prepaid = horizon > 0 ? 0.0 : tax;
+      double s = b + lcb(1.0) - prepaid;
+      if (hold > 1) s = std::min(s, b + lcb(hold) - prepaid);
+      // A rise, beyond the rounding of a force scaled back to the kept one.
+      const bool rise = tax > q * 1e-12 * std::fabs(phi);
+      if (horizon > 0 && rise) s = std::min(s, budget + lcb(horizon) - tax);
+      return s;
+    };
+    const bool sign_ok = r.value * phi >= 0.0 && std::fabs(r.value) <= std::fabs(phi);
+    const double scale = 1e-12 + 1e-9 * std::fabs(phi) * (q + 1e-4);
+    const bool affordable = r.value == phi || slack(r.value) >= -scale;
+    const double bigger = r.value + 1e-6 * phi;
+    const bool largest = !r.active || r.value == phi || slack(bigger) < scale;
+    if (!sign_ok || !affordable || !largest) {
+      CHECK(sign_ok);
+      CHECK(affordable);
+      CHECK(largest);
+      std::printf("trial %d m %g q %g held %g phi %g budget %g hold %d conf %g horizon %d -> %g\n",
+                  trial, m, q, held, phi, budget, hold, confidence, horizon, r.value);
+      return;
+    }
+  }
+}
+
 TEST_CASE(reflective_store_grants_in_full_when_covered) {
   ReflectiveStore s;
   s.on_master_input_energy(1.0);

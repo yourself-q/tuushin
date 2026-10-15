@@ -142,13 +142,50 @@ namespace tuushin::control {
 //    the two is what the tax pays for. Smoother estimates also mean fewer
 //    and smaller force changes, and so a smaller tax.
 //
+// Repaying the tax. Without a budget the tax of a rise has to come from the
+// input the new force draws. Paid within the coming sample, it needs the
+// device to move more than q per sample into the force, 5.5 cm/s for a
+// Touch at 1 kHz: on a device pressed more slowly a force cannot start from
+// zero, so the master displays nothing, takes in nothing and never earns
+// the budget that would let it. With tax_samples = N the one-sample and
+// hold constraints leave the tax out, and a rise must instead repay it,
+// with any deficit of the books, from the work predicted over N samples
+// with the force held:
+//
+//   lambda * G_N - lambda^2 * C_N - q * (lambda |phi| - kept) >= -budget,
+//
+// with G_N and C_N the coefficients of the work over N samples above and
+// kept the part of the held force with phi's sign. That lowers the
+// threshold to about q / (N dt), 1.4 cm/s for N = 4. The books still take
+// the tax at once; if the device does not come, they go into deficit by at
+// most about one tax and block further rises until inputs repay it.
+//
+// Trusting the prediction. A horizon of N samples trusts the prediction
+// over N samples, so its error matters. limit_force_predictive takes
+// `confidence` standard deviations (hold_sd) off the predicted work: a
+// lower confidence bound. That bound is only as good as the filter's idea
+// of its own uncertainty, which rests on force_rate. Told 5 N/s while the
+// hand's push changes faster, the filter misses the device's displacement
+// by about fifteen of its standard deviations, told 20 N/s by about four,
+// and a horizon of four samples on such predictions let the actuators
+// generate up to 7 mJ at 50 ms. With adapt_force_rate the filter tunes its
+// random walk to its innovations, the covariance matching of R. K. Mehra,
+// "On the identification of variances and adaptive Kalman filtering",
+// IEEE T-AC 15(2), 1970: a consistent filter's normalized innovation
+// squared nu^2 / S averages 1, so the log of the walk's variance moves by
+// 3/s times (min(nu^2 / S, 9) - 1), with the rate kept between force_rate
+// and 16 force_rate. Its misses are then about one standard deviation.
+//
 // Measured in the 1-DoF simulator (reflective scheme, 55 um master and 1 um
 // slave encoders, 20 s over nine hand motions): with the filter, the tax and
 // the ports paying their own excess first (control/tdpa.hpp), the actuators
 // never generate energy at 10, 50 or 100 ms each way. Controllers that take
 // the readings as exact let the teleoperator generate up to 0.5 mJ, 0.8 J
-// and 1.1 J. The price is transparency: on the default motion at 50 ms the
-// displayed stiffness falls from 202 N/m with exact encoders to 88 N/m.
+// and 1.1 J. The price is transparency: with adaptation, confidence 1 and
+// the tax repaid over four samples the master conveys 40, 17 and 8 % of the
+// contact force at 10, 50 and 100 ms, against 77, 29 and 13 % with exact
+// encoders. With the tax prepaid it conveyed 32, 12 and 4 %, and nothing
+// at all on the three motions too slow to pay it.
 //
 // Sign convention: power into the controlled two-port is phi * dx, and the
 // device accelerates by -phi / m. At a haptic master phi is the displayed
@@ -159,8 +196,11 @@ class DevicePredictor {
   // `resolution` is the encoder's resolution in m, 0 for an exact encoder
   // (the three-point recursion). `force_rate` is how fast the forces other
   // than the port force are expected to change, in N/s; it only matters
-  // with a resolution, as the random walk of the Kalman filter's H.
-  DevicePredictor(double mass, double dt, double resolution = 0.0, double force_rate = 20.0);
+  // with a resolution, as the random walk of the Kalman filter's H. With
+  // `adapt_force_rate` it is the least rate, and the filter raises it up to
+  // 16 times as far as its innovations show it to be overconfident.
+  DevicePredictor(double mass, double dt, double resolution = 0.0, double force_rate = 20.0,
+                  bool adapt_force_rate = false);
 
   // Call once per sample with the displacement realized over the last sample,
   // the port force that was held throughout it, and its length h in seconds
@@ -175,6 +215,9 @@ class DevicePredictor {
   bool ready() const { return regular_ >= 2; }
 
   double resolution() const { return q_; }
+  // The rate the filter's random walk currently assumes: force_rate, or
+  // with adapt_force_rate what the innovations have raised it to.
+  double force_rate() const;
   // The port force held at the end of the last sample: the force observed
   // with it, or 0 after observe_irregular(), whose force was cut. The
   // quantization tax of the next force is measured from it.
@@ -195,6 +238,9 @@ class DevicePredictor {
     return hold_base(n) - hold_compliance(n) * phi;
   }
   double hold_work(double phi, double n) const { return phi * hold_displacement(phi, n); }
+  // Standard deviation of hold_displacement() from the Kalman filter's
+  // uncertainty about v and H; 0 without a resolution.
+  double hold_sd(double n) const;
 
   // Estimates recovered from the history (or the Kalman filter, with a
   // resolution): everything acting on the device except the port force (the
@@ -220,6 +266,9 @@ class DevicePredictor {
   double q_;
   double noise_;     // variance of a reading, q^2 / 12
   double h_walk_;    // variance of the change of H over a nominal sample
+  double force_rate_;
+  bool adapt_;
+  double log_walk_ = 0.0;  // log of the factor adaptation applies to h_walk_
   double e_ = 0.0, v_ = 0.0, h_ = 0.0;
   double p_[3][3] = {};
 };
@@ -236,13 +285,18 @@ class DevicePredictor {
 double quantization_tax(double q, double prev, double phi);
 
 // Scales `phi` towards zero so that the predicted work over the coming
-// sample, and over `hold_samples` samples if that is larger than one, stays
+// sample, and over `hold_samples` samples if that is larger than one, less
+// `confidence` standard deviations of it (DevicePredictor::hold_sd), stays
 // above -budget (budget in J; negative values count as zero). With an
 // encoder resolution the quantization tax of moving from the held force to
-// the result counts against the budget as well. The result's gain is the
-// fraction of the requested force that was removed, 1 - lambda. While the
-// device is not ready() the result is zero force.
+// the result counts as well: against each of those predictions when
+// `tax_samples` is 0, and otherwise only for a rise beyond the held force,
+// which must repay it and any deficit (a negative budget) from the work
+// predicted over `tax_samples` samples. The result's gain is the fraction
+// of the requested force that was removed, 1 - lambda. While the device is
+// not ready() the result is zero force.
 PcResult limit_force_predictive(double budget, double phi, const DevicePredictor& device,
-                                int hold_samples = 2);
+                                int hold_samples = 2, double confidence = 0.0,
+                                int tax_samples = 0);
 
 }  // namespace tuushin::control

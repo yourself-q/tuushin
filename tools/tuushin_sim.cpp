@@ -54,6 +54,11 @@ void usage() {
                "  --master-encoder Q    master encoder resolution in m (0 = exact)\n"
                "  --slave-encoder Q     slave encoder resolution in m (0 = exact)\n"
                "  --encoders-unknown    controllers treat the encoder readings as exact\n"
+               "  --force-rate R        with encoders: operator's least force rate in N/s (20)\n"
+               "  --fixed-force-rate    with encoders: the filters keep the force rate\n"
+               "  --pc-confidence K     with encoders: PC predictions' confidence factor (1)\n"
+               "  --pc-tax N            with encoders: samples a force rise may take to pay\n"
+               "                        its quantization tax, 0 to pay at once (4)\n"
                "  --initial-energy E    reflect: energy in the store at start in J (0)\n"
                "  --deadband K          perceptual deadband with Weber fraction K, both ways\n"
                "  --wall-k K            wall stiffness in N/m (5000)\n"
@@ -101,6 +106,10 @@ Options parse(int argc, char** argv) {
     else if (a == "--master-encoder") o.cfg.master_encoder_resolution = std::stod(next());
     else if (a == "--slave-encoder") o.cfg.slave_encoder_resolution = std::stod(next());
     else if (a == "--encoders-unknown") o.cfg.encoder_resolution_known = false;
+    else if (a == "--force-rate") o.cfg.force_rate = std::stod(next());
+    else if (a == "--fixed-force-rate") o.cfg.adapt_force_rate = false;
+    else if (a == "--pc-confidence") o.cfg.pc_confidence = std::stod(next());
+    else if (a == "--pc-tax") o.cfg.pc_tax_samples = std::stoi(next());
     else if (a == "--initial-energy") o.cfg.initial_energy = std::stod(next());
     else if (a == "--passivity") {
       const std::string p = next();
@@ -168,6 +177,8 @@ void print_result(const sim::Teleop1DResult& r) {
   std::printf("pos_rmse               %.5f m\n", r.pos_rmse);
   std::printf("final_drift            %.5f m\n", r.final_drift);
   std::printf("force_rmse             %.3f N\n", r.force_rmse);
+  std::printf("pc_force_rmse          %.3f N\n", r.pc_force_rmse);
+  std::printf("display_variation      %.1f N/s\n", r.display_force_variation);
   std::printf("forward_packet_rate    %.1f /s (loss %.2f %%)\n", r.forward_packet_rate,
               100.0 * r.forward_loss);
   std::printf("backward_packet_rate   %.1f /s (loss %.2f %%)\n", r.backward_packet_rate,

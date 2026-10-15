@@ -86,6 +86,10 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
   mc.pc_hold_samples = cfg.pc_hold_samples;
   mc.max_force = cfg.master.max_force;
   mc.encoder_resolution = cfg.encoder_resolution_known ? cfg.master_encoder_resolution : 0.0;
+  mc.force_rate = cfg.force_rate;
+  mc.adapt_force_rate = cfg.adapt_force_rate;
+  mc.pc_confidence = cfg.pc_confidence;
+  mc.pc_tax_samples = cfg.pc_tax_samples;
   mc.deadband = cfg.forward_deadband;
   mc.deadband_params = cfg.forward_deadband_params;
   teleop::MasterController master(mc);
@@ -103,6 +107,10 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
   sc.model_mass = cfg.slave_model_mass > 0.0 ? cfg.slave_model_mass : cfg.slave.mass;
   sc.pc_hold_samples = cfg.pc_hold_samples;
   sc.encoder_resolution = cfg.encoder_resolution_known ? cfg.slave_encoder_resolution : 0.0;
+  sc.force_rate = cfg.force_rate;
+  sc.adapt_force_rate = cfg.adapt_force_rate;
+  sc.pc_confidence = cfg.pc_confidence;
+  sc.pc_tax_samples = cfg.pc_tax_samples;
   sc.deadband = cfg.backward_deadband;
   sc.deadband_params = cfg.backward_deadband_params;
   teleop::SlaveController slave(sc, slave_dev.read_position(0));
@@ -113,6 +121,7 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
   Teleop1DResult r;
   double sum_pos_err2 = 0.0, sum_force_err2 = 0.0;
   double sum_kp_num = 0.0, sum_kp_den = 0.0;
+  double sum_pc_err2 = 0.0, variation = 0.0, f_prev = 0.0;
   double drift_sum = 0.0;
   std::int64_t drift_n = 0;
   std::int64_t pc_m_count = 0, pc_s_count = 0;
@@ -205,6 +214,10 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
 
     sum_pos_err2 += (x_m - x_s) * (x_m - x_s);
     sum_force_err2 += (f_display - f_contact) * (f_display - f_contact);
+    const double pc_err = f_display - master.requested_force();
+    sum_pc_err2 += pc_err * pc_err;
+    variation += std::fabs(f_display - f_prev);
+    f_prev = f_display;
     const double penetration_m = x_m - cfg.wall.position;
     if (penetration_m > 0.0 && f_display > 0.0) {
       sum_kp_num += f_display * penetration_m;
@@ -230,6 +243,8 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
   const double sim_s = static_cast<double>(done) * dt;
   r.pos_rmse = std::sqrt(sum_pos_err2 / n);
   r.force_rmse = std::sqrt(sum_force_err2 / n);
+  r.pc_force_rmse = std::sqrt(sum_pc_err2 / n);
+  r.display_force_variation = sim_s > 0 ? variation / sim_s : 0.0;
   r.displayed_stiffness = sum_kp_den > 0.0 ? sum_kp_num / sum_kp_den : 0.0;
   r.final_drift = drift_n > 0 ? drift_sum / static_cast<double>(drift_n) : 0.0;
   r.forward_packet_rate = sim_s > 0 ? static_cast<double>(fwd_sender.sent) / sim_s : 0.0;

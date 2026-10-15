@@ -61,9 +61,17 @@ struct MasterConfig {
   // a Kalman filter, and the velocity sent to the slave is the filter's
   // instead of the backward difference (control/predictive_pc.hpp).
   // `force_rate` (N/s) is how fast the filter expects the operator's push
-  // to change.
+  // to change; with `adapt_force_rate` it is the least, and the filter
+  // raises it as far as its innovations show it to be overconfident. The
+  // PC then predicts with the lower bound of `pc_confidence` standard
+  // deviations, and a rise of the force repays its tax over
+  // `pc_tax_samples` samples instead of within the coming one, which a
+  // master pressed slower than a count per sample cannot pay.
   double encoder_resolution = 0.0;
   double force_rate = 20.0;
+  bool adapt_force_rate = true;
+  double pc_confidence = 1.0;
+  int pc_tax_samples = 4;
   bool deadband = false;
   codec::DeadbandParams deadband_params{0.1, 0.002, from_millis(100)};
 };
@@ -104,6 +112,10 @@ class MasterController {
   // encoder positions, or the device model's estimate with an encoder
   // resolution set and a regular history.
   double velocity() const { return v_sent_; }
+  // The force the newest slave sample asks the master to display (0 before
+  // one arrived); display_force is what the passivity controller and the
+  // actuator limit leave of it.
+  double requested_force() const { return has_value_ ? f_reflected_ : 0.0; }
   bool has_slave_sample() const { return has_value_; }
   // Energy books at the master device port (power into the teleoperator).
   const control::EnergyPort& port() const { return port_; }
@@ -149,6 +161,9 @@ struct SlaveConfig {
   // passed to step().
   double encoder_resolution = 0.0;  // m
   double force_rate = 20.0;         // N/s
+  bool adapt_force_rate = true;
+  double pc_confidence = 1.0;
+  int pc_tax_samples = 4;
   bool deadband = false;
   codec::DeadbandParams deadband_params{0.1, 0.05, from_millis(100)};
   // Between samples the slave extrapolates the master position with the last

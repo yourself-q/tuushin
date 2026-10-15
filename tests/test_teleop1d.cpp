@@ -142,8 +142,9 @@ TEST_CASE(teleop_reflective_tdpa_stays_passive_on_coarse_encoders) {
   // A 55 um master encoder (3D Systems Touch) and a 1 um slave encoder. With
   // the resolutions known the books never credit more than the actuators
   // took in, whatever the motion, so the true margin is that of the books'
-  // guarantee: nothing is generated. The price is transparency: at 50 ms
-  // the wall feels about half as stiff as with exact encoders.
+  // guarantee: nothing is generated. The price is transparency: over nine
+  // hand motions at 10-100 ms the master conveys a little over half of the
+  // contact force it conveys with exact encoders.
   for (int ms : {10, 50, 100}) {
     for (double freq : {0.4, 0.6}) {
       for (double amplitude : {0.03, 0.05}) {
@@ -169,4 +170,64 @@ TEST_CASE(teleop_reflective_tdpa_stays_passive_on_coarse_encoders) {
   cfg.slave_encoder_resolution = 1e-6;
   cfg.encoder_resolution_known = false;
   CHECK(run(cfg, from_millis(50)).min_true_margin < -0.1);
+}
+
+namespace {
+
+sim::Teleop1DConfig coarse(double freq, double amplitude) {
+  sim::Teleop1DConfig cfg;
+  cfg.passivity = Passivity::kReflective;
+  cfg.master_encoder_resolution = 55e-6;
+  cfg.slave_encoder_resolution = 1e-6;
+  cfg.op.ref_freq = freq;
+  cfg.op.ref_amplitude = amplitude;
+  return cfg;
+}
+
+// The PCs as they were before the confidence bound, the tax horizon and the
+// adaptation: the tax prepaid within the sample.
+sim::Teleop1DConfig prepaid(sim::Teleop1DConfig cfg) {
+  cfg.adapt_force_rate = false;
+  cfg.pc_confidence = 0.0;
+  cfg.pc_tax_samples = 0;
+  return cfg;
+}
+
+}  // namespace
+
+TEST_CASE(teleop_coarse_encoder_forces_start_on_slow_motions) {
+  // A rise of the master's force from zero costs the tax q |phi| at once.
+  // Prepaid from the input of the coming sample, it needs the master to
+  // move more than a count per sample into the force, q / dt = 5.5 cm/s
+  // on a Touch at 1 kHz; a hand that presses slower never feels the wall,
+  // for the master displays nothing, takes in nothing and so never earns
+  // a budget. Repaid over four samples of predicted input, the force starts
+  // above about q / (4 dt), 1.4 cm/s. This hand peaks at 1.9 cm/s.
+  for (int ms : {10, 50, 100}) {
+    const auto cfg = coarse(0.2, 0.03);
+    const auto r = run(cfg, from_millis(ms));
+    CHECK(!r.diverged);
+    CHECK(r.max_book_excess < 1e-12);
+    CHECK(r.min_true_margin > -1e-9);
+    CHECK(r.max_display_force > 2.0);
+    CHECK(run(prepaid(cfg), from_millis(ms)).max_display_force == 0.0);
+  }
+}
+
+TEST_CASE(teleop_coarse_encoder_pc_needs_an_honest_filter) {
+  // Repaying the tax over several samples trusts the filter's prediction
+  // over them, and a filter told that the hand's push changes at 5 N/s
+  // when it changes several times faster trusts it too much: its
+  // predictions miss by many of its own standard deviations, the lower
+  // confidence bound is too high, and the actuators generate energy.
+  // Adapting the rate to the innovations restores the guarantee.
+  for (int ms : {50, 100}) {
+    auto cfg = coarse(0.6, 0.05);
+    cfg.force_rate = 5.0;
+    const auto r = run(cfg, from_millis(ms));
+    CHECK(!r.diverged);
+    CHECK(r.min_true_margin > -1e-9);
+    cfg.adapt_force_rate = false;
+    CHECK(run(cfg, from_millis(ms)).min_true_margin < -1e-3);
+  }
 }

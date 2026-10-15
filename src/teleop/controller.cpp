@@ -35,7 +35,7 @@ void observe(control::DevicePredictor& dev, double dx, double phi, double h, Nan
 MasterController::MasterController(const MasterConfig& cfg)
     : cfg_(cfg),
       dt_(to_seconds(cfg.dt)),
-      dev_(cfg.model_mass, dt_, cfg.encoder_resolution, cfg.force_rate),
+      dev_(cfg.model_mass, dt_, cfg.encoder_resolution, cfg.force_rate, cfg.adapt_force_rate),
       enc_(cfg.deadband_params) {}
 
 void MasterController::receive(std::uint32_t seq, const Sample& s) {
@@ -66,7 +66,8 @@ MasterController::Step MasterController::step(Nanos now, double position, Nanos 
   if (cfg_.passivity != Passivity::kNone) {
     const auto pc = cfg_.predictive_pc
                         ? control::limit_force_predictive(port_.budget(), f_reflected, dev_,
-                                                          cfg_.pc_hold_samples)
+                                                          cfg_.pc_hold_samples, cfg_.pc_confidence,
+                                                          cfg_.pc_tax_samples)
                         : control::limit_force(port_, f_reflected, v_meas_, dt_);
     out.display_force = pc.value;
     out.pc_active = pc.active;
@@ -101,7 +102,7 @@ SlaveController::SlaveController(const SlaveConfig& cfg, double position)
     : cfg_(cfg),
       dt_(to_seconds(cfg.dt)),
       store_(cfg.initial_energy),
-      dev_(cfg.model_mass, dt_, cfg.encoder_resolution, cfg.force_rate),
+      dev_(cfg.model_mass, dt_, cfg.encoder_resolution, cfg.force_rate, cfg.adapt_force_rate),
       enc_(cfg.deadband_params),
       x_sampled_(position),
       x_cmd_(position),
@@ -179,7 +180,8 @@ SlaveController::Step SlaveController::step(Nanos now, double position, double v
     const auto grant = store_.allocate(want_slave, want_master);
     const auto pc = cfg_.predictive_pc
                         ? control::limit_force_predictive(grant.slave, phi, dev_,
-                                                          cfg_.pc_hold_samples)
+                                                          cfg_.pc_hold_samples, cfg_.pc_confidence,
+                                                          cfg_.pc_tax_samples)
                         : control::limit_force(grant.slave, phi, velocity, dt_);
     f_ctrl_ = -pc.value;
     out.pc_active = pc.active || grant.limited;
