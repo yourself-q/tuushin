@@ -1,5 +1,8 @@
 #pragma once
 
+#include <deque>
+#include <utility>
+
 #include "tuushin/time.hpp"
 
 namespace tuushin::teleop {
@@ -50,6 +53,34 @@ struct WallParams {
   double b = 10.0;         // N s/m, only while penetrating
 };
 
+// Friction in a device's transmission besides the viscous damping, as in
+// the model of Armstrong-Helouvry et al. (Automatica 30(7), 1994): Coulomb
+// friction that drops from the stiction force to the Coulomb force over
+// the Stribeck velocity, smoothed through zero velocity with tanh(v / v0) so
+// that the integrator need not find the stops. A tanh with a small v0 lets
+// the device creep under a force F below the stiction force Fs instead of
+// sticking, at v0 atanh(F / Fs).
+struct FrictionParams {
+  double coulomb = 0.0;              // N
+  double stiction = 0.0;             // N, ignored below `coulomb`
+  double stribeck_velocity = 0.01;   // m/s
+  double smoothing_velocity = 1e-3;  // m/s, v0
+  // The friction force on a device moving at v, against the motion.
+  double force(double v) const;
+};
+
+// A device whose structure gives: the encoder and the actuator sit on the
+// motor side, and the hand or the wall pushes on a distal mass joined to it
+// by a spring and a damper (a cable, a belt, a harmonic drive or a link).
+// Below the resonance the two move as one mass; above it the controller
+// drives the motor side alone, which is lighter than any model of the
+// whole device says.
+struct ComplianceParams {
+  double distal_mass = 0.0;  // kg, part of the device's mass; 0 for a rigid device
+  double stiffness = 0.0;    // N/m
+  double damping = 0.0;      // N s/m
+};
+
 // Physics shared by the simulated devices: a mass with viscous friction,
 // integrated with classical Runge-Kutta under a zero-order-held actuator
 // force. RK4 is exact for a constant force on a mass, as a real device under
@@ -67,11 +98,7 @@ class SimulatedDevice : public Device1D {
   // The velocity at the last read, or with an encoder resolution the
   // backward difference of the readings, as device drivers report it.
   double velocity() const override { return q_ > 0.0 ? v_read_ : v_; }
-  void command_force(double f) override {
-    f_ = f;
-    command_time_ = t_;
-    cut_after_ = 0;
-  }
+  void command_force(double f) override;
   Nanos force_cut_after() const override { return cut_after_; }
 
   // Rounds the readings to multiples of `q` (m), as an encoder with that
@@ -79,11 +106,27 @@ class SimulatedDevice : public Device1D {
   void set_encoder_resolution(double q);
   double encoder_resolution() const { return q_; }
 
-  // The physical state, whatever the encoder reads.
+  // Friction besides the viscous damping, acting on the motor side.
+  void set_friction(const FrictionParams& friction) { friction_ = friction; }
+  // Splits the device's mass into a motor side, which the encoder reads and
+  // the actuator drives, and a distal side, on which the external force
+  // acts; the two start together at rest. A distal mass outside (0, mass)
+  // makes the device rigid again.
+  void set_compliance(const ComplianceParams& compliance);
+  // A commanded force takes effect `delay` later, as with a servo loop that
+  // picks up commands on its own ticks or a bus that carries them. The
+  // watchdog still counts from the command.
+  void set_actuation_delay(Nanos delay) { delay_ = delay > 0 ? delay : 0; }
+
+  // The physical state, whatever the encoder reads: of the motor side.
   double position() const { return x_; }
   double true_velocity() const { return v_; }
-  // The force the actuator applies now: the last command, or 0 once the
-  // watchdog has cut it.
+  // The distal side, where the hand or the wall acts; the motor side for a
+  // rigid device.
+  double distal_position() const { return compliant_ ? x2_ : x_; }
+  double distal_velocity() const { return compliant_ ? v2_ : v_; }
+  // The force the actuator applies now: the last command that has taken
+  // effect, or 0 once the watchdog has cut it.
   double force() const { return f_; }
   Nanos time() const { return t_; }
   // Work done on the device by its actuator so far (J): the integral of the
@@ -103,20 +146,29 @@ class SimulatedDevice : public Device1D {
   SimulatedDevice(double mass, double damping, Nanos nominal_dt, int substeps, Nanos start,
                   double position);
   // Forces other than the actuator and friction at time `t` (s since start)
-  // for the state (x, v).
+  // for the state (x, v) of the distal side.
   virtual double external_force(double t, double x, double v) const = 0;
   Nanos start() const { return start_; }
 
  private:
   void advance(Nanos to);
+  void integrate(Nanos to);
 
   double mass_, damping_;
+  FrictionParams friction_;
+  bool compliant_ = false;
+  double m1_ = 0.0, m2_ = 0.0;  // motor and distal masses when compliant
+  ComplianceParams compliance_;
+  double x2_ = 0.0, v2_ = 0.0;
+  Nanos delay_ = 0;
+  std::deque<std::pair<Nanos, double>> pending_;  // commands not yet in effect
   Nanos nominal_dt_;
   int substeps_;
   Nanos start_;
   Nanos t_;
   double x_, v_ = 0.0;
   double f_ = 0.0;
+  double commanded_ = 0.0;
   Nanos command_time_;
   Nanos watchdog_ = 0;
   Nanos cut_after_ = 0;

@@ -23,6 +23,7 @@ namespace {
 
 struct Options {
   sim::Teleop1DConfig cfg;
+  std::vector<double> master_compliance, slave_compliance;
   double delay_ms = 0.0;
   double jitter_ms = 0.0;
   bool reorder = false;
@@ -50,6 +51,15 @@ void usage() {
                "  --no-tdpa             same as --passivity none\n"
                "  --constant-velocity-pc  PCs assume constant velocity over a sample\n"
                "  --model-mass M        master mass the PC believes in kg (true mass)\n"
+               "  --slave-model-mass M  slave mass the PC believes in kg (true mass)\n"
+               "  --master-friction C[,S]  Coulomb and stiction friction of the master in N\n"
+               "  --slave-friction C[,S]   the same for the slave\n"
+               "  --master-compliance F,HZ[,Z]  a fraction F of the master's mass sits\n"
+               "                        beyond a spring at HZ Hz, damping ratio Z (0.05)\n"
+               "  --slave-compliance F,HZ[,Z]   the same for the slave\n"
+               "  --master-actuation-delay-ms D  delay before a master force takes effect\n"
+               "  --slave-actuation-delay-ms D   the same for the slave\n"
+               "  --sample-jitter-ms J  each end samples up to J off its 1 ms grid (< 0.5)\n"
                "  --pc-hold N           samples a PC force must stay affordable if held (2)\n"
                "  --master-encoder Q    master encoder resolution in m (0 = exact)\n"
                "  --slave-encoder Q     slave encoder resolution in m (0 = exact)\n"
@@ -82,6 +92,27 @@ std::vector<double> parse_list(const std::string& s) {
   return out;
 }
 
+teleop::FrictionParams parse_friction(const std::string& name, const std::string& s) {
+  const auto v = parse_list(s);
+  if (v.empty() || v.size() > 2) throw std::invalid_argument(name + " needs 1 or 2 values");
+  teleop::FrictionParams f;
+  f.coulomb = v[0];
+  f.stiction = v.size() > 1 ? v[1] : 0.0;
+  return f;
+}
+
+// Two masses, a fraction `v[0]` of `mass` beyond the spring, resonating
+// against each other at v[1] Hz with damping ratio v[2].
+teleop::ComplianceParams compliance(const std::string& name, double mass,
+                                    const std::vector<double>& v) {
+  if (v.size() < 2 || v.size() > 3 || !(v[0] > 0.0 && v[0] < 1.0) || !(v[1] > 0.0)) {
+    throw std::invalid_argument(name + " needs F in (0, 1), HZ > 0 and optionally Z");
+  }
+  const double m2 = v[0] * mass, mu = (mass - m2) * m2 / mass;
+  const double w = 2.0 * 3.14159265358979323846 * v[1], zeta = v.size() > 2 ? v[2] : 0.05;
+  return teleop::ComplianceParams{m2, mu * w * w, 2.0 * zeta * mu * w};
+}
+
 Options parse(int argc, char** argv) {
   Options o;
   for (int i = 1; i < argc; ++i) {
@@ -106,6 +137,18 @@ Options parse(int argc, char** argv) {
     else if (a == "--no-tdpa") o.cfg.passivity = sim::Teleop1DConfig::Passivity::kNone;
     else if (a == "--constant-velocity-pc") o.cfg.predictive_pc = false;
     else if (a == "--model-mass") o.cfg.master_model_mass = std::stod(next());
+    else if (a == "--slave-model-mass") o.cfg.slave_model_mass = std::stod(next());
+    else if (a == "--master-friction") o.cfg.master.friction = parse_friction(a, next());
+    else if (a == "--slave-friction") o.cfg.slave.friction = parse_friction(a, next());
+    else if (a == "--master-compliance") o.master_compliance = parse_list(next());
+    else if (a == "--slave-compliance") o.slave_compliance = parse_list(next());
+    else if (a == "--master-actuation-delay-ms") {
+      o.cfg.master.actuation_delay = from_millis(std::stod(next()));
+    }
+    else if (a == "--slave-actuation-delay-ms") {
+      o.cfg.slave.actuation_delay = from_millis(std::stod(next()));
+    }
+    else if (a == "--sample-jitter-ms") o.cfg.sample_jitter = from_millis(std::stod(next()));
     else if (a == "--pc-hold") o.cfg.pc_hold_samples = std::stoi(next());
     else if (a == "--master-encoder") o.cfg.master_encoder_resolution = std::stod(next());
     else if (a == "--slave-encoder") o.cfg.slave_encoder_resolution = std::stod(next());
@@ -145,6 +188,13 @@ Options parse(int argc, char** argv) {
     else if (a == "--sweep") o.sweep = parse_list(next());
     else if (a == "-h" || a == "--help") { usage(); std::exit(0); }
     else throw std::invalid_argument("unknown option " + a);
+  }
+  if (!o.master_compliance.empty()) {
+    o.cfg.master.compliance =
+        compliance("--master-compliance", o.cfg.master.mass, o.master_compliance);
+  }
+  if (!o.slave_compliance.empty()) {
+    o.cfg.slave.compliance = compliance("--slave-compliance", o.cfg.slave.mass, o.slave_compliance);
   }
   return o;
 }

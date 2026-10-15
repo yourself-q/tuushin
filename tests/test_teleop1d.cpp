@@ -141,6 +141,33 @@ TEST_CASE(teleop_tdpa_with_jitter_and_loss_stays_passive) {
   }
 }
 
+TEST_CASE(teleop_sampling_jitter_stays_passive) {
+  // Each end samples up to 0.45 ms off its 1 ms grid, as a control loop on
+  // a general-purpose OS does. A sample that strays more than half a period
+  // from the last restarts the predictor's model, so the PCs block more,
+  // but the books stay exact and nothing is generated.
+  for (int ms : {10, 50}) {
+    sim::Teleop1DConfig cfg;
+    cfg.passivity = Passivity::kReflective;
+    cfg.master_encoder_resolution = 55e-6;
+    cfg.slave_encoder_resolution = 1e-6;
+    cfg.sample_jitter = 450'000;
+    const auto r = run(cfg, from_millis(ms));
+    CHECK(!r.diverged);
+    CHECK(r.max_book_excess < 1e-12);
+    CHECK(r.min_true_margin > -1e-9);
+  }
+  sim::Teleop1DConfig bad;
+  bad.sample_jitter = bad.dt / 2;
+  bool threw = false;
+  try {
+    run(bad, 0);
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  CHECK(threw);
+}
+
 TEST_CASE(teleop_deadband_cuts_packet_rate) {
   for (Passivity p : {Passivity::kChannel, Passivity::kReflective}) {
     sim::Teleop1DConfig cfg;

@@ -36,6 +36,12 @@ struct MasterParams {
   // Actuator limit in N, 0 for none. Desktop devices peak between about
   // 3 N (3D Systems Touch) and 20 N (Force Dimension sigma.7).
   double max_force = 20.0;
+  // What the controller's model leaves out (teleop/device.hpp): friction
+  // besides the viscous damping, a compliant structure, and a delay before a
+  // commanded force takes effect.
+  teleop::FrictionParams friction;
+  teleop::ComplianceParams compliance;
+  Nanos actuation_delay = 0;
 };
 
 struct SlaveParams {
@@ -72,12 +78,21 @@ struct SlaveParams {
   // 2014), but released gradually through the gain instead of at once.
   using DriftReference = teleop::SlaveConfig::DriftReference;
   DriftReference drift_reference = DriftReference::kCommand;
+  // As for the master.
+  teleop::FrictionParams friction;
+  teleop::ComplianceParams compliance;
+  Nanos actuation_delay = 0;
 };
 
 struct Teleop1DConfig {
   Nanos dt = kNanosPerMilli;   // control and packet period (1 kHz)
   int substeps = 10;           // physics steps per control step
   Nanos duration = from_seconds(10.0);
+  // Each end samples its device at k * dt plus a time drawn uniformly from
+  // [-sample_jitter, sample_jitter], independently, as control loops on a
+  // general-purpose OS do; less than dt / 2.
+  Nanos sample_jitter = 0;
+  std::uint64_t jitter_seed = 1;
 
   OperatorParams op;
   MasterParams master;

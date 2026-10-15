@@ -8,6 +8,8 @@
 #include <stdexcept>
 #include <vector>
 
+#include "tuushin/rng.hpp"
+
 namespace tuushin::sim {
 
 namespace {
@@ -55,6 +57,9 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
   if (cfg.dt <= 0 || cfg.substeps <= 0 || cfg.duration <= 0) {
     throw std::invalid_argument("run_teleop1d: dt, substeps and duration must be positive");
   }
+  if (cfg.sample_jitter < 0 || 2 * cfg.sample_jitter >= cfg.dt) {
+    throw std::invalid_argument("run_teleop1d: sample_jitter must be in [0, dt / 2)");
+  }
   using Passivity = Teleop1DConfig::Passivity;
   const bool reflective = cfg.passivity == Passivity::kReflective;
   const double dt = to_seconds(cfg.dt);
@@ -77,6 +82,18 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
                                    cfg.substeps, 0, cfg.op.ref_offset);
   master_dev.set_encoder_resolution(cfg.master_encoder_resolution);
   slave_dev.set_encoder_resolution(cfg.slave_encoder_resolution);
+  master_dev.set_friction(cfg.master.friction);
+  slave_dev.set_friction(cfg.slave.friction);
+  master_dev.set_compliance(cfg.master.compliance);
+  slave_dev.set_compliance(cfg.slave.compliance);
+  master_dev.set_actuation_delay(cfg.master.actuation_delay);
+  slave_dev.set_actuation_delay(cfg.slave.actuation_delay);
+  Rng jitter(cfg.jitter_seed);
+  auto sample_time = [&](Nanos nominal) {
+    if (cfg.sample_jitter <= 0) return nominal;
+    const double u = 2.0 * jitter.uniform() - 1.0;
+    return nominal + static_cast<Nanos>(std::llround(u * static_cast<double>(cfg.sample_jitter)));
+  };
 
   teleop::MasterConfig mc;
   mc.dt = cfg.dt;
@@ -140,36 +157,39 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
   for (std::int64_t k = 0; k < steps; ++k) {
     const Nanos now = k * cfg.dt;
     const double t = to_seconds(now);
+    // When each end samples, k = 0 on time.
+    const Nanos now_m = k > 0 ? sample_time(now) : now;
+    const Nanos now_s = k > 0 ? sample_time(now) : now;
 
-    // 1. Deliver everything that has arrived by now.
-    while (!fwd_queue.empty() && fwd_queue.top().arrival <= now) {
+    // 1. Deliver everything that has arrived by then.
+    while (!fwd_queue.empty() && fwd_queue.top().arrival <= now_s) {
       slave.receive(fwd_queue.top().seq, fwd_queue.top().sample);
       fwd_queue.pop();
     }
-    while (!bwd_queue.empty() && bwd_queue.top().arrival <= now) {
+    while (!bwd_queue.empty() && bwd_queue.top().arrival <= now_m) {
       master.receive(bwd_queue.top().seq, bwd_queue.top().sample);
       bwd_queue.pop();
     }
 
     // 2. Sample both devices; this integrates the physics over the last
     //    sample with the forces that were held during it.
-    const double x_m = master_dev.read_position(now);
-    const double x_s = slave_dev.read_position(now);
+    const double x_m = master_dev.read_position(now_m);
+    const double x_s = slave_dev.read_position(now_s);
     if (!check_plausible(now)) break;
     const double v_m = master_dev.true_velocity();
     const double v_s = slave_dev.velocity();
 
     // 3. Master step.
-    const auto ms = master.step(now, x_m, master_dev.force_cut_after());
+    const auto ms = master.step(now_m, x_m, master_dev.force_cut_after());
     master_dev.command_force(-ms.display_force);
     const double f_display = ms.display_force;
-    if (ms.send) fwd_sender.send(forward, fwd_queue, now, cfg.packet_bytes, ms.sample);
+    if (ms.send) fwd_sender.send(forward, fwd_queue, now_m, cfg.packet_bytes, ms.sample);
 
     // 4. Slave step.
     const double f_contact = slave_dev.contact_force();
-    const auto ss = slave.step(now, x_s, v_s, f_contact, slave_dev.force_cut_after());
+    const auto ss = slave.step(now_s, x_s, v_s, f_contact, slave_dev.force_cut_after());
     slave_dev.command_force(ss.force);
-    if (ss.send) bwd_sender.send(backward, bwd_queue, now, cfg.packet_bytes, ss.sample);
+    if (ss.send) bwd_sender.send(backward, bwd_queue, now_s, cfg.packet_bytes, ss.sample);
 
     // Metrics on the samples of this step.
     const auto& mp = master.port();
@@ -195,9 +215,7 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
 
     const double x_ref = cfg.op.ref_offset +
                          cfg.op.ref_amplitude * 0.5 * (1.0 - std::cos(2.0 * kPi * cfg.op.ref_freq * t));
-    const double v_ref = cfg.op.ref_amplitude * 0.5 * 2.0 * kPi * cfg.op.ref_freq *
-                         std::sin(2.0 * kPi * cfg.op.ref_freq * t);
-    const double f_hand = cfg.op.hand_k * (x_ref - x_m) + cfg.op.hand_b * (v_ref - v_m);
+    const double f_hand = master_dev.hand_force();
 
     if (log) {
       const auto& st = slave.store();

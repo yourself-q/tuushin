@@ -10,12 +10,26 @@ namespace {
 
 constexpr double kPi = 3.14159265358979323846;
 
+// Motor side (x, v) and distal side (x2, v2); the distal side is unused on
+// a rigid device.
 struct State {
-  double x, v;
-  State plus(const State& d, double s) const { return {x + s * d.x, v + s * d.v}; }
+  double x, v, x2, v2;
+  State plus(const State& d, double s) const {
+    return {x + s * d.x, v + s * d.v, x2 + s * d.x2, v2 + s * d.v2};
+  }
 };
 
 }  // namespace
+
+double FrictionParams::force(double v) const {
+  if (coulomb <= 0.0 && stiction <= 0.0) return 0.0;
+  double level = coulomb;
+  if (stiction > coulomb && stribeck_velocity > 0.0) {
+    const double s = v / stribeck_velocity;
+    level += (stiction - coulomb) * std::exp(-s * s);
+  }
+  return level * std::tanh(v / std::max(smoothing_velocity, 1e-9));
+}
 
 SimulatedDevice::SimulatedDevice(double mass, double damping, Nanos nominal_dt, int substeps,
                                  Nanos start, double position)
@@ -30,9 +44,11 @@ SimulatedDevice::SimulatedDevice(double mass, double damping, Nanos nominal_dt, 
 
 double SimulatedDevice::read_position(Nanos now) {
   if (now > t_) {
-    if (watchdog_ > 0 && f_ != 0.0 && now > command_time_ + watchdog_) {
+    if (watchdog_ > 0 && commanded_ != 0.0 && cut_after_ == 0 &&
+        now > command_time_ + watchdog_) {
       advance(std::max(t_, command_time_ + watchdog_));
       f_ = 0.0;
+      pending_.clear();
       cut_after_ = watchdog_;
     }
     advance(now);
@@ -48,6 +64,26 @@ double SimulatedDevice::read_position(Nanos now) {
   return y_;
 }
 
+void SimulatedDevice::command_force(double f) {
+  if (delay_ > 0) {
+    pending_.emplace_back(t_ + delay_, f);
+  } else {
+    f_ = f;
+  }
+  command_time_ = t_;
+  commanded_ = f;
+  cut_after_ = 0;
+}
+
+void SimulatedDevice::set_compliance(const ComplianceParams& compliance) {
+  compliance_ = compliance;
+  compliant_ = compliance.distal_mass > 0.0 && compliance.distal_mass < mass_;
+  m2_ = compliant_ ? compliance.distal_mass : 0.0;
+  m1_ = mass_ - m2_;
+  x2_ = x_;
+  v2_ = v_;
+}
+
 void SimulatedDevice::set_encoder_resolution(double q) {
   q_ = q > 0.0 ? q : 0.0;
   have_read_ = false;
@@ -55,6 +91,15 @@ void SimulatedDevice::set_encoder_resolution(double q) {
 }
 
 void SimulatedDevice::advance(Nanos now) {
+  while (!pending_.empty() && pending_.front().first <= now) {
+    integrate(pending_.front().first);
+    f_ = pending_.front().second;
+    pending_.pop_front();
+  }
+  integrate(now);
+}
+
+void SimulatedDevice::integrate(Nanos now) {
   if (now <= t_) return;
   const Nanos elapsed = now - t_;
   const std::int64_t n = std::max<std::int64_t>(
@@ -62,9 +107,14 @@ void SimulatedDevice::advance(Nanos now) {
   const double h = to_seconds(elapsed) / static_cast<double>(n);
   const double t0 = to_seconds(t_ - start_);
   auto deriv = [&](double ti, const State& p) {
-    return State{p.v, (external_force(ti, p.x, p.v) + f_ - damping_ * p.v) / mass_};
+    const double own = f_ - damping_ * p.v - friction_.force(p.v);
+    if (!compliant_) {
+      return State{p.v, (external_force(ti, p.x, p.v) + own) / mass_, 0.0, 0.0};
+    }
+    const double link = compliance_.stiffness * (p.x2 - p.x) + compliance_.damping * (p.v2 - p.v);
+    return State{p.v, (own + link) / m1_, p.v2, (external_force(ti, p.x2, p.v2) - link) / m2_};
   };
-  State p{x_, v_};
+  State p{x_, v_, x2_, v2_};
   for (std::int64_t i = 0; i < n; ++i) {
     const double ti = t0 + static_cast<double>(i) * h;
     const State k1 = deriv(ti, p);
@@ -76,11 +126,16 @@ void SimulatedDevice::advance(Nanos now) {
   work_ += f_ * (p.x - x_);
   x_ = p.x;
   v_ = p.v;
+  x2_ = p.x2;
+  v2_ = p.v2;
   t_ = now;
 }
 
 bool SimulatedDevice::plausible() const {
-  return std::isfinite(x_) && std::isfinite(v_) && std::fabs(x_) < 1.0 && std::fabs(v_) < 10.0;
+  auto ok = [](double x, double v) {
+    return std::isfinite(x) && std::isfinite(v) && std::fabs(x) < 1.0 && std::fabs(v) < 10.0;
+  };
+  return ok(x_, v_) && ok(distal_position(), distal_velocity());
 }
 
 SimulatedMaster::SimulatedMaster(double mass, double damping, const OperatorParams& op,
@@ -95,7 +150,7 @@ double SimulatedMaster::external_force(double t, double x, double v) const {
 }
 
 double SimulatedMaster::hand_force() const {
-  return external_force(to_seconds(time() - start()), position(), true_velocity());
+  return external_force(to_seconds(time() - start()), distal_position(), distal_velocity());
 }
 
 SimulatedSlave::SimulatedSlave(double mass, double damping, const WallParams& wall,
@@ -116,7 +171,7 @@ double SimulatedSlave::external_force(double, double x, double v) const {
 }
 
 double SimulatedSlave::contact_force() const {
-  return wall_force(wall_, position(), true_velocity());
+  return wall_force(wall_, distal_position(), distal_velocity());
 }
 
 }  // namespace tuushin::teleop

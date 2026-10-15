@@ -108,6 +108,103 @@ TEST_CASE(wall_only_pushes) {
   CHECK(s.contact_force() >= 0.0);
 }
 
+TEST_CASE(device_friction_follows_the_stribeck_curve) {
+  FrictionParams fr;
+  fr.coulomb = 0.5;
+  fr.stiction = 0.8;
+  CHECK(fr.force(0.0) == 0.0);
+  CHECK_NEAR(fr.force(1.0), 0.5, 1e-12);    // far beyond the Stribeck velocity
+  CHECK_NEAR(fr.force(-1.0), -0.5, 1e-12);  // against the motion
+  // Below the Stribeck velocity and above the smoothing one: toward the
+  // stiction force, 0.5 + 0.3 exp(-0.25) = 0.73 N.
+  CHECK(fr.force(5e-3) > 0.73 && fr.force(5e-3) < 0.74);
+  // A mass with viscous and Coulomb friction under 2.5 N settles where
+  // 2.5 = b v + 0.5: at 1 m/s.
+  WallParams far;
+  far.position = 10.0;
+  SimulatedSlave s(0.1, 2.0, far, kNanosPerMilli, 10);
+  s.set_friction(fr);
+  s.command_force(2.5);
+  s.read_position(500 * kNanosPerMilli);  // ten time constants m / b
+  CHECK_NEAR(s.velocity(), 1.0, 1e-3);
+}
+
+TEST_CASE(device_compliance_resonates_and_keeps_momentum) {
+  // 0.2 kg split evenly, the halves joined at 50 Hz without damping: an
+  // impulse on the motor side sets the two halves swinging against each
+  // other at 50 Hz while their common momentum stays what the impulse gave.
+  WallParams far;
+  far.position = 10.0;
+  const double m = 0.2, m2 = 0.1, mu = (m - m2) * m2 / m, w = 2.0 * 3.14159265358979323846 * 50.0;
+  SimulatedSlave s(m, 0.0, far, kNanosPerMilli, 10);
+  s.set_compliance(ComplianceParams{m2, mu * w * w, 0.0});
+  s.command_force(1.0);
+  s.read_position(kNanosPerMilli);
+  s.command_force(0.0);
+  std::vector<double> up;  // times the distal side passes the motor side upward
+  double prev = s.distal_position() - s.position();
+  for (Nanos t = kNanosPerMilli + 10'000; t <= 101 * kNanosPerMilli; t += 10'000) {
+    s.read_position(t);
+    const double d = s.distal_position() - s.position();
+    if (prev < 0.0 && d >= 0.0) up.push_back(to_seconds(t) - d / (d - prev) * 1e-5);
+    prev = d;
+  }
+  CHECK(up.size() >= 4);
+  CHECK_NEAR((up.back() - up.front()) / static_cast<double>(up.size() - 1), 0.02, 2e-5);
+  const double p = (m - m2) * s.true_velocity() + m2 * s.distal_velocity();
+  CHECK_NEAR(p, 1.0 * 1e-3, 1e-9);
+  CHECK_NEAR(s.actuator_work(), 0.5 * (m - m2) * s.true_velocity() * s.true_velocity() +
+                                    0.5 * m2 * s.distal_velocity() * s.distal_velocity() +
+                                    0.5 * mu * w * w * prev * prev,
+             1e-9);
+  // A distal mass outside (0, mass) leaves the device rigid.
+  SimulatedSlave rigid(m, 0.0, far, kNanosPerMilli, 10);
+  rigid.set_compliance(ComplianceParams{m, 1.0, 0.0});
+  rigid.command_force(1.0);
+  rigid.read_position(10 * kNanosPerMilli);
+  CHECK(rigid.distal_position() == rigid.position());
+  CHECK_NEAR(rigid.position(), 1.0 * 0.01 * 0.01 / (2.0 * m), 1e-12);
+}
+
+TEST_CASE(device_actuation_delay_shifts_the_commands) {
+  // Commands that take effect 3 ms late move the device as the same
+  // commands issued 3 ms later do; the watchdog counts from the command.
+  WallParams far;
+  far.position = 10.0;
+  const Nanos d = 3 * kNanosPerMilli;
+  SimulatedSlave late(1.0, 2.0, far, kNanosPerMilli, 10);
+  SimulatedSlave shifted(1.0, 2.0, far, kNanosPerMilli, 10);
+  late.set_actuation_delay(d);
+  const double forces[] = {1.5, -0.5, 2.0, 0.0, 0.7};
+  for (int k = 0; k < 5; ++k) {
+    const Nanos t = k * 2 * kNanosPerMilli;
+    late.read_position(t);
+    late.command_force(forces[k]);
+  }
+  for (int k = 0; k < 5; ++k) {
+    const Nanos t = k * 2 * kNanosPerMilli + d;
+    shifted.read_position(t);
+    shifted.command_force(forces[k]);
+  }
+  late.read_position(30 * kNanosPerMilli);
+  shifted.read_position(30 * kNanosPerMilli);
+  CHECK(late.force() == 0.7);
+  CHECK_NEAR(late.position(), shifted.position(), 1e-15);
+  CHECK_NEAR(late.actuator_work(), shifted.actuator_work(), 1e-18);
+  // A command still in flight when the watchdog cuts never takes effect.
+  SimulatedSlave dog(1.0, 2.0, far, kNanosPerMilli, 10);
+  dog.set_actuation_delay(d);
+  dog.set_watchdog(2 * kNanosPerMilli);
+  dog.read_position(0);
+  dog.command_force(1.5);
+  dog.read_position(kNanosPerMilli);
+  CHECK(dog.force() == 0.0);  // not yet in effect
+  dog.read_position(10 * kNanosPerMilli);
+  CHECK(dog.force() == 0.0);
+  CHECK(dog.force_cut_after() == 2 * kNanosPerMilli);
+  CHECK(dog.actuator_work() == 0.0);
+}
+
 TEST_CASE(master_displays_newest_sample_and_counts_every_energy) {
   MasterConfig cfg;
   cfg.passivity = Passivity::kNone;
