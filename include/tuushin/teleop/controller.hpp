@@ -61,10 +61,16 @@ class ActuatorSchedule {
   // their lengths in units of dt. If the watchdog cut the force `cut_after`
   // after `from`, when the last command was issued, the force is zero from
   // then on and nothing is in flight any more.
-  std::vector<control::ForceSegment> advance(Nanos from, Nanos to, Nanos cut_after);
+  //
+  // advance() and lead() return buffers the schedule reuses, valid until
+  // the next call of the same function: a control loop that estimates the
+  // delay runs a schedule per candidate, and returning new vectors cost it
+  // two heap allocations per candidate and sample, 137 per millisecond with
+  // 65 candidates.
+  const std::vector<control::ForceSegment>& advance(Nanos from, Nanos to, Nanos cut_after);
   // The forces in flight at `now`: what acts until a command issued now
   // takes effect. Empty without a delay.
-  std::vector<control::ForceSegment> lead(Nanos now) const;
+  const std::vector<control::ForceSegment>& lead(Nanos now);
   void command(Nanos now, double phi);
 
  private:
@@ -72,6 +78,8 @@ class ActuatorSchedule {
   double dt_;  // ns
   double active_ = 0.0;
   std::deque<std::pair<Nanos, double>> pending_;  // effective time, force
+  std::vector<control::ForceSegment> segs_;  // advance()'s result
+  std::vector<control::ForceSegment> lead_;  // lead()'s result
 };
 
 // The device model a controller books and predicts with, and the schedule

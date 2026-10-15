@@ -24,9 +24,10 @@ void append(std::vector<control::ForceSegment>& segs, double phi, Nanos length, 
 
 }  // namespace
 
-std::vector<control::ForceSegment> ActuatorSchedule::advance(Nanos from, Nanos to,
-                                                             Nanos cut_after) {
-  std::vector<control::ForceSegment> segs;
+const std::vector<control::ForceSegment>& ActuatorSchedule::advance(Nanos from, Nanos to,
+                                                                    Nanos cut_after) {
+  auto& segs = segs_;
+  segs.clear();
   const Nanos cut = cut_after > 0 ? from + cut_after : to + 1;
   Nanos t = from;
   while (!pending_.empty() && pending_.front().first <= to && pending_.front().first <= cut) {
@@ -48,8 +49,9 @@ std::vector<control::ForceSegment> ActuatorSchedule::advance(Nanos from, Nanos t
   return segs;
 }
 
-std::vector<control::ForceSegment> ActuatorSchedule::lead(Nanos now) const {
-  std::vector<control::ForceSegment> segs;
+const std::vector<control::ForceSegment>& ActuatorSchedule::lead(Nanos now) {
+  auto& segs = lead_;
+  segs.clear();
   if (delay_ <= 0) return segs;
   const Nanos end = now + delay_;
   Nanos t = now;
@@ -135,7 +137,7 @@ double DeviceModel::book_and_observe(Nanos from, Nanos now, double dx, double h,
   double least_miss = std::numeric_limits<double>::infinity();
   for (std::size_t i = 0; i < bank_.size(); ++i) {
     auto& c = bank_[i];
-    const auto segs = c.actuator.advance(from, now, cut_after);
+    const auto& segs = c.actuator.advance(from, now, cut_after);
     double w = c.dev.realized_work(dx, segs);
     c.miss = 0.0;
     if (cut_after > 0) {
