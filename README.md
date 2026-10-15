@@ -28,7 +28,7 @@ and also tested on Linux (Ubuntu 24.04, GCC 13.3). MIT licensed.
 | `wire/` | The datagram format: a 32-byte header whose echo fields let each end measure the round trip from ordinary traffic, as RTCP does. |
 | `crypto/` | A Noise_NNpsk0 handshake and ChaCha20-Poly1305 on libsodium: a pre-shared key becomes fresh keys for every session, and every datagram is authenticated and encrypted (see Authentication below). SHA-1, HMAC-SHA1 and MD5, only because STUN and TURN require them. |
 | `sim/` | A deterministic 1-DoF teleoperation simulator built on the same controllers and devices. |
-| `tools/` | `tuushin-sim`, `tuushin-teleop` (master, slave and rendezvous server as separate processes), `tuushin-probe` (measure a path, write replayable traces), `nat_lab.sh` (master and slave behind Linux NATs in network namespaces, with coturn as a relay). `tests/sim_nat.hpp` and `tests/sim_turn.hpp` are a NAT and a TURN server in user space for tests on any system. |
+| `tools/` | `tuushin-sim`, `tuushin-teleop` (master, slave and rendezvous server as separate processes), `tuushin-probe` (measure a path, write replayable traces), `tuushin-netreplay` (Linux: replay a trace on an interface, datagram by datagram, for network namespaces, Mininet and testbeds built on them), `nat_lab.sh` (master and slave behind Linux NATs in network namespaces, with coturn as a relay), `netreplay_lab.sh` (checks the replay against its traces). `tests/sim_nat.hpp` and `tests/sim_turn.hpp` are a NAT and a TURN server in user space for tests on any system. |
 
 ## Build and test
 
@@ -40,6 +40,8 @@ cmake --build build
 
 Needs a C++17 compiler, CMake and libsodium (ISC licence):
 `brew install libsodium`, or `apt install libsodium-dev pkg-config`.
+`tuushin-netreplay` is built on Linux where clang and libbpf (used under
+its BSD-2-Clause licence) are found: `apt install clang libbpf-dev`.
 
 ## Quick start
 
@@ -104,6 +106,13 @@ Measure a real path and replay it:
 # on the other end: 60 s of 1 kHz probes, both directions, skew-corrected
 ./build/tools/tuushin-probe measure HOST --out path
 ./build/tools/tuushin-sim --trace-fwd path.fwd.csv --trace-bwd path.bwd.csv
+```
+
+or replay it under real network stacks, on a Linux interface that forwards
+the traffic (a router namespace, a switch port in Mininet), as root:
+
+```sh
+./build/tools/tuushin-netreplay run --dev s1-eth2 --trace path.fwd.csv
 ```
 
 ## Results so far
@@ -786,6 +795,65 @@ The new allocation costs 60 to 100 samples more than a direct move. With
 both NATs symmetric the session was lost before the punches were copies:
 the slave kept sending to the master's port for the old relay.
 
+## Replaying a path on Linux
+
+`tuushin-sim` replays a trace inside the simulator. Testbeds that run real
+network stacks, such as Mininet and those built on it, need the path on
+an interface. netem, the usual tool, gives a delay drawn from a
+distribution, not one that follows a recording, and reorders datagrams
+whenever its jitter does. `tuushin-netreplay` replays a trace instead:
+
+- An eBPF program on the interface's egress (tc, direct action) looks up
+  each UDP datagram's send time in the trace and sets its earliest
+  departure time to now plus the delay recorded then; the fq qdisc, made
+  the interface's root, holds it until then, as it does for TCP's pacing.
+  Becker et al. (2022) emulated delay this way, and Tian et al. (2024)
+  replayed satellite traces; neither's code has a licence, so this is
+  written anew.
+- The lookup is by time, not by datagram number, so traffic at any rate
+  meets the path as it was at that moment, and the trace loops.
+- Between the trace's points the delay is interpolated linearly. A
+  datagram sent at t leaves at t + d(t), which keeps the datagrams sent
+  between two points in order if the points' own packets arrived in order;
+  holding each point's delay as a step reorders a datagram sent late in a
+  bin behind the next one's first whenever the delay falls (in a test, a
+  queue that drains at 0.95 ms per ms, 27 kHz of datagrams: 7770 of 81000
+  reordered in 3 s with steps, none interpolated).
+- Losses are dropped at the same place, from a datagram sent where the
+  trace lost its packet to the next point.
+
+`tools/netreplay_lab.sh` puts it between two network namespaces, where
+both ends share a clock and a datagram's one-way delay is known exactly,
+sends 1 kHz of stamped datagrams each way and compares what they met with
+the traces. On a virtual machine on a laptop (colima, Linux 6.8, 4 vCPUs):
+
+| path | losses | delay minus the trace's (median, p99, max) |
+|---|---|---|
+| synthetic pair: wander, a filling queue every 4 s, 0.3 % lost in bursts; 15 s | 56 and 57 of 15000, all where the trace lost: none elsewhere, none delivered where it lost; none reordered | 0.12 ms, 1.1 ms, 30 ms |
+| constant 20.5 ms, replayed | none | 0.19 ms, 0.51 ms, 2.2 ms |
+| the same with netem | none | 0.18 ms, 0.47 ms, 4.5 ms |
+| constant 20 ms, replayed | none | 0.07 ms, 0.53 ms, 9.1 ms |
+| the same with netem | none | 0.04 ms, 0.38 ms, 11 ms |
+
+The datagrams come out late by the latency of the kernel's timer, the
+same for both tools: here 0.15 to 0.2 ms. A delay that is a whole number
+of sending intervals lets each datagram leave as the next one arrives,
+before the timer fires, which is why the constant 20 ms looks better. The
+maxima are this virtual machine stalling its network processing for up to
+tens of ms; behind a stall, datagrams are judged by the trace at the
+moment they reach the router, and in one run 42 in 10000 were dropped by
+losses that came after they were sent.
+
+Two things to know when attaching it:
+
+- **On a hop that forwards, not on the sender.** A datagram held in the
+  sender's own qdisc counts against its socket's send buffer. 1 kHz of
+  100-byte datagrams held 300 ms at their sender had 21 % of their sends
+  refused with Linux's default 208 KiB (500 ms: 52 %); held at a router
+  they have no socket.
+- **It replaces the root qdisc.** Give a replayed link no tc parameters of
+  its own (in Mininet, no `bw` or `delay` on its `TCLink`).
+
 ## Known issues
 
 - **Devices need a watchdog.** The stall handling above relies on the
@@ -864,12 +932,19 @@ the slave kept sending to the master's port for the old relay.
   server sees follows it.
 - One-way delays assume equal minimum delays in both directions, which no
   measurement between unsynchronized clocks can avoid.
+- **The replay is checked on a virtual machine only**, where its timing is
+  that of the machine's timers (Replaying a path on Linux, above); bare
+  metal should do better and has not been measured. It replays UDP over
+  IPv4 and IPv6 on Ethernet-framed interfaces; with a port filter, IPv4
+  fragments after the first pass undelayed. The two directions loop with
+  their own traces' lengths, so they drift apart over many loops.
 - Sequence numbers do not wrap (49 days at 1 kHz).
 
 ## Next
 
 - Traces of real paths (fibre, 4G and 5G in Japan) recorded with
-  `tuushin-probe`, published so that any simulator or testbed can replay them.
+  `tuushin-probe`, published so that any simulator or testbed can replay
+  them (`tuushin-netreplay` on Linux).
 - A relayed session that moves to a direct path once one opens; then QUIC
   datagrams as a transport.
 - Deadbands that adapt to the measured delay; more degrees of freedom; a real
@@ -918,6 +993,12 @@ The code cites its sources where it uses them. The main ones:
   M. Petit-Huguenin, G. Salgueiro, J. Rosenberg, D. Wing, R. Mahy and
   P. Matthews, RFC 8489 (STUN), for the relay and its long-term
   credentials; R. Denis-Courmont, RFC 5769, for STUN's test vectors.
+- S. Becker, T. Pfandzelter, N. Japke, D. Bermbach and O. Kao, "Network
+  emulation in large-scale virtual edge testbeds: a note of caution and
+  the way forward", TDIS 2022, arXiv:2208.05862, and W. Tian, Y. Li,
+  J. Zhao, S. Wu and J. Pan, "An eBPF-based trace-driven emulation method
+  for satellite networks", IEEE Networking Letters, 2024,
+  arXiv:2408.15581, for replaying a path with departure times and fq.
 - D. Trautwein, C. Ihle, M. Schubotz and B. Gipp, "Challenging tribal
   knowledge: large scale measurement campaign on decentralized NAT
   traversal", arXiv:2510.27500, 2025, for priming with low-TTL datagrams

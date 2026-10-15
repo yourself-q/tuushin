@@ -1,5 +1,8 @@
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <unistd.h>
 
@@ -85,6 +88,86 @@ TEST_CASE(trace_roundtrip_and_replay) {
   CHECK(*ch.transit(from_seconds(1) + 2 * kNanosPerMilli, 64) == from_millis(30));
   // Loops after duration() = 3 ms.
   CHECK(*ch.transit(from_seconds(1) + 3 * kNanosPerMilli, 64) == from_millis(10));
+}
+
+TEST_CASE(trace_grid_keeps_a_regular_trace) {
+  const Nanos ms = kNanosPerMilli;
+  Trace t;
+  t.entries = {{0, 10 * ms}, {ms, 12 * ms}, {2 * ms, -1}, {3 * ms, 16 * ms}, {4 * ms, 11 * ms}};
+  CHECK(t.median_interval() == ms);
+  const TraceGrid g = t.grid(ms);
+  REQUIRE(g.delay.size() == 5);
+  // The lost packet's point takes its delay from the packets around it.
+  const std::vector<Nanos> delay{10 * ms, 12 * ms, 14 * ms, 16 * ms, 11 * ms};
+  const std::vector<bool> lost{false, false, true, false, false};
+  CHECK(g.delay == delay);
+  CHECK(g.lost == lost);
+  CHECK_NEAR(g.loss_rate(), 0.2, 1e-12);
+  CHECK(g.delay_at(0) == 10 * ms);
+  CHECK(g.delay_at(ms / 2) == 11 * ms);
+  CHECK(g.delay_at(2 * ms + ms / 2) == -1);
+  // The last point leads back to the first: the trace loops.
+  CHECK(g.delay_at(4 * ms + ms / 2) == 10 * ms + ms / 2);
+  CHECK(g.delay_at(5 * ms) == 10 * ms);
+  bool threw = false;
+  try {
+    (void)t.grid(0);
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  CHECK(threw);
+}
+
+TEST_CASE(trace_grid_resamples_wandering_sends) {
+  // A probe whose sends wander up to 0.2 ms off a 1 ms grid, every tenth
+  // lost, on a path whose delay is linear in the send time.
+  const Nanos ms = kNanosPerMilli;
+  Trace t;
+  for (int i = 0; i < 1000; ++i) {
+    const Nanos send = i * ms + (i % 5 - 2) * ms / 10;
+    t.entries.push_back({send, i % 10 == 0 ? -1 : 10 * ms + send / 100});
+  }
+  const TraceGrid g = t.grid(ms);
+  REQUIRE(g.delay.size() >= 999);
+  // From the first received packet, the second sent, to the last.
+  const Nanos first = t.entries.front().send_offset;
+  for (std::size_t k = 2; k < 990; ++k) {
+    CHECK(g.lost[k] == (k % 10 == 0));
+    CHECK(std::llabs(g.delay[k] - (10 * ms + (first + static_cast<Nanos>(k) * ms) / 100)) <= 1);
+  }
+}
+
+TEST_CASE(trace_grid_replays_in_order_what_arrived_in_order) {
+  // A queue that fills slowly and drains fast: the delay falls by up to
+  // 0.95 ms per 1 ms probe, so every probe still arrived after the one
+  // before it.
+  const Nanos ms = kNanosPerMilli;
+  Trace t;
+  Nanos d = 5 * ms;
+  for (int i = 0; i < 3000; ++i) {
+    t.entries.push_back({i * ms, d});
+    d = (i / 40) % 2 == 0 ? d + ms / 5 : std::max<Nanos>(5 * ms, d - ms * 95 / 100);
+  }
+  for (std::size_t i = 1; i < t.entries.size(); ++i) {
+    REQUIRE(t.entries[i].send_offset + t.entries[i].delay >=
+            t.entries[i - 1].send_offset + t.entries[i - 1].delay);
+  }
+  const TraceGrid g = t.grid(ms);
+  // Datagrams at 27 kHz, off the probes' grid, up to the last point (from
+  // which the trace loops).
+  Nanos last = 0, last_held = 0;
+  int reordered = 0, reordered_held = 0;
+  for (Nanos s = 0; s < 2999 * ms; s += 37'000) {
+    const Nanos arrival = s + g.delay_at(s);
+    if (arrival < last) ++reordered;
+    last = std::max(last, arrival);
+    // Holding each point's delay over its bin instead.
+    const Nanos held = s + g.delay[static_cast<std::size_t>(s / ms)];
+    if (held < last_held) ++reordered_held;
+    last_held = std::max(last_held, held);
+  }
+  CHECK(reordered == 0);
+  CHECK(reordered_held > 100);
 }
 
 TEST_CASE(bottleneck_idle_link_has_only_propagation_and_serialization) {
