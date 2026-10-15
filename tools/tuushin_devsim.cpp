@@ -347,6 +347,10 @@ int main(int argc, char** argv) {
     // where it then is; the object is put there then too, so that the
     // calibration's sweeps do not run into it.
     bool placed = false;
+    // The motor's work so far, printed when a host goes away: a lab that
+    // kills the host and then the device still sees what the device did
+    // for that host.
+    bool was_connected = false;
 
     std::uint8_t buf[4096];
     Nanos due = t0;
@@ -379,6 +383,8 @@ int main(int argc, char** argv) {
       if (!placed && core.calibration().valid &&
           !(core.last_state().flags & device::kStateCalibrating)) {
         placed = true;
+        std::fprintf(stderr, "devsim: calibrated at %.3f s, %.4f J of motor work so far\n",
+                     sim_time(now), plant.motor_work());
         if (hand.present) {
           hand.ref_offset = plant.angle();
           plant.set_hand(hand, sim_time(now));
@@ -393,6 +399,11 @@ int main(int argc, char** argv) {
         if (n == 0) break;
         port->write(buf, n);
       }
+      if (was_connected && !port->connected()) {
+        std::fprintf(stderr, "devsim: %.4f J of motor work by %.3f s\n", plant.motor_work(),
+                     sim_time(now));
+      }
+      was_connected = port->connected();
       if (!quiet && now >= next_status) {
         next_status += kNanosPerSecond;
         const device::State& st = core.last_state();

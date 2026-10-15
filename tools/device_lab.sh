@@ -6,6 +6,9 @@
 #
 #   tools/device_lab.sh [BUILD_DIR] [SECONDS] [-- extra tuushin-teleop options for both ends]
 #
+# DEVICE_OPTS is appended to both --device specs (",damping=0"), and
+# SLAVE_ARGS goes to the slave alone ("--kp 300").
+#
 # Prints both ends' reports; exits non-zero if either end did.
 set -eu
 
@@ -26,8 +29,19 @@ life=$((seconds + 40))
 pids="$pids $!"
 "$build/tools/tuushin-devsim" --tcp 47301 --stop 0.5 --duration "$life" --quiet 2>"$out/devsim-slave.txt" &
 pids="$pids $!"
+# Each device prints its banner once it listens.
+i=0
+until grep -q "^devsim: tcp" "$out/devsim-master.txt" 2>/dev/null &&
+  grep -q "^devsim: tcp" "$out/devsim-slave.txt" 2>/dev/null; do
+  i=$((i + 1))
+  if [ $i -gt 100 ]; then
+    cat "$out/devsim-master.txt" "$out/devsim-slave.txt"
+    exit 1
+  fi
+  sleep 0.1
+done
 
-"$build/tools/tuushin-teleop" slave --once --port 47110 --device tcp:127.0.0.1:47301 "$@" \
+"$build/tools/tuushin-teleop" slave --once --port 47110 --device "tcp:127.0.0.1:47301${DEVICE_OPTS:-}" ${SLAVE_ARGS:-} "$@" \
   >"$out/slave.txt" 2>&1 &
 slave=$!
 pids="$pids $slave"
@@ -44,7 +58,7 @@ done
 
 rc=0
 "$build/tools/tuushin-teleop" master 127.0.0.1 --port 47110 --duration "$seconds" \
-  --device tcp:127.0.0.1:47300 "$@" >"$out/master.txt" 2>&1 || rc=$?
+  --device "tcp:127.0.0.1:47300${DEVICE_OPTS:-}" "$@" >"$out/master.txt" 2>&1 || rc=$?
 wait "$slave" || rc=$?
 
 echo "== master"; cat "$out/master.txt"
