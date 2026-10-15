@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cmath>
+#include <vector>
 
 #include "tuushin/control/tdpa.hpp"
 
@@ -109,6 +110,44 @@ namespace tuushin::control {
 // force after a stall of tens of milliseconds. Samples much shorter than dt
 // count as irregular too: on a real encoder dx_1 / h_1 amplifies the
 // quantization by dt / h_1.
+//
+// Actuation delay. A device that applies each command some time d after it
+// is issued (a servo loop that picks commands up on its own ticks, a bus
+// that carries them) breaks two assumptions above: the force held over a
+// sample is no longer the one commanded at its start, and the force being
+// chosen does not act over the coming sample but over one that starts d
+// later. Booked as if each force acted at once, the work of one force is
+// credited to the next; in the 1-DoF simulator (reflective scheme, nine
+// hand motions, 10-100 ms) a master delay of 1 ms let the actuators
+// generate 0.14 J with exact readings, and 2 ms 1.2 J, while the books
+// showed nothing. Both are fixed by knowing d (teleop::ActuatorSchedule):
+//
+//  * A sample whose force changed within it is observed as segments
+//    phi_i over r_i samples. The mass model is still exact: the segments
+//    enter the recursion as two held forces, phi_v, which changes the
+//    velocity as much (phi_v r = sum phi_i r_i), and phi_d, which moves the
+//    device as far (phi_d r^2 = sum phi_i r_i (2 (r - s_i) - r_i) for the
+//    segment starting s_i samples in). The Kalman filter's transition takes
+//    them the same way.
+//  * The encoder sees only the sample's total displacement. Each segment
+//    but the last is credited with the displacement the model predicts for
+//    it from the state at the sample's start, and the last with the rest
+//    (realized_work), so that the books still add up to what was read.
+//  * The forces already commanded but not yet in effect, the lead, act
+//    before the new one. Their predicted work, less `confidence` times its
+//    standard deviation, is added to the budget, and the new force's
+//    horizons start where the lead ends: hold_base() from the velocity the
+//    lead leaves, hold_sd() over samples R to R + n, (R + n)^2 - R^2 instead
+//    of n^2 for the model error.
+//
+// With d known the same runs leave a few microjoules: the split misplaces
+// up to 16 uJ against what the model leaves out within a sample (the
+// hand's impedance, the damping), and with 2 ms a prediction four samples
+// ahead overshoots by up to 0.12 mJ with exact readings. Coarse encoders,
+// whose books already allow for misses, generate nothing (3 mJ to 0.6 J
+// unaware). The delay has to be known: believed 0.1 ms off, exact readings
+// let the actuators generate up to 0.9 mJ, and half a millisecond off up
+// to 35 mJ.
 //
 // Encoder quantization. Everything above takes the encoder to be exact. A
 // real one reads the position to a resolution q (about 55 um on a
@@ -271,6 +310,14 @@ namespace tuushin::control {
 // device accelerates by -phi / m. At a haptic master phi is the displayed
 // force when it pushes against the positive direction; at a slave robot phi
 // is minus the force the controller applies.
+// A port force held for `samples` samples, which need not be whole: a piece
+// of a force that changed within a sample, as when the device applies
+// commands some time after they are issued.
+struct ForceSegment {
+  double phi = 0.0;
+  double samples = 0.0;
+};
+
 class DevicePredictor {
  public:
   // `resolution` is the encoder's resolution in m, 0 for an exact encoder
@@ -287,9 +334,18 @@ class DevicePredictor {
   // (dt if omitted). A sample further than dt / 2 from dt is irregular.
   void observe(double dx, double phi_held) { observe(dx, phi_held, dt_); }
   void observe(double dx, double phi_held, double h);
+  // A sample during which the port force changed: `segments` in order, their
+  // lengths adding up to h / dt. The model is still exact for a mass.
+  void observe(double dx, const std::vector<ForceSegment>& segments, double h);
   // A sample during which the port force was not held throughout, e.g. the
   // device's watchdog cut it.
   void observe_irregular(double dx, double phi_held);
+  // The work the segments' forces did over a sample in which the encoder saw
+  // the displacement dx, to be called before that sample is observed: each
+  // segment but the last over the displacement the model predicts for it
+  // from the state at the sample's start, the last over the rest. One
+  // segment did phi * dx.
+  double realized_work(double dx, const std::vector<ForceSegment>& segments) const;
   // True when the last two samples were regular. A new predictor is ready:
   // its history is that of a device at rest.
   bool ready() const { return regular_ >= 2; }
@@ -298,10 +354,22 @@ class DevicePredictor {
   // The rate the filter's random walk currently assumes: force_rate, or
   // with adapt_force_rate what the innovations have raised it to.
   double force_rate() const;
-  // The port force held at the end of the last sample: the force observed
-  // with it, or 0 after observe_irregular(), whose force was cut. The
-  // quantization tax of the next force is measured from it.
-  double held_force() const { return held_; }
+  // Forces already commanded that take effect after the last sample and
+  // before the next one commanded: on a device that applies its commands
+  // some time after they are issued, the forces in flight. The predictions
+  // below are then for the samples that follow them. Observing a sample
+  // clears the lead.
+  void set_lead(const std::vector<ForceSegment>& lead);
+  double lead_samples() const { return lead_samples_; }
+  // The work the lead is predicted to do (J), and its standard deviation.
+  double lead_work() const;
+  double lead_sd() const;
+
+  // The port force held before the next one: the last of the lead, or the
+  // force observed at the end of the last sample, or 0 after
+  // observe_irregular(), whose force was cut. The quantization tax of the
+  // next force is measured from it.
+  double held_force() const { return lead_.empty() ? held_ : lead_.back().phi; }
 
   // Coefficients of the predicted displacement dx = base() - compliance() * phi.
   double base() const;
@@ -311,7 +379,8 @@ class DevicePredictor {
 
   // The same over n samples with phi held: D_n = hold_base(n) - n^2 c phi.
   // hold_base(1) equals base(). n need not be an integer: the model is a
-  // mass under a constant net force, so it predicts any horizon.
+  // mass under a constant net force, so it predicts any horizon. With a
+  // lead, the n samples start where it ends.
   double hold_base(double n) const;
   double hold_compliance(double n) const { return n * n * c_; }
   double hold_displacement(double phi, double n) const {
@@ -320,7 +389,8 @@ class DevicePredictor {
   double hold_work(double phi, double n) const { return phi * hold_displacement(phi, n); }
   // Standard deviation of hold_displacement(): with a resolution, from the
   // Kalman filter's uncertainty about v and H; either way, from the model
-  // error, n^2 model_error().
+  // error, n^2 model_error(), or (R + n)^2 - R^2 times it after a lead of R
+  // samples.
   double hold_sd(double n) const;
   // How far the model has lately missed the displacement over a sample,
   // beyond what the reading error explains, in m (see "Model error").
@@ -328,23 +398,35 @@ class DevicePredictor {
 
   // Estimates recovered from the history (or the Kalman filter, with a
   // resolution): everything acting on the device except the port force (the
-  // operator's hand, gravity, friction) in N, and the velocity at the start
-  // of the coming sample times dt.
+  // operator's hand, gravity, friction) in N, and the velocity at the end of
+  // the last sample times dt.
   double external_force() const;
   double velocity_dt() const;
 
  private:
-  void push(double dx, double phi_held, double r, bool regular);
-  void filter(double dx, double phi_held, double r, bool regular);
+  // A sample's port force by what a mass feels of it, as two held forces:
+  // phi_d, which moves it as far over the sample, and phi_v, which changes
+  // its velocity as much. Both are phi for a held force. For segments
+  // phi_i over r_i samples, the one starting s_i samples into a sample of
+  // r: phi_v r = sum phi_i r_i, and phi_d r^2 = sum phi_i r_i (2 (r - s_i) - r_i).
+  void push(double dx, double phi_d, double phi_v, double r, bool regular);
+  void filter(double dx, double phi_d, double phi_v, double r, bool regular);
+  // Standard deviation of a quantity whose error is gv times that of the
+  // velocity, k c times that of H, and k times the model error.
+  double spread(double gv, double k) const;
 
   double dt_;
   double mass_;
   double c_;
   double dx1_ = 0.0, dx2_ = 0.0;      // last two realized displacements
-  double phi1_ = 0.0, phi2_ = 0.0;    // forces held during them
+  double phid1_ = 0.0, phid2_ = 0.0;  // the port force during them (push())
+  double phiv1_ = 0.0, phiv2_ = 0.0;
   double r1_ = 1.0, r2_ = 1.0;        // their lengths in units of dt
   int regular_ = 2;                   // regular samples since an irregular one, up to 2
   double held_ = 0.0;
+  std::vector<ForceSegment> lead_;
+  double lead_samples_ = 0.0;
+  double lead_imp_ = 0.0;  // sum phi_i r_i over the lead
   // Kalman filter, used when q_ > 0. The position is kept relative to the
   // last reading (e_ = estimate - reading), so that it never grows large.
   double q_;

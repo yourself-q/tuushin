@@ -9,6 +9,7 @@
 
 using tuushin::Rng;
 using tuushin::control::DevicePredictor;
+using tuushin::control::ForceSegment;
 using tuushin::control::limit_force_predictive;
 using tuushin::control::quantization_tax;
 using tuushin::control::ReflectiveStore;
@@ -86,6 +87,51 @@ TEST_CASE(predictor_is_exact_after_samples_of_unequal_length) {
   b.observe(dx1, 3.0, dt);
   CHECK(a.base() == b.base());
   CHECK_NEAR(a.base(), 2.0 * dx1 - dx2 + c * -2.0, 1e-18);
+}
+
+TEST_CASE(predictor_is_exact_for_forces_that_take_effect_late) {
+  // A device that applies each command 0.4 ms after it is issued holds two
+  // forces in every sample: the one before for 0.4 ms, then the new one.
+  const double m = 0.2, dt = 1e-3, late = 0.4;
+  HeldMass dev{m, dt, 3.0};
+  dev.v = 0.05;
+  DevicePredictor pred(m, dt);
+  pred.observe(dev.step(0.0), 0.0);
+  pred.observe(dev.step(0.0), 0.0);
+  const double phis[] = {7.0, -2.0, 4.5, 4.5, 0.0, 10.0, -6.0, 1.0};
+  double prev = 0.0;
+  for (double phi : phis) {
+    // When phi is commanded, prev is in flight: the predictions for phi
+    // start where it ends.
+    pred.set_lead({{prev, late}});
+    CHECK(pred.held_force() == prev);
+    HeldMass copy = dev;
+    const double lead = copy.step_for(prev, late * dt);
+    CHECK_NEAR(pred.lead_work(), prev * lead, 1e-15);
+    // Without a resolution only the model error spreads it: a miss taken as
+    // an unmodeled force moves the device c r^2 per newton in r samples.
+    CHECK_NEAR(pred.lead_sd(), std::fabs(prev) * late * late * pred.model_error(), 1e-18);
+    const double one = copy.step(phi);
+    CHECK_NEAR(pred.hold_displacement(phi, 1), one, 1e-15);
+    CHECK_NEAR(pred.hold_displacement(phi, 2), one + copy.step(phi), 1e-15);
+    // The sample: the encoder sees only the sum, which the model splits.
+    const double d1 = dev.step_for(prev, late * dt);
+    const double d2 = dev.step_for(phi, (1.0 - late) * dt);
+    const std::vector<ForceSegment> segs{{prev, late}, {phi, 1.0 - late}};
+    CHECK_NEAR(pred.realized_work(d1 + d2, segs), prev * d1 + phi * d2, 1e-15);
+    pred.observe(d1 + d2, segs, dt);
+    CHECK(pred.lead_samples() == 0.0);
+    CHECK_NEAR(pred.external_force(), dev.H, 1e-7);
+    CHECK_NEAR(pred.velocity_dt(), dev.v * dt, 1e-15);
+    prev = phi;
+  }
+  // A lead longer than a sample, of several forces.
+  pred.set_lead({{1.0, 0.7}, {-3.0, 1.0}, {2.0, 0.3}});
+  HeldMass copy = dev;
+  const double w = 1.0 * copy.step_for(1.0, 0.7 * dt) - 3.0 * copy.step_for(-3.0, dt) +
+                   2.0 * copy.step_for(2.0, 0.3 * dt);
+  CHECK_NEAR(pred.lead_work(), w, 1e-15);
+  CHECK_NEAR(pred.hold_displacement(5.0, 1.5), copy.step_for(5.0, 1.5 * dt), 1e-15);
 }
 
 TEST_CASE(predictor_waits_two_samples_after_an_irregular_one) {

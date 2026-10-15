@@ -110,6 +110,8 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
   mc.pc_rise_samples = cfg.master_pc_rise_samples;
   mc.deadband = cfg.forward_deadband;
   mc.deadband_params = cfg.forward_deadband_params;
+  mc.actuation_delay = cfg.master_model_actuation_delay >= 0 ? cfg.master_model_actuation_delay
+                                                              : cfg.master.actuation_delay;
   teleop::MasterController master(mc);
 
   teleop::SlaveConfig sc;
@@ -132,6 +134,8 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
   sc.pc_rise_samples = cfg.slave_pc_rise_samples;
   sc.deadband = cfg.backward_deadband;
   sc.deadband_params = cfg.backward_deadband_params;
+  sc.actuation_delay = cfg.slave_model_actuation_delay >= 0 ? cfg.slave_model_actuation_delay
+                                                            : cfg.slave.actuation_delay;
   teleop::SlaveController slave(sc, slave_dev.read_position(0));
 
   Sender fwd_sender, bwd_sender;

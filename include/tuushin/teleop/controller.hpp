@@ -1,6 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <deque>
+#include <utility>
+#include <vector>
 
 #include "tuushin/codec/deadband.hpp"
 #include "tuushin/control/predictive_pc.hpp"
@@ -45,6 +48,31 @@ struct Sample {
   double energy = 0.0;
 };
 
+// The port forces a device applies when its commands take effect `delay`
+// after they are issued, as with a servo loop that picks them up on its own
+// ticks or a bus that carries them. Both controllers book and predict with
+// it; without a delay every sample holds the force commanded at its start.
+class ActuatorSchedule {
+ public:
+  ActuatorSchedule(Nanos delay, Nanos dt);
+
+  // The port forces over the sample from `from` to `to`, in order, with
+  // their lengths in units of dt. If the watchdog cut the force `cut_after`
+  // after `from`, when the last command was issued, the force is zero from
+  // then on and nothing is in flight any more.
+  std::vector<control::ForceSegment> advance(Nanos from, Nanos to, Nanos cut_after);
+  // The forces in flight at `now`: what acts until a command issued now
+  // takes effect. Empty without a delay.
+  std::vector<control::ForceSegment> lead(Nanos now) const;
+  void command(Nanos now, double phi);
+
+ private:
+  Nanos delay_;
+  double dt_;  // ns
+  double active_ = 0.0;
+  std::deque<std::pair<Nanos, double>> pending_;  // effective time, force
+};
+
 struct MasterConfig {
   Nanos dt = kNanosPerMilli;  // sample period
   Passivity passivity = Passivity::kReflective;
@@ -80,6 +108,10 @@ struct MasterConfig {
   int pc_rise_samples = 64;
   bool deadband = false;
   codec::DeadbandParams deadband_params{0.1, 0.002, from_millis(100)};
+  // How long after a command the device applies it (ActuatorSchedule). The
+  // books then credit each force with the displacement while it acted, and
+  // the predictive PC pays for the forces in flight before the new one.
+  Nanos actuation_delay = 0;
 };
 
 class MasterController {
@@ -101,8 +133,8 @@ class MasterController {
   };
 
   // One sample at time `now` with the encoder at `position`. Books the work
-  // the previously applied force did since the last call; `cut_after` is the
-  // device's Device1D::force_cut_after() (0 when the force stayed on).
+  // the previously applied forces did since the last call; `cut_after` is
+  // the device's Device1D::force_cut_after() (0 when the force stayed on).
   //
   // Samples need not come at exactly dt: the velocity and the device model
   // use the time that really passed, and a sample far from dt (the loop was
@@ -132,6 +164,7 @@ class MasterController {
   double dt_;
   control::EnergyPort port_;
   control::DevicePredictor dev_;
+  ActuatorSchedule actuator_;
   codec::DeadbandEncoder<1> enc_;
   bool first_ = true;
   Nanos last_now_ = 0;
@@ -183,6 +216,8 @@ struct SlaveConfig {
   // the last velocity. 0 extrapolates indefinitely; it must exceed the
   // deadband's max_interval to leave the deadband alone.
   Nanos hold_after = 0;
+  // As in MasterConfig.
+  Nanos actuation_delay = 0;
 };
 
 class SlaveController {
@@ -230,6 +265,7 @@ class SlaveController {
   control::EnergyPort port_;
   control::ReflectiveStore store_;
   control::DevicePredictor dev_;
+  ActuatorSchedule actuator_;
   codec::DeadbandEncoder<1> enc_;
   double x_sampled_;
   double x_cmd_;

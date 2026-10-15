@@ -387,6 +387,59 @@ the force recovered that stiffness but let the 80 % master generate
 eight times as much; shorter memories of 20, 10 or 5 ms did not recover
 it.
 
+### Actuation delay
+
+A device need not apply a force when it is commanded: a servo loop picks
+commands up on its own ticks, a bus carries them, an amplifier has its
+own loop. With a delay d the force held over a sample is partly the one
+before, and a new force acts over a sample that starts d later. A
+controller that takes every force to act at once credits each force with
+the displacement the one before it caused, and its books run ahead of the
+actuators. Told d, the controllers now keep the commands in flight
+(`teleop::ActuatorSchedule`). The device model takes a sample whose force
+changed within it exactly, as a mass; the books split the sample's
+displacement where the force changed, by the model's prediction for each
+piece; and the PC first pays for the forces in flight, from their
+predicted work less its uncertainty, then predicts the new force from
+where they leave the device.
+
+Worst true margin over nine hand motions, 20 s each, 10, 50 and 100 ms
+each way (reflective scheme; coarse: 55 µm master, 1 µm slave), with the
+controllers unaware of the delay and told it:
+
+| delay | coarse, unaware | told | exact, unaware | told |
+|---|---|---|---|---|
+| master 0.25 ms | 0 J | 0 J | −1.4e−3 J | −3.6e−6 J |
+| master 1 ms | −3.3e−3 J | 0 J | −0.14 J | −2.6e−6 J |
+| master 2 ms | −0.079 J | 0 J | −1.2 J | −1.2e−4 J |
+| slave 0.25 ms | 0 J | 0 J | −3.8e−3 J | −2.3e−6 J |
+| slave 1 ms | −0.15 J | 0 J | −0.14 J | −1.4e−8 J |
+| slave 2 ms | −0.63 J | 0 J | −0.51 J | −1.8e−8 J |
+
+`tuushin-sim --master-actuation-delay-ms 1` sets up the second row, and
+`--actuation-delay-unknown` hides the delay from the controllers. With
+coarse encoders nothing is generated, also with both ends delayed and
+the loops up to 0.2 ms off their grid. With exact readings what is left
+is model error: the split misplaces a few microjoules against what the
+model leaves out within a sample, the hand's impedance and the device's
+damping (up to 14 µJ with both ends at 1 ms and the loops off their
+grid), and with 2 ms at the master a prediction four samples ahead
+overshoots by up to 0.12 mJ. Unaware, the master's force also chatters:
+with exact readings and 1 ms it varies 350, 190 and 210 N/s, told 130,
+20 and 16 N/s, against 107, 19 and 15 without a delay. Told, the master
+conveys as much of the contact force as without a delay with exact
+readings (87, 26 and 11 %, against 84, 26 and 12 %), and with a coarse
+encoder and 2 ms 78, 14 and 9 % instead of 93, 17 and 10 %.
+
+The delay has to be known. Believed 0.1 ms off (0.9 or 1.1 ms for 1 ms)
+the teleoperator generated up to 0.9 mJ with exact readings; half a
+millisecond off, 8 mJ (master 1 ms believed 0.5) and 35 mJ (slave 2 ms
+believed 1.5). Half a millisecond too long generated less, up to 4 mJ,
+but cost transparency: for 2 ms believed 2.5 the master conveyed 48
+instead of 88 % of the contact force at 10 ms. Coarse encoders generated
+nothing in all of these but one, 11 mJ for the slave at 2 ms believed
+1.5 ms at 100 ms.
+
 ## Authentication
 
 Without a key, anyone who can send datagrams to the slave's port can drive
@@ -731,6 +784,10 @@ the slave kept sending to the master's port for the old relay.
   generated 0.19 mJ (Model mismatch above). Coarse encoders, whose
   misses show among the innovations, generated nothing on the same
   devices.
+- **The actuation delay has to be known**, to about a tenth of a
+  millisecond with exact readings (Actuation delay above). Nothing
+  measures it; a device's driver or datasheet has to supply it, and a
+  delay that varies from command to command is not modelled.
 - **Simulated devices only, one degree of freedom.** `teleop::Device1D` is
   the interface a real device will implement.
 - **Only the slave takes a relay, over UDP.** One relay is enough to cross

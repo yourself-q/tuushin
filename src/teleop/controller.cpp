@@ -5,30 +5,95 @@
 
 namespace tuushin::teleop {
 
+ActuatorSchedule::ActuatorSchedule(Nanos delay, Nanos dt)
+    : delay_(delay > 0 ? delay : 0), dt_(static_cast<double>(dt > 0 ? dt : kNanosPerMilli)) {}
+
 namespace {
 
-// Work the port force phi, held since the last sample, did on the two-port
-// over that sample (positive = in), given the displacement dx the encoder
-// saw. If the watchdog cut the force `cut_after` after the command, the
-// displacement while it acted was not seen: the model the PC chose the force
-// with predicts it, and only an output is booked. Without a usable model the
-// whole sample's work is booked if it was an output.
-double held_work(const control::DevicePredictor& dev, double phi, double dx, Nanos cut_after,
-                 double dt) {
-  if (cut_after <= 0) return phi * dx;
-  const double predicted = dev.ready() ? dev.hold_work(phi, to_seconds(cut_after) / dt) : phi * dx;
-  return std::min(0.0, predicted);
+void append(std::vector<control::ForceSegment>& segs, double phi, Nanos length, double dt) {
+  if (length <= 0) return;
+  if (!segs.empty() && segs.back().phi == phi) {
+    segs.back().samples += static_cast<double>(length) / dt;
+  } else {
+    segs.push_back({phi, static_cast<double>(length) / dt});
+  }
 }
 
-// Feeds the last sample, of length h (s), to the device model. A sample far
-// from the nominal length is the model's to reject; one during which the
-// force was cut is not described by it at all.
-void observe(control::DevicePredictor& dev, double dx, double phi, double h, Nanos cut_after) {
-  if (cut_after > 0) {
-    dev.observe_irregular(dx, phi);
-  } else {
-    dev.observe(dx, phi, h);
+}  // namespace
+
+std::vector<control::ForceSegment> ActuatorSchedule::advance(Nanos from, Nanos to,
+                                                             Nanos cut_after) {
+  std::vector<control::ForceSegment> segs;
+  const Nanos cut = cut_after > 0 ? from + cut_after : to + 1;
+  Nanos t = from;
+  while (!pending_.empty() && pending_.front().first <= to && pending_.front().first <= cut) {
+    const Nanos at = std::max(t, pending_.front().first);
+    append(segs, active_, at - t, dt_);
+    t = at;
+    active_ = pending_.front().second;
+    pending_.pop_front();
   }
+  if (cut <= to) {
+    const Nanos at = std::max(t, cut);
+    append(segs, active_, at - t, dt_);
+    t = at;
+    active_ = 0.0;
+    pending_.clear();
+  }
+  append(segs, active_, to - t, dt_);
+  if (segs.empty()) segs.push_back({active_, 1.0});
+  return segs;
+}
+
+std::vector<control::ForceSegment> ActuatorSchedule::lead(Nanos now) const {
+  std::vector<control::ForceSegment> segs;
+  if (delay_ <= 0) return segs;
+  const Nanos end = now + delay_;
+  Nanos t = now;
+  double phi = active_;
+  for (const auto& [at, f] : pending_) {
+    const Nanos from = std::clamp(at, t, end);
+    append(segs, phi, from - t, dt_);
+    t = from;
+    phi = f;
+  }
+  append(segs, phi, end - t, dt_);
+  return segs;
+}
+
+void ActuatorSchedule::command(Nanos now, double phi) {
+  if (delay_ <= 0) {
+    active_ = phi;
+  } else {
+    pending_.emplace_back(now + delay_, phi);
+  }
+}
+
+namespace {
+
+// Books and observes the sample from `from` to `now` in which the encoder
+// saw the displacement dx, and sets the forces in flight as the predictor's
+// lead. Returns the work the port forces did on the two-port over it
+// (positive = in): each force over the displacement while it acted, which
+// the model splits where the force changed within the sample. If the
+// watchdog cut the force `cut_after` after the command, the displacement
+// while it acted was not seen at all: the model the PC chose the force with
+// predicts it, and only an output is booked. Without a usable model a
+// sample's displacement is split in proportion to time. A sample far from
+// the nominal length is the model's to reject; one during which the force
+// was cut is not described by it at all.
+double book_and_observe(control::DevicePredictor& dev, ActuatorSchedule& actuator, Nanos from,
+                        Nanos now, double dx, double h, Nanos cut_after) {
+  const auto segs = actuator.advance(from, now, cut_after);
+  double work = dev.realized_work(dx, segs);
+  if (cut_after > 0) {
+    work = std::min(0.0, work);
+    dev.observe_irregular(dx, segs.front().phi);
+  } else {
+    dev.observe(dx, segs, h);
+  }
+  dev.set_lead(actuator.lead(now));
+  return work;
 }
 
 }  // namespace
@@ -37,6 +102,7 @@ MasterController::MasterController(const MasterConfig& cfg)
     : cfg_(cfg),
       dt_(to_seconds(cfg.dt)),
       dev_(cfg.model_mass, dt_, cfg.encoder_resolution, cfg.force_rate, cfg.adapt_force_rate),
+      actuator_(cfg.actuation_delay, cfg.dt),
       enc_(cfg.deadband_params) {}
 
 void MasterController::receive(std::uint32_t seq, const Sample& s) {
@@ -49,17 +115,18 @@ void MasterController::receive(std::uint32_t seq, const Sample& s) {
 }
 
 MasterController::Step MasterController::step(Nanos now, double position, Nanos cut_after) {
-  // Book the work the force held over the last sample actually did, then
+  // Book the work the forces over the last sample actually did, then
   // display the reflected force through the PC. The velocity is the backward
   // difference of the encoder position, as on a real device.
   if (first_) x_sampled_ = position;
-  const double h = first_ || now <= last_now_ ? dt_ : to_seconds(now - last_now_);
+  const bool fresh = first_ || now <= last_now_;
+  const Nanos from = fresh ? now - cfg_.dt : last_now_;
+  const double h = fresh ? dt_ : to_seconds(now - last_now_);
   const double dx = position - x_sampled_;
   v_meas_ = first_ ? 0.0 : dx / h;
   first_ = false;
   last_now_ = now;
-  port_.account_energy(held_work(dev_, f_display_, dx, cut_after, dt_));
-  observe(dev_, dx, f_display_, h, cut_after);
+  port_.account_energy(book_and_observe(dev_, actuator_, from, now, dx, h, cut_after));
   x_sampled_ = position;
 
   Step out;
@@ -85,6 +152,7 @@ MasterController::Step MasterController::step(Nanos now, double position, Nanos 
                                                     out.display_force));
   }
   f_display_ = out.display_force;
+  actuator_.command(now, f_display_);
 
   // A coarse encoder's backward difference is mostly quantization noise
   // (q / dt: 5.5 cm/s for 55 um at 1 kHz), which the slave's damping would
@@ -104,6 +172,7 @@ SlaveController::SlaveController(const SlaveConfig& cfg, double position)
       dt_(to_seconds(cfg.dt)),
       store_(cfg.initial_energy),
       dev_(cfg.model_mass, dt_, cfg.encoder_resolution, cfg.force_rate, cfg.adapt_force_rate),
+      actuator_(cfg.actuation_delay, cfg.dt),
       enc_(cfg.deadband_params),
       x_sampled_(position),
       x_cmd_(position),
@@ -134,17 +203,18 @@ SlaveController::Step SlaveController::step(Nanos now, double position, double v
   const bool fresh = fresh_;
   fresh_ = false;
   if (fresh) fresh_at_ = now;
-  const double h = stepped_ && now > last_now_ ? to_seconds(now - last_now_) : dt_;
+  const bool regular = stepped_ && now > last_now_;
+  const Nanos from = regular ? last_now_ : now - cfg_.dt;
+  const double h = regular ? to_seconds(now - last_now_) : dt_;
   stepped_ = true;
   last_now_ = now;
 
-  // Book the work the applied force did on the slave over the last sample;
+  // Book the work the applied forces did on the slave over the last sample;
   // this is the true slave terminal for every scheme, and the energy source
   // or sink of the reflective store.
   const double dx = position - x_sampled_;
-  const double work_in = held_work(dev_, -f_ctrl_, dx, cut_after, dt_);
+  const double work_in = book_and_observe(dev_, actuator_, from, now, dx, h, cut_after);
   terminal_net_ += work_in;
-  observe(dev_, dx, -f_ctrl_, h, cut_after);
   x_sampled_ = position;
 
   const bool live = has_value_ && (cfg_.hold_after <= 0 || now - fresh_at_ <= cfg_.hold_after);
@@ -177,11 +247,15 @@ SlaveController::Step SlaveController::step(Nanos now, double position, double v
     const double phi = -f_coupling;
     // A predictor that is not ready lets no force through (see step()), so
     // nothing will leave towards the slave. The predictive PC also pays the
-    // force's quantization tax from its grant.
+    // force's quantization tax from its grant, and what the forces in flight
+    // are expected to take out at worst.
     const double tax =
         control::quantization_tax(cfg_.encoder_resolution, dev_.held_force(), phi);
+    const double lead = dev_.lead_samples() > 0.0
+                            ? dev_.lead_work() - cfg_.pc_confidence * dev_.lead_sd()
+                            : 0.0;
     const double want_slave = !cfg_.predictive_pc ? f_coupling * velocity * dt_
-                              : dev_.ready()      ? tax - dev_.work(phi)
+                              : dev_.ready()      ? tax - dev_.work(phi) - lead
                                                   : 0.0;
     const double want_master = -f_slave_ * v_c_ * dt_;
     const auto grant = store_.allocate(want_slave, want_master);
@@ -224,6 +298,7 @@ SlaveController::Step SlaveController::step(Nanos now, double position, double v
     terminal_net_ -= tax;
     if (cfg_.passivity == Passivity::kReflective) store_.account_slave_energy(-tax);
   }
+  actuator_.command(now, -f_ctrl_);
   x_master_est_ += v_received * dt_;
   out.force = f_ctrl_;
 

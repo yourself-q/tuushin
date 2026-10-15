@@ -37,8 +37,9 @@ struct MasterParams {
   // 3 N (3D Systems Touch) and 20 N (Force Dimension sigma.7).
   double max_force = 20.0;
   // What the controller's model leaves out (teleop/device.hpp): friction
-  // besides the viscous damping, a compliant structure, and a delay before a
-  // commanded force takes effect.
+  // besides the viscous damping and a compliant structure; and a delay
+  // before a commanded force takes effect, which the controllers are told
+  // (Teleop1DConfig::master_model_actuation_delay).
   teleop::FrictionParams friction;
   teleop::ComplianceParams compliance;
   Nanos actuation_delay = 0;
@@ -155,6 +156,11 @@ struct Teleop1DConfig {
   int pc_tax_samples = 4;
   int master_pc_rise_samples = 64;
   int slave_pc_rise_samples = 0;
+  // The actuation delays the controllers book and predict with
+  // (teleop::ActuatorSchedule); negative means the devices' true ones
+  // (MasterParams::actuation_delay), 0 takes every force to act at once.
+  Nanos master_model_actuation_delay = -1;
+  Nanos slave_model_actuation_delay = -1;
   bool forward_deadband = false;
   codec::DeadbandParams forward_deadband_params{0.1, 0.002, from_millis(100)};
   bool backward_deadband = false;

@@ -416,3 +416,61 @@ TEST_CASE(teleop_reflective_tdpa_nearly_passive_on_exact_readings_of_misdescribe
     }
   }
 }
+
+TEST_CASE(teleop_reflective_tdpa_pays_for_the_forces_in_flight) {
+  // Devices that apply each force some time after it is commanded: 1 ms at
+  // both ends with the loops up to 0.2 ms off their grid, so that the
+  // forces change within samples, and 2 ms on the grid. Unaware of it, the
+  // controllers credit each force with the displacement the one before it
+  // caused and predict as if the new force acted at once: the books run
+  // ahead of the actuators, which generate 34 to 58 mJ with 1 ms and 0.4
+  // to 0.5 J with 2 ms at 50 and 100 ms, and the master's force varies 7
+  // to 25 times as much. Told the delay, they split each sample's
+  // displacement where the force changed and pay for the forces in flight
+  // before they choose the next. What remains is model error: the split
+  // misplaces up to 6 uJ against the hand's impedance within a sample, and
+  // with 2 ms a prediction four samples ahead overshoots by up to 16 uJ.
+  struct Lag {
+    Nanos delay, jitter;
+  };
+  for (const Lag lag : {Lag{from_millis(1.0), from_millis(0.2)}, Lag{from_millis(2.0), 0}}) {
+    for (int ms : {10, 50, 100}) {
+      sim::Teleop1DResult r[2];
+      for (const bool known : {true, false}) {
+        sim::Teleop1DConfig cfg;
+        cfg.passivity = Passivity::kReflective;
+        cfg.master.actuation_delay = lag.delay;
+        cfg.slave.actuation_delay = lag.delay;
+        cfg.sample_jitter = lag.jitter;
+        if (!known) cfg.master_model_actuation_delay = cfg.slave_model_actuation_delay = 0;
+        r[known ? 0 : 1] = run(cfg, from_millis(ms));
+      }
+      CHECK(!r[0].diverged);
+      CHECK(r[0].min_true_margin > -5e-5);
+      CHECK(r[0].max_book_excess < 1e-5);
+      if (ms > 10) {
+        CHECK(r[1].min_true_margin < -0.03);
+        CHECK(r[0].display_force_variation < 0.2 * r[1].display_force_variation);
+      }
+    }
+  }
+  // With coarse encoders the books already allow for misses, but unaware of
+  // a delay of 2 ms the teleoperator still generates 0.1 J at 50 and 100 ms.
+  // Told it, it generates nothing.
+  for (int ms : {10, 50, 100}) {
+    for (const bool known : {true, false}) {
+      auto cfg = coarse(0.5, 0.04);
+      cfg.master.actuation_delay = from_millis(2.0);
+      cfg.slave.actuation_delay = from_millis(2.0);
+      if (!known) cfg.master_model_actuation_delay = cfg.slave_model_actuation_delay = 0;
+      const auto r = run(cfg, from_millis(ms));
+      CHECK(!r.diverged);
+      if (known) {
+        CHECK(r.max_book_excess < 1e-12);
+        CHECK(r.min_true_margin > -1e-9);
+      } else if (ms > 10) {
+        CHECK(r.min_true_margin < -0.05);
+      }
+    }
+  }
+}

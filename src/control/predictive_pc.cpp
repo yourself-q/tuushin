@@ -48,33 +48,112 @@ DevicePredictor::DevicePredictor(double mass, double dt, double resolution, doub
 
 void DevicePredictor::observe(double dx, double phi_held, double h) {
   const bool regular = std::fabs(h - dt_) <= 0.5 * dt_;
-  push(dx, phi_held, regular ? h / dt_ : 1.0, regular);
+  push(dx, phi_held, phi_held, regular ? h / dt_ : 1.0, regular);
   held_ = phi_held;
 }
 
+void DevicePredictor::observe(double dx, const std::vector<ForceSegment>& segments, double h) {
+  if (segments.size() <= 1) {
+    observe(dx, segments.empty() ? 0.0 : segments.front().phi, h);
+    return;
+  }
+  const bool regular = std::fabs(h - dt_) <= 0.5 * dt_;
+  const double r = regular ? h / dt_ : 1.0;
+  double total = 0.0;
+  for (const auto& seg : segments) total += seg.samples;
+  const double scale = total > 0.0 ? r / total : 0.0;
+  double imp = 0.0, mom = 0.0, start = 0.0;
+  for (const auto& seg : segments) {
+    const double ri = seg.samples * scale;
+    imp += seg.phi * ri;
+    mom += seg.phi * ri * (2.0 * (r - start) - ri);
+    start += ri;
+  }
+  push(dx, mom / (r * r), imp / r, r, regular);
+  held_ = segments.back().phi;
+}
+
 void DevicePredictor::observe_irregular(double dx, double phi_held) {
-  push(dx, phi_held, 1.0, false);
+  push(dx, phi_held, phi_held, 1.0, false);
   held_ = 0.0;
 }
 
-void DevicePredictor::push(double dx, double phi_held, double r, bool regular) {
+double DevicePredictor::realized_work(double dx, const std::vector<ForceSegment>& segments) const {
+  if (segments.empty()) return 0.0;
+  double total = 0.0;
+  for (const auto& seg : segments) total += seg.samples;
+  // From the state at the end of the last sample, which the lead does not
+  // change.
+  double v = velocity_dt();
+  const double ext = external_force();
+  double work = 0.0, moved = 0.0;
+  for (std::size_t i = 0; i + 1 < segments.size(); ++i) {
+    const double r = segments[i].samples, phi = segments[i].phi;
+    const double d = ready() ? r * v + c_ * r * r * (ext - phi)
+                             : (total > 0.0 ? dx * r / total : 0.0);
+    work += phi * d;
+    moved += d;
+    v += 2.0 * c_ * r * (ext - phi);
+  }
+  return work + segments.back().phi * (dx - moved);
+}
+
+void DevicePredictor::set_lead(const std::vector<ForceSegment>& lead) {
+  lead_ = lead;
+  lead_samples_ = 0.0;
+  lead_imp_ = 0.0;
+  for (const auto& seg : lead_) {
+    lead_samples_ += seg.samples;
+    lead_imp_ += seg.phi * seg.samples;
+  }
+}
+
+double DevicePredictor::lead_work() const {
+  double v = velocity_dt(), work = 0.0;
+  const double ext = external_force();
+  for (const auto& seg : lead_) {
+    const double r = seg.samples;
+    work += seg.phi * (r * v + c_ * r * r * (ext - seg.phi));
+    v += 2.0 * c_ * r * (ext - seg.phi);
+  }
+  return work;
+}
+
+double DevicePredictor::lead_sd() const {
+  // A segment s samples into the lead and r long moves r more per unit of
+  // v dt, and r (2 s + r) c more per newton of H.
+  double gv = 0.0, k = 0.0, start = 0.0;
+  for (const auto& seg : lead_) {
+    gv += seg.phi * seg.samples;
+    k += seg.phi * seg.samples * (2.0 * start + seg.samples);
+    start += seg.samples;
+  }
+  return spread(gv * dt_, k);
+}
+
+void DevicePredictor::push(double dx, double phi_d, double phi_v, double r, bool regular) {
+  lead_.clear();
+  lead_samples_ = 0.0;
+  lead_imp_ = 0.0;
   if (q_ <= 0.0 && regular && ready()) {
     // What the model missed over this sample, held as a decaying envelope:
     // exact readings leave no noise to average, only the model's error.
-    const double e = dx - hold_displacement(phi_held, r);
+    const double e = dx - (hold_base(r) - hold_compliance(r) * phi_d);
     miss_ = std::max(e * e, (1.0 - std::min(1.0, r * dt_ / kMissSeconds)) * miss_);
   }
   dx2_ = dx1_;
-  phi2_ = phi1_;
+  phid2_ = phid1_;
+  phiv2_ = phiv1_;
   r2_ = r1_;
   dx1_ = dx;
-  phi1_ = phi_held;
+  phid1_ = phi_d;
+  phiv1_ = phi_v;
   r1_ = r;
   regular_ = regular ? std::min(regular_ + 1, 2) : 0;
-  if (q_ > 0.0) filter(dx, phi_held, r, regular);
+  if (q_ > 0.0) filter(dx, phi_d, phi_v, r, regular);
 }
 
-void DevicePredictor::filter(double dx, double phi_held, double r, bool regular) {
+void DevicePredictor::filter(double dx, double phi_d, double phi_v, double r, bool regular) {
   if (!regular) {
     // The model did not hold over this sample, so its residual says nothing
     // about v or H: restart from the reading, with the estimates kept as
@@ -89,13 +168,13 @@ void DevicePredictor::filter(double dx, double phi_held, double r, bool regular)
     p_[2][2] = ph;
     return;
   }
-  // Predict over the sample, of length h, with the held force: the exact
-  // transition of a mass under a constant net force H - phi.
+  // Predict over the sample, of length h, with the port force: the exact
+  // transition of a mass under a net force H - phi.
   const double h = r * dt_;
   const double a = h * h / (2.0 * mass_), b = h / mass_;
   const double f[3][3] = {{1.0, h, a}, {0.0, 1.0, b}, {0.0, 0.0, 1.0}};
-  e_ += v_ * h + a * (h_ - phi_held) - dx;  // the reading moved by dx
-  v_ += b * (h_ - phi_held);
+  e_ += v_ * h + a * (h_ - phi_d) - dx;  // the reading moved by dx
+  v_ += b * (h_ - phi_v);
   double fp[3][3], p[3][3];
   for (int i = 0; i < 3; ++i) {
     for (int j = 0; j < 3; ++j) {
@@ -148,26 +227,42 @@ double DevicePredictor::external_force() const {
   // With r_j = h_j / dt and F_j = H - phi_j, dx_j / r_j is the displacement
   // at the mean velocity over sample j scaled to dt, and the mean velocities
   // of two adjacent samples differ by (F_1 h_1 + F_2 h_2) / (2 m). For equal
-  // samples: dx1 - dx2 = c * (F1 + F2).
-  return ((dx1_ / r1_ - dx2_ / r2_) / c_ + phi1_ * r1_ + phi2_ * r2_) / (r1_ + r2_);
+  // samples: dx1 - dx2 = c * (F1 + F2). A force that changed within the
+  // older sample enters by how it moved the device (phi_d) and how it left
+  // its velocity (phi_v), as 2 phi_v - phi_d.
+  return ((dx1_ / r1_ - dx2_ / r2_) / c_ + phid1_ * r1_ + (2.0 * phiv2_ - phid2_) * r2_) /
+         (r1_ + r2_);
 }
 
 double DevicePredictor::velocity_dt() const {
   if (q_ > 0.0) return v_ * dt_;
   // The velocity at the end of the last sample: its mean velocity plus half
-  // the change over it, F_1 h_1 / (2 m), times dt.
-  return dx1_ / r1_ + c_ * r1_ * (external_force() - phi1_);
+  // the change over it, F_1 h_1 / (2 m), times dt; for a force that changed
+  // within the sample, with 2 phi_v - phi_d for phi_1.
+  return dx1_ / r1_ + c_ * r1_ * (external_force() - (2.0 * phiv1_ - phid1_));
 }
 
 double DevicePredictor::hold_base(double n) const {
-  return n * velocity_dt() + n * n * c_ * external_force();
+  if (lead_.empty()) return n * velocity_dt() + n * n * c_ * external_force();
+  // From where the lead ends: the velocity it leaves, and H acting on.
+  const double ext = external_force();
+  const double v = velocity_dt() + 2.0 * c_ * (ext * lead_samples_ - lead_imp_);
+  return n * v + n * n * c_ * ext;
 }
 
 double DevicePredictor::hold_sd(double n) const {
-  // A miss over one sample taken as an unmodeled force grows as n^2.
-  const double miss = n * n * n * n * miss_;
+  // Over samples R to R + n after the last one, with R the lead's length,
+  // the displacement grows by n per unit of v dt and by
+  // (R + n)^2 - R^2 = n (2 R + n) times c per newton of H.
+  return spread(n * dt_, n * (2.0 * lead_samples_ + n));
+}
+
+double DevicePredictor::spread(double gv, double k) const {
+  // A miss over one sample taken as an unmodeled force grows as k: n^2
+  // over n samples.
+  const double miss = k * k * miss_;
   if (q_ <= 0.0) return std::sqrt(miss);
-  const double gv = n * dt_, gh = n * n * c_;
+  const double gh = k * c_;
   const double var = gv * gv * p_[1][1] + 2.0 * gv * gh * p_[1][2] + gh * gh * p_[2][2] + miss;
   return std::sqrt(std::max(0.0, var));
 }
@@ -213,6 +308,11 @@ PcResult limit_force_predictive(double budget, double phi, const DevicePredictor
     r.gain = 1.0;
     r.active = true;
     return r;
+  }
+  // Forces already in flight do their work first: the budget is what is
+  // left after the lower bound of it.
+  if (device.lead_samples() > 0.0) {
+    budget += device.lead_work() - confidence * device.lead_sd();
   }
   const double b = std::max(0.0, budget);
   const double q = device.resolution();

@@ -59,6 +59,7 @@ void usage() {
                "  --slave-compliance F,HZ[,Z]   the same for the slave\n"
                "  --master-actuation-delay-ms D  delay before a master force takes effect\n"
                "  --slave-actuation-delay-ms D   the same for the slave\n"
+               "  --actuation-delay-unknown  controllers take every force to act at once\n"
                "  --sample-jitter-ms J  each end samples up to J off its 1 ms grid (< 0.5)\n"
                "  --pc-hold N           samples a PC force must stay affordable if held (2)\n"
                "  --master-encoder Q    master encoder resolution in m (0 = exact)\n"
@@ -154,6 +155,10 @@ Options parse(int argc, char** argv) {
     else if (a == "--master-encoder") o.cfg.master_encoder_resolution = std::stod(next());
     else if (a == "--slave-encoder") o.cfg.slave_encoder_resolution = std::stod(next());
     else if (a == "--encoders-unknown") o.cfg.encoder_resolution_known = false;
+    else if (a == "--actuation-delay-unknown") {
+      o.cfg.master_model_actuation_delay = 0;
+      o.cfg.slave_model_actuation_delay = 0;
+    }
     else if (a == "--force-rate") o.cfg.force_rate = std::stod(next());
     else if (a == "--fixed-force-rate") o.cfg.adapt_force_rate = false;
     else if (a == "--pc-confidence") o.cfg.pc_confidence = std::stod(next());

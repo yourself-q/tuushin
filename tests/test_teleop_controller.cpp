@@ -1,4 +1,5 @@
 #include <cmath>
+#include <vector>
 
 #include "test.hpp"
 #include "tuushin/teleop/controller.hpp"
@@ -203,6 +204,75 @@ TEST_CASE(device_actuation_delay_shifts_the_commands) {
   CHECK(dog.force() == 0.0);
   CHECK(dog.force_cut_after() == 2 * kNanosPerMilli);
   CHECK(dog.actuator_work() == 0.0);
+}
+
+TEST_CASE(actuator_schedule_splits_samples_where_commands_take_effect) {
+  const Nanos ms = kNanosPerMilli;
+  auto check = [](const std::vector<control::ForceSegment>& segs,
+                  std::vector<control::ForceSegment> want) {
+    REQUIRE(segs.size() == want.size());
+    for (std::size_t i = 0; i < want.size(); ++i) {
+      CHECK(segs[i].phi == want[i].phi);
+      CHECK_NEAR(segs[i].samples, want[i].samples, 1e-12);
+    }
+  };
+  // Without a delay each sample holds the force commanded at its start.
+  ActuatorSchedule now(0, ms);
+  now.command(0, 3.0);
+  check(now.advance(0, ms, 0), {{3.0, 1.0}});
+  check(now.lead(ms), {});
+  // 0.4 ms: the force before acts for 0.4 ms of the sample, and the force
+  // just commanded is in flight until then.
+  ActuatorSchedule soon(400'000, ms);
+  soon.command(0, 2.0);
+  check(soon.advance(0, ms, 0), {{0.0, 0.4}, {2.0, 0.6}});
+  check(soon.lead(ms), {{2.0, 0.4}});
+  // A force equal to the one before continues it.
+  soon.command(ms, 2.0);
+  check(soon.advance(ms, 2 * ms, 0), {{2.0, 1.0}});
+  // 2.5 ms: forces commanded over the last two samples are in flight.
+  ActuatorSchedule late(2'500'000, ms);
+  late.command(0, 1.0);
+  check(late.advance(0, ms, 0), {{0.0, 1.0}});
+  late.command(ms, 2.0);
+  check(late.advance(ms, 2 * ms, 0), {{0.0, 1.0}});
+  check(late.lead(2 * ms), {{0.0, 0.5}, {1.0, 1.0}, {2.0, 1.0}});
+  check(late.advance(2 * ms, 3 * ms, 0), {{0.0, 0.5}, {1.0, 0.5}});
+  // The watchdog cuts the force 0.2 ms after the last command, before the
+  // command takes effect: zero from then on, and nothing in flight.
+  soon.command(2 * ms, 5.0);
+  check(soon.advance(2 * ms, 3 * ms, 200'000), {{2.0, 0.2}, {0.0, 0.8}});
+  check(soon.lead(3 * ms), {{0.0, 0.4}});
+}
+
+TEST_CASE(master_books_forces_in_flight_by_when_they_act) {
+  // A pure mass whose actuator applies each force 0.4 ms after it is
+  // commanded, under forces that change every sample. Told the delay, the
+  // master books what the actuator really did; taking each force to act at
+  // once, it credits each with the displacement the one before it caused.
+  WallParams far;
+  far.position = 10.0;
+  const Nanos d = 400'000;
+  double error[2];
+  for (const bool known : {true, false}) {
+    SimulatedSlave dev(0.2, 0.0, far, kNanosPerMilli, 10);
+    dev.set_actuation_delay(d);
+    MasterConfig cfg;
+    cfg.passivity = Passivity::kNone;
+    cfg.actuation_delay = known ? d : 0;
+    MasterController m(cfg);
+    for (int k = 0; k < 40; ++k) {
+      const Nanos now = k * kNanosPerMilli;
+      m.receive(k + 1, Sample{3.0 * std::sin(0.7 * k), 0.0, 0.0});
+      const auto s = m.step(now, dev.read_position(now));
+      dev.command_force(-s.display_force);
+    }
+    // The books' net input against the work the actuator did on the device.
+    error[known ? 0 : 1] =
+        m.port().input_energy() - m.port().output_energy() + dev.actuator_work();
+  }
+  CHECK(std::fabs(error[0]) < 1e-15);
+  CHECK(std::fabs(error[1]) > 1e-6);
 }
 
 TEST_CASE(master_displays_newest_sample_and_counts_every_energy) {
