@@ -19,6 +19,8 @@ add_executable(tuushin_tests
   test_stun.cpp
   test_turn.cpp
   test_hops.cpp
+  test_device_proto.cpp
+  test_fw_core.cpp
 )
-target_link_libraries(tuushin_tests PRIVATE tuushin)
+target_link_libraries(tuushin_tests PRIVATE tuushin_fw)
 add_test(NAME tuushin_tests COMMAND tuushin_tests)

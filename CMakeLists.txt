@@ -23,6 +23,7 @@ add_library(tuushin
   src/control/tdpa.cpp
   src/crypto/legacy_digest.cpp
   src/crypto/noise.cpp
+  src/device/proto.cpp
   src/net/channel.cpp
   src/net/clock_sync.cpp
   src/net/hops.cpp
@@ -71,6 +72,22 @@ endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(tuushin PRIVATE -Wall -Wextra -Wpedantic -Wshadow)
+endif()
+
+# The servo loop of a device's firmware (firmware/core), built for the host
+# as well: tuushin-devsim runs it on a simulated motor, and the tests drive
+# it. The ESP-IDF project in firmware/esp32 compiles the same sources.
+add_library(tuushin_fw
+  firmware/core/src/core.cpp
+  firmware/core/src/foc.cpp
+  firmware/core/src/plant.cpp
+)
+target_include_directories(tuushin_fw PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/firmware/core/include>
+)
+target_link_libraries(tuushin_fw PUBLIC tuushin)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  target_compile_options(tuushin_fw PRIVATE -Wall -Wextra -Wpedantic -Wshadow)
 endif()
 
 if(TUUSHIN_BUILD_TOOLS)
