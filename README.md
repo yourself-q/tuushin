@@ -302,7 +302,9 @@ a sequence number far ahead, it makes every genuine sample look stale
   newest it has answered, so once a newer one has arrived a recorded hello
   costs it neither a key exchange nor a reply. A copy of the current hello, even one that arrives ahead
   of the genuine one from another address, gets the very same reply, which
-  only the master can use.
+  only the master can use. With `--hello-state FILE` the slave keeps that
+  time on disk, written and synced before each reply goes out, so that a
+  restart does not make the hellos recorded before it new again.
 
 What it costs, measured on an Apple M4: 16 bytes per datagram (84 instead
 of 68 for one degree of freedom), 0.39 µs to seal and 0.39 µs to open one,
@@ -592,10 +594,13 @@ the slave kept sending to the master's port for the old relay.
 - **A flood of forged hellos costs the slave CPU** while it waits for a
   session: about 10 µs to reject each one. There is no cookie mechanism
   (WireGuard's answer to this under load).
-- The slave forgets the newest hello time when it restarts, so one recorded
-  hello can be answered once more afterwards (still without starting a
-  session). A master whose wall clock is set back is refused until it
-  passes the newest time the slave has seen.
+- Without `--hello-state`, the slave forgets the newest hello time when it
+  restarts: until the master's next hello, every hello recorded before can
+  be answered once more, oldest first (still without starting a session),
+  each holding one of the 16 waiting slots for up to 5 s. A master whose
+  wall clock is set back is refused until it passes the newest time the
+  slave has seen; with `--hello-state`, across restarts too, so delete the
+  file if a clock ran far ahead.
 - **Coarse encoders cost transparency.** With a 55 µm master encoder the
   teleoperator stays passive, but about half the force exact encoders
   convey reaches the operator, and it chatters more (Coarse encoders

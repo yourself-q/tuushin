@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -287,6 +288,7 @@ struct NodePair {
   MasterNodeReport master;
   std::vector<SlaveSessionReport> slave;
   std::vector<std::string> refusals;
+  std::vector<std::uint64_t> answered;  // hello times, as on_hello_answered saw them
 };
 
 // A short session over loopback between a master and a slave with the given
@@ -317,6 +319,10 @@ NodePair run_pair(std::optional<crypto::Key> master_psk, std::optional<crypto::K
   hooks.on_refused = [&](const std::string& why) {
     std::lock_guard<std::mutex> lock(mu);
     out.refusals.push_back(why);
+  };
+  hooks.on_hello_answered = [&](std::uint64_t stamp) {
+    std::lock_guard<std::mutex> lock(mu);
+    out.answered.push_back(stamp);
   };
   std::atomic<bool> stop{false};
   std::thread slave([&] { out.slave = run_slave_node(slave_sock, slave_dev, scfg, hooks, &stop); });
@@ -535,6 +541,40 @@ TEST_CASE(hellos_must_be_newer_and_copies_share_one_reply) {
   CHECK(r.master.authenticated);
   REQUIRE(r.slave.size() == 1);
   CHECK(r.slave[0].authenticated);
+  // Every answered hello was reported once, copies not again.
+  REQUIRE(r.answered.size() >= 3);
+  CHECK(r.answered[0] == 2000);
+  CHECK(r.answered[1] == 3000);
+  CHECK(std::adjacent_find(r.answered.begin(), r.answered.end(),
+                           [](std::uint64_t a, std::uint64_t b) { return a >= b; }) ==
+        r.answered.end());
+}
+
+TEST_CASE(a_slave_started_with_the_newest_hello_refuses_older_ones) {
+  // As after a restart with that time kept (tuushin-teleop --hello-state):
+  // a hello recorded before it is refused, a newer one answered.
+  net::UdpSocket slave_sock = bind_loopback();
+  const crypto::Key psk = crypto::random_key();
+  bool older = true, newer = false;
+  const auto r = run_pair(
+      psk, psk, 300 * kNanosPerMilli, kNanosPerSecond, slave_sock,
+      [&] {
+        net::UdpSocket a = bind_loopback();
+        const net::Endpoint slave_ep = peer_of(slave_sock);
+        const auto h1 = make_hello(psk, 0x201, hello_payload(2000));
+        a.send_to(slave_ep, h1.data(), h1.size());
+        older = is_reply(receive(a, 100 * kNanosPerMilli));
+        const auto h2 = make_hello(psk, 0x202, hello_payload(3000));
+        a.send_to(slave_ep, h2.data(), h2.size());
+        newer = is_reply(receive(a));
+      },
+      nullptr, [](SlaveNodeConfig& c) { c.newest_hello = 2500; });
+  CHECK(!older);
+  CHECK(newer);
+  CHECK(any_contains(r.refusals, "not newer"));
+  REQUIRE(r.answered.size() >= 2);
+  CHECK(r.answered[0] == 3000);
+  CHECK(r.master.authenticated);
 }
 
 TEST_CASE(a_copied_hello_ahead_of_the_master_does_not_take_its_place) {

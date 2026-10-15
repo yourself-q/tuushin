@@ -82,6 +82,8 @@ void usage() {
                "                           (not with reflect, which needs the coupling force)\n"
                "      --wall-k K           simulated wall stiffness in N/m (5000)\n"
                "      --log PREFIX         per-session CSV log PREFIX<session>.csv\n"
+               "      --hello-state FILE   keep the newest answered hello's time in FILE, so\n"
+               "                           that hellos recorded before a restart stay refused\n"
                "      --turn HOST[:PORT]   with --rendezvous: take a relay on this TURN server\n"
                "                           (port 3478) and announce it, for masters that\n"
                "                           cannot reach this end directly\n"
@@ -161,6 +163,7 @@ struct Options {
   double hold_after_ms = 150.0;
   bool contact_force = false;
   double wall_k = 5000.0;
+  std::string hello_state;
   std::string turn, turn_user, turn_pass_file;
   // emulation
   double delay_ms = 0.0, jitter_ms = 0.0, loss = 0.0;
@@ -307,6 +310,49 @@ std::optional<crypto::Key> load_key(const Options& o) {
                  o.key_file.c_str());
   }
   return key;
+}
+
+// The newest answered hello's time, kept across runs as one decimal number;
+// a missing file is a first run.
+std::uint64_t load_hello_state(const std::string& path) {
+  std::FILE* f = std::fopen(path.c_str(), "r");
+  if (!f) {
+    if (errno == ENOENT) return 0;
+    throw std::runtime_error("cannot open " + path + ": " + std::strerror(errno));
+  }
+  char text[64];
+  const std::size_t n = std::fread(text, 1, sizeof text - 1, f);
+  std::fclose(f);
+  text[n] = '\0';
+  char* end = nullptr;
+  errno = 0;
+  const unsigned long long v = std::strtoull(text, &end, 10);
+  if (text[0] < '0' || text[0] > '9' || errno != 0 || (*end != '\0' && std::strcmp(end, "\n") != 0)) {
+    throw std::runtime_error(path + " does not hold a hello time (one decimal number)");
+  }
+  return v;
+}
+
+// Replaces the file so that a crash leaves either the old time or the new
+// one, and returns only once the new one is on disk.
+void save_hello_state(const std::string& path, std::uint64_t stamp) {
+  const std::string tmp = path + ".tmp";
+  const std::string text = std::to_string(stamp) + "\n";
+  const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  bool ok = fd >= 0 && ::write(fd, text.data(), text.size()) == static_cast<ssize_t>(text.size()) &&
+            ::fsync(fd) == 0;
+  const int err = errno;
+  if (fd >= 0) ::close(fd);
+  ok = ok && std::rename(tmp.c_str(), path.c_str()) == 0;
+  if (!ok) throw std::runtime_error("cannot write " + path + ": " + std::strerror(ok ? errno : err));
+  // The rename is durable once its directory is.
+  const auto slash = path.find_last_of('/');
+  const std::string dir = slash == std::string::npos ? "." : path.substr(0, slash ? slash : 1);
+  const int dfd = ::open(dir.c_str(), O_RDONLY);
+  if (dfd >= 0) {
+    ::fsync(dfd);
+    ::close(dfd);
+  }
 }
 
 net::UdpSocket open_socket(const Options& o, const net::Endpoint& local) {
@@ -559,6 +605,10 @@ int run_slave(const Options& o) {
   cfg.once = o.once;
   cfg.log_prefix = o.log;
   cfg.psk = load_key(o);
+  if (!o.hello_state.empty()) {
+    if (!cfg.psk) throw std::runtime_error("--hello-state needs --key-file");
+    cfg.newest_hello = load_hello_state(o.hello_state);
+  }
   cfg.rendezvous = rendezvous_of(o, cfg.psk, sock);
   cfg.relay = relay_of(o, sock);
 
@@ -573,6 +623,9 @@ int run_slave(const Options& o) {
     hooks.emulation = [&](Nanos start) { return make_emulation(o, start, seed++); };
   }
   hooks.on_refused = [](const std::string& why) { std::fprintf(stderr, "%s\n", why.c_str()); };
+  if (!o.hello_state.empty()) {
+    hooks.on_hello_answered = [&](std::uint64_t stamp) { save_hello_state(o.hello_state, stamp); };
+  }
   hooks.on_rendezvous = [](const std::string& what) {
     std::fprintf(stderr, "rendezvous: %s\n", what.c_str());
   };
@@ -666,6 +719,7 @@ int main(int argc, char** argv) {
       else if (a == "--hold-after") o.hold_after_ms = parse_double(next(), "hold-after");
       else if (a == "--contact-force") o.contact_force = true;
       else if (a == "--wall-k") o.wall_k = parse_double(next(), "wall-k");
+      else if (a == "--hello-state") o.hello_state = next();
       else if (a == "--turn") o.turn = next();
       else if (a == "--turn-user") o.turn_user = next();
       else if (a == "--turn-pass-file") o.turn_pass_file = next();
@@ -681,6 +735,9 @@ int main(int argc, char** argv) {
     }
     if (o.mode != "slave" && !o.turn.empty()) {
       throw std::runtime_error("--turn is for the slave; the master reaches its relay");
+    }
+    if (o.mode != "slave" && !o.hello_state.empty()) {
+      throw std::runtime_error("--hello-state is for the slave, which answers hellos");
     }
     if (o.mode == "master") {
       if (o.host.empty() && o.rendezvous.empty()) {

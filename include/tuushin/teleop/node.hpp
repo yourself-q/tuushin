@@ -229,7 +229,9 @@ struct SlaveNodeConfig {
   // How long an answered hello waits for the master's first sealed sample.
   Nanos handshake_timeout = 5 * kNanosPerSecond;
   // Hellos at or before this wall-clock time (ns, as in hello_payload) are
-  // not answered; the newest answered one raises it as the node runs.
+  // not answered; the newest answered one raises it as the node runs. Kept
+  // across restarts (SlaveNodeHooks::on_hello_answered), it stops hellos
+  // recorded before the restart from being answered once more.
   std::uint64_t newest_hello = 0;
   // Register with a rendezvous server while idle, and punch towards every
   // master it announces; needs psk.
@@ -271,6 +273,11 @@ struct SlaveNodeHooks {
   // Called with what the rendezvous server said (this end's address as it
   // saw it, and every master it announced) and what became of the relay.
   std::function<void(const std::string&)> on_rendezvous;
+  // Called with the time of every hello the node answers, the newest so
+  // far, before the reply goes out: store it to start the next run with it
+  // as SlaveNodeConfig::newest_hello. An exception from it ends the node
+  // without the reply.
+  std::function<void(std::uint64_t)> on_hello_answered;
 };
 
 // Serves sessions one after the other until `stop` becomes true, or after

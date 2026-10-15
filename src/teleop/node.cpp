@@ -900,6 +900,7 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
             continue;
           }
           newest_hello = *stamp;
+          if (hooks.on_hello_answered) hooks.on_hello_answered(newest_hello);
           const auto msg2 = hs.write_message(&kNoPayload, 0);
           wire::Header rh;
           rh.type = wire::PacketType::kHelloReply;
