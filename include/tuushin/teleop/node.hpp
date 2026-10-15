@@ -211,7 +211,10 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
 
 struct SlaveNodeConfig {
   // control.passivity is the scheme the slave runs; sessions announcing
-  // another one are refused unless adopt_scheme is set.
+  // another one are refused unless adopt_scheme is set. A slave that
+  // reports the contact force refuses kReflective sessions, which cannot
+  // work with it (sim::SlaveParams), and does not start with that scheme
+  // unless it adopts the master's.
   SlaveConfig control;
   bool adopt_scheme = false;
   Nanos idle_timeout = kNanosPerSecond;

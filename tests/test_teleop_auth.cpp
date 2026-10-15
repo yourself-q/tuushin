@@ -3,6 +3,7 @@
 #include <cstring>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -291,10 +292,12 @@ struct NodePair {
 // A short session over loopback between a master and a slave with the given
 // keys. `before` runs once the slave is up, before the master starts.
 // `via`, if set, is where the master sends instead of the slave's socket.
+// `tweak`, if set, changes the slave's configuration.
 template <class Before>
 NodePair run_pair(std::optional<crypto::Key> master_psk, std::optional<crypto::Key> slave_psk,
                   Nanos duration, Nanos handshake_timeout, net::UdpSocket& slave_sock,
-                  Before&& before, const net::Endpoint* via = nullptr) {
+                  Before&& before, const net::Endpoint* via = nullptr,
+                  void (*tweak)(SlaveNodeConfig&) = nullptr) {
   net::UdpSocket master_sock = bind_loopback();
   const net::Endpoint slave_ep = via ? *via : peer_of(slave_sock);
   const Nanos period = kNanosPerMilli;
@@ -307,6 +310,7 @@ NodePair run_pair(std::optional<crypto::Key> master_psk, std::optional<crypto::K
   scfg.once = true;
   scfg.psk = slave_psk;
   scfg.handshake_timeout = handshake_timeout;
+  if (tweak) tweak(scfg);
   NodePair out;
   std::mutex mu;
   SlaveNodeHooks hooks;
@@ -386,6 +390,35 @@ TEST_CASE(nodes_authenticate_and_run_a_sealed_session) {
   CHECK(r.slave[0].link.unauthentic == 0);
   CHECK(r.refusals.empty());
   CHECK(r.master.max_position > 0.002);
+}
+
+TEST_CASE(slave_reporting_contact_force_refuses_energy_reflection) {
+  // Energy reflection needs the coupling force (sim::SlaveParams). A slave
+  // that adopts the master's scheme refuses such a session; one that would
+  // run it itself does not start.
+  net::UdpSocket slave_sock = bind_loopback();
+  const crypto::Key psk = crypto::random_key();
+  const auto r = run_pair(psk, psk, 300 * kNanosPerMilli, 300 * kNanosPerMilli, slave_sock, [] {},
+                          nullptr, [](SlaveNodeConfig& c) {
+                            c.control.passivity = Passivity::kChannel;
+                            c.control.report_contact_force = true;
+                            c.adopt_scheme = true;
+                          });
+  CHECK(!r.master.authenticated && !r.master.slave_answered);
+  CHECK(r.slave.empty());
+  CHECK(any_contains(r.refusals, "reports the contact force"));
+
+  SimulatedSlave slave_dev(1.0, 2.0, WallParams{}, kNanosPerMilli, 10, monotonic_now(), 0.0);
+  SlaveNodeConfig scfg;
+  scfg.control.passivity = Passivity::kReflective;
+  scfg.control.report_contact_force = true;
+  bool threw = false;
+  try {
+    run_slave_node(slave_sock, slave_dev, scfg);
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  CHECK(threw);
 }
 
 TEST_CASE(nodes_with_different_keys_never_start_a_session) {

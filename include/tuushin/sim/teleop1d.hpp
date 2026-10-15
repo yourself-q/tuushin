@@ -46,7 +46,13 @@ struct SlaveParams {
   // Report the measured contact force instead of the coupling force. The
   // coupling force is what a robot without a force sensor has (motor current),
   // and it is the conjugate of the commanded velocity, so TDPA's energy books
-  // describe the real slave port.
+  // describe the real slave port. With the contact force they describe a port
+  // the slave does not have: under kChannel without delay, where the coupling
+  // force keeps min_true_margin at 0, the default scenario then generates
+  // 4.7 J and runs into the force limit. kReflective cannot run with it at
+  // all: in free space the contact force is zero, so nothing the operator
+  // does puts energy in, and the slave, which needs energy to follow, never
+  // moves. run_teleop1d rejects that combination.
   bool report_contact_force = false;
   // Position-drift compensation gain in 1/s, 0 to disable. The slave adds
   // v_ad = drift_gain * (x_master_delayed - x_slave) to the received velocity

@@ -63,6 +63,7 @@ void usage() {
                "  --deadband K          perceptual deadband with Weber fraction K, both ways\n"
                "  --wall-k K            wall stiffness in N/m (5000)\n"
                "  --contact-force       slave reports contact force, not coupling force\n"
+               "                        (none and channel only)\n"
                "  --drift-gain G        position-drift compensation gain in 1/s (0 = off)\n"
                "  --drift-ref R         drift measured against 'cmd' (default) or 'slave'\n"
                "  --seed N              random seed (1)\n"

@@ -79,6 +79,7 @@ void usage() {
                "      --hold-after MS      stop extrapolating the master after MS without\n"
                "                           a sample (150)\n"
                "      --contact-force      report the contact force, not the coupling force\n"
+               "                           (not with reflect, which needs the coupling force)\n"
                "      --wall-k K           simulated wall stiffness in N/m (5000)\n"
                "      --log PREFIX         per-session CSV log PREFIX<session>.csv\n"
                "      --turn HOST[:PORT]   with --rendezvous: take a relay on this TURN server\n"
@@ -536,6 +537,10 @@ int run_master(const Options& o) {
 int run_slave(const Options& o) {
   if (!o.rendezvous.empty() && o.key_file.empty()) {
     throw std::runtime_error("--rendezvous needs --key-file");
+  }
+  if (o.contact_force && o.scheme == teleop::Passivity::kReflective && !o.adopt) {
+    throw std::runtime_error(
+        "--contact-force needs --scheme channel or none: reflect needs the coupling force");
   }
   net::UdpSocket sock = open_listening(o, o.port.value_or(kDefaultPort));
   const Nanos period = period_of(o);

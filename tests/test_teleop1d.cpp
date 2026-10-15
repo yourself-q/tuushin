@@ -1,6 +1,7 @@
 #include <cmath>
 #include <iterator>
 #include <memory>
+#include <stdexcept>
 
 #include "test.hpp"
 #include "tuushin/net/channel.hpp"
@@ -94,6 +95,28 @@ TEST_CASE(teleop_reflective_tdpa_renders_a_stiffer_wall_than_channel_tdpa) {
     CHECK(r.displayed_stiffness > 2.0 * c.displayed_stiffness);
     CHECK(r.pos_rmse < c.pos_rmse);
   }
+}
+
+TEST_CASE(teleop_contact_force_reports_need_a_scheme_that_can_use_them) {
+  // The coupling force is the conjugate of the commanded velocity and the
+  // contact force is not, so with the contact force the conventional books
+  // miss what the coupling does: even without delay the teleoperator then
+  // generates energy. Energy reflection cannot run with it at all.
+  sim::Teleop1DConfig cfg;
+  cfg.passivity = Passivity::kChannel;
+  CHECK(run(cfg, 0).min_true_margin > -1e-9);
+  cfg.slave.report_contact_force = true;
+  const auto r = run(cfg, 0);
+  CHECK(!r.diverged);
+  CHECK(r.min_true_margin < -1.0);
+  cfg.passivity = Passivity::kReflective;
+  bool threw = false;
+  try {
+    run(cfg, 0);
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  CHECK(threw);
 }
 
 TEST_CASE(teleop_tdpa_with_jitter_and_loss_stays_passive) {

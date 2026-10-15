@@ -145,7 +145,8 @@ struct SlaveConfig {
   double kp = 2000.0;  // N/m, position coupling to the command
   double kd = 60.0;    // N s/m, velocity coupling to the command
   // Report the measured contact force instead of the coupling force. See
-  // sim::SlaveParams for why the coupling force is the default.
+  // sim::SlaveParams for why the coupling force is the default; kReflective
+  // cannot work with it, and the constructor rejects the combination.
   bool report_contact_force = false;
   // kChannel only: position-drift compensation gain in 1/s, 0 to disable,
   // and what the drift is measured against (sim::SlaveParams).

@@ -1,6 +1,7 @@
 #include "tuushin/teleop/controller.hpp"
 
 #include <algorithm>
+#include <stdexcept>
 
 namespace tuushin::teleop {
 
@@ -106,7 +107,13 @@ SlaveController::SlaveController(const SlaveConfig& cfg, double position)
       enc_(cfg.deadband_params),
       x_sampled_(position),
       x_cmd_(position),
-      x_master_est_(position) {}
+      x_master_est_(position) {
+  if (cfg.passivity == Passivity::kReflective && cfg.report_contact_force) {
+    throw std::invalid_argument(
+        "SlaveController: energy reflection needs the coupling force reported, not the contact "
+        "force");
+  }
+}
 
 void SlaveController::receive(std::uint32_t seq, const Sample& s) {
   if (cfg_.passivity == Passivity::kReflective) {

@@ -686,6 +686,12 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
                                                const SlaveNodeConfig& cfg,
                                                const SlaveNodeHooks& hooks,
                                                const std::atomic<bool>* stop) {
+  if (cfg.control.passivity == Passivity::kReflective && cfg.control.report_contact_force &&
+      !cfg.adopt_scheme) {
+    throw std::invalid_argument(
+        "run_slave_node: energy reflection needs the coupling force reported, not the contact "
+        "force");
+  }
   socket.enable_rx_timestamps();
   std::vector<SlaveSessionReport> reports;
   std::vector<std::uint8_t> buf(wire::kMaxDatagram + 1);
@@ -846,6 +852,12 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
         if (*scheme != cfg.control.passivity && !cfg.adopt_scheme) {
           refuse(h->session, "session from " + from.to_string() +
                                  " runs another passivity scheme; refused");
+          continue;
+        }
+        if (*scheme == Passivity::kReflective && cfg.control.report_contact_force) {
+          refuse(h->session, "session from " + from.to_string() +
+                                 " runs energy reflection, which needs the coupling force, but "
+                                 "this slave reports the contact force; refused");
           continue;
         }
         const std::uint8_t* const payload = buf.data() + wire::kHeaderSize;
