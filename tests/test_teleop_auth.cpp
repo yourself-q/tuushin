@@ -630,3 +630,67 @@ TEST_CASE(a_copied_hello_ahead_of_the_master_does_not_take_its_place) {
   CHECK(r.slave[0].session == r.master.session);
   CHECK(r.slave[0].master == relay_ep);
 }
+
+TEST_CASE(late_copies_of_the_handshake_are_not_foreign_to_the_session) {
+  // A path that holds the first datagram each way for 120 ms. The master
+  // resends its hello every 50 ms meanwhile, and the session starts on the
+  // copies, so the held hello and the held reply arrive during it: they
+  // are the session's own handshake, not foreign datagrams.
+  net::UdpSocket slave_sock = bind_loopback();
+  net::UdpSocket relay = bind_loopback();
+  const net::Endpoint slave_ep = peer_of(slave_sock), relay_ep = peer_of(relay);
+  std::atomic<bool> stop{false};
+  std::atomic<int> held{0};
+  std::thread tap([&] {
+    struct Held {
+      Nanos release;
+      net::Endpoint to;
+      std::vector<std::uint8_t> bytes;
+    };
+    std::vector<Held> queue;
+    std::optional<net::Endpoint> master;
+    bool held_up = false, held_down = false;
+    std::vector<std::uint8_t> buf(wire::kMaxDatagram + 1);
+    while (!stop.load()) {
+      relay.wait_readable(kNanosPerMilli);
+      const Nanos now = monotonic_now();
+      for (auto it = queue.begin(); it != queue.end();) {
+        if (it->release > now) {
+          ++it;
+          continue;
+        }
+        relay.send_to(it->to, it->bytes.data(), it->bytes.size());
+        it = queue.erase(it);
+      }
+      for (;;) {
+        net::Endpoint from;
+        const auto n = relay.recv_from(buf.data(), buf.size(), &from);
+        if (!n) break;
+        const bool up = from != slave_ep;
+        if (up) master = from;
+        if (!master) continue;
+        const net::Endpoint to = up ? slave_ep : *master;
+        bool& done = up ? held_up : held_down;
+        if (!done) {
+          done = true;
+          ++held;
+          queue.push_back({now + 120 * kNanosPerMilli, to,
+                           std::vector<std::uint8_t>(buf.data(), buf.data() + *n)});
+          continue;
+        }
+        relay.send_to(to, buf.data(), *n);
+      }
+    }
+  });
+  const crypto::Key psk = crypto::random_key();
+  const auto r =
+      run_pair(psk, psk, 400 * kNanosPerMilli, kNanosPerSecond, slave_sock, [] {}, &relay_ep);
+  stop.store(true);
+  tap.join();
+  CHECK(held.load() == 2);
+  CHECK(r.master.authenticated);
+  REQUIRE(r.slave.size() == 1);
+  CHECK(r.slave[0].authenticated);
+  CHECK(r.master.link.foreign == 0);
+  CHECK(r.slave[0].link.foreign == 0);
+}
