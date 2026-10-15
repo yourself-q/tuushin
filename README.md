@@ -440,6 +440,47 @@ instead of 88 % of the contact force at 10 ms. Coarse encoders generated
 nothing in all of these but one, 11 mJ for the slave at 2 ms believed
 1.5 ms at 100 ms.
 
+Or estimated. Given the longest delay a device may have
+(`MasterConfig::actuation_delay_max`, the same for the slave), a
+controller runs a bank of device models, one per candidate delay
+62.5 µs apart, fed the same readings and commands, and scores each by
+how well it predicts the readings (`teleop::DeviceModel`: the prediction
+error method, run as multiple-model adaptive estimation). Two things
+stood in the way. A hand's damping answers a force at once, so a model
+of the device as a bare mass takes it for an earlier actuation: from a
+55 µm encoder 2 ms looked like 1.4 ms, 1 ms like 0.6 ms. Each candidate
+therefore estimates the damping and stiffness holding the device along
+with H (`control::HeldDeviceFilter`, an extended Kalman filter). And a
+delay taken too short costs far more than one taken too long: held at a
+fixed belief, a coarse master with 2 ms at 10 ms generated energy
+believing 1 ms or less, and none believing 1.25, 1.8–2.2 or 3–4 ms. So
+the controller uses not the best-scoring delay but the longest the
+readings cannot tell from it (a likelihood ratio test at 95 %). It
+starts from the maximum, takes a longer delay at once and a shorter one
+only after the readings have kept to it for 0.1 s: without that, a
+contact dropped a slave's 2 ms to 0 for 20 ms, and the teleoperator
+generated 2 mJ.
+
+The same runs with both controllers estimating, from 0 to 4 ms
+(`tuushin-sim --estimate-actuation-delay 4`):
+
+| delay | coarse: worst true margin | estimate at the end | exact: worst true margin | estimate |
+|---|---|---|---|---|
+| none | — | — | 0 J | 0 ms |
+| master 1 ms | 0 J | 0.75–1.44 ms | 0 J | 1 ms |
+| master 2 ms | 0 J | 1.81–2.5 ms | −7.3e−5 J | 2 ms |
+| slave 1 ms | 0 J | 0.94–4 ms | 0 J | 1 ms |
+| slave 2 ms | 0 J | 1.94–4 ms | 0 J | 2 ms |
+
+With exact readings the estimates are the delays, and what is left is
+the model error of a told delay (−1.2e−4 J for the master at 2 ms).
+Coarse estimates land up to 0.25 ms short and 0.5 ms long, and in some
+motions at 10 and 50 ms the slave's stayed at 4 ms, its readings never
+telling the candidates apart: nothing was generated. The long side
+costs a little transparency: a coarse master with 2 ms conveyed 66, 12
+and 8 % of the contact force instead of the 78, 14 and 9 % it conveys
+told the delay.
+
 ## Authentication
 
 Without a key, anyone who can send datagrams to the slave's port can drive
@@ -784,10 +825,13 @@ the slave kept sending to the master's port for the old relay.
   generated 0.19 mJ (Model mismatch above). Coarse encoders, whose
   misses show among the innovations, generated nothing on the same
   devices.
-- **The actuation delay has to be known**, to about a tenth of a
-  millisecond with exact readings (Actuation delay above). Nothing
-  measures it; a device's driver or datasheet has to supply it, and a
-  delay that varies from command to command is not modelled.
+- **The actuation delay is estimated on simulated hands only.** Their
+  impedance is constant; a real grip changes, and the filters let the
+  damping and stiffness drift at a rate (a grip that changes over
+  seconds) that no simulation has tested. The estimate needs the device
+  to move under changing forces: until then it stays at the maximum,
+  which holds the forces back. A delay that varies from command to
+  command is not modelled (Actuation delay above).
 - **Simulated devices only, one degree of freedom.** `teleop::Device1D` is
   the interface a real device will implement.
 - **Only the slave takes a relay, over UDP.** One relay is enough to cross

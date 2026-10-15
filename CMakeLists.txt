@@ -17,6 +17,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_library(tuushin
   src/time.cpp
+  src/control/held_device.cpp
   src/control/predictive_pc.cpp
   src/control/reflection.cpp
   src/control/tdpa.cpp

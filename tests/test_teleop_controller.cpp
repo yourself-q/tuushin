@@ -2,6 +2,8 @@
 #include <vector>
 
 #include "test.hpp"
+#include "tuushin/control/held_device.hpp"
+#include "tuushin/rng.hpp"
 #include "tuushin/teleop/controller.hpp"
 #include "tuushin/teleop/device.hpp"
 
@@ -273,6 +275,67 @@ TEST_CASE(master_books_forces_in_flight_by_when_they_act) {
   }
   CHECK(std::fabs(error[0]) < 1e-15);
   CHECK(std::fabs(error[1]) > 1e-6);
+}
+
+TEST_CASE(held_device_filter_finds_the_hands_damping_and_stiffness) {
+  // A 0.2 kg device with 0.5 N s/m of damping of its own, held in place by
+  // a 5 N s/m, 300 N/m hand and pushed by random force steps: the filter
+  // finds the 5.5 N s/m and 300 N/m acting on it from exact readings, and
+  // within a few percent from a 55 um encoder's.
+  OperatorParams op;
+  op.ref_amplitude = 0.0;
+  for (const double q : {0.0, 55e-6}) {
+    SimulatedMaster dev(0.2, 0.5, op, kNanosPerMilli, 10);
+    dev.set_encoder_resolution(q);
+    control::HeldDeviceFilter f(0.2, 1e-3, q, 20.0);
+    Rng rng(1);
+    double x = dev.read_position(0), phi = 0.0;
+    for (int k = 1; k <= 3000; ++k) {
+      const double now = dev.read_position(k * kNanosPerMilli);
+      f.observe(now - x, {{phi, 1.0}}, 1e-3);
+      x = now;
+      if (k % 20 == 0) phi = rng.normal();
+      dev.command_force(-phi);
+    }
+    CHECK_NEAR(f.damping(), 5.5, q > 0.0 ? 0.2 : 0.01);
+    CHECK_NEAR(f.stiffness(), 300.0, q > 0.0 ? 10.0 : 0.5);
+  }
+}
+
+TEST_CASE(master_estimates_the_actuation_delay) {
+  // A device that applies each force 1 or 2 ms after it is commanded, held
+  // by a hand that moves it 4 cm at 0.5 Hz, under random force steps. The
+  // master starts from the longest candidate delay, 4 ms, and finds the
+  // device's from exact readings within half a second. From a 55 um
+  // encoder's it ends within a grid step (62.5 us) below it or 0.25 ms
+  // above: the side to err on, as a delay taken too short lets the PC
+  // spend energy the device has not yet received.
+  OperatorParams op;
+  for (const double q : {0.0, 55e-6}) {
+    for (const double ms : {1.0, 2.0}) {
+      SimulatedMaster dev(0.2, 0.5, op, kNanosPerMilli, 10);
+      dev.set_encoder_resolution(q);
+      dev.set_actuation_delay(from_millis(ms));
+      MasterConfig cfg;
+      cfg.passivity = Passivity::kNone;
+      cfg.encoder_resolution = q;
+      cfg.actuation_delay = from_millis(4.0);
+      cfg.actuation_delay_max = from_millis(4.0);
+      MasterController m(cfg);
+      Rng rng(1);
+      double phi = 0.0;
+      for (int k = 0; k <= 3000; ++k) {
+        const Nanos now = k * kNanosPerMilli;
+        if (k % 20 == 0) phi = rng.normal();
+        m.receive(k + 1, Sample{phi, 0.0, 0.0});
+        const auto s = m.step(now, dev.read_position(now));
+        dev.command_force(-s.display_force);
+        if (q == 0.0 && k >= 500) CHECK(m.actuation_delay() == from_millis(ms));
+      }
+      CHECK(m.actuation_delay() >= from_millis(ms - 0.0625));
+      CHECK(m.actuation_delay() <= from_millis(ms + 0.25));
+    }
+  }
 }
 
 TEST_CASE(master_displays_newest_sample_and_counts_every_energy) {

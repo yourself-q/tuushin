@@ -474,3 +474,44 @@ TEST_CASE(teleop_reflective_tdpa_pays_for_the_forces_in_flight) {
     }
   }
 }
+
+TEST_CASE(teleop_reflective_tdpa_estimates_the_forces_in_flight) {
+  // The devices of the test above, with the controllers not told their
+  // delays but estimating them from 0-4 ms (teleop::DeviceModel). From
+  // exact readings both find them, and the teleoperator stays as passive
+  // as with them told. With coarse encoders the master's estimate ends up
+  // to 0.375 ms long, and at 10 ms the slave's stays at 4 ms, its readings
+  // never telling it from 2 ms: long, the side that holds the forces back,
+  // and the teleoperator generates nothing.
+  struct Lag {
+    Nanos delay, jitter;
+  };
+  for (const Lag lag : {Lag{from_millis(1.0), from_millis(0.2)}, Lag{from_millis(2.0), 0}}) {
+    for (int ms : {10, 50, 100}) {
+      sim::Teleop1DConfig cfg;
+      cfg.passivity = Passivity::kReflective;
+      cfg.master.actuation_delay = lag.delay;
+      cfg.slave.actuation_delay = lag.delay;
+      cfg.sample_jitter = lag.jitter;
+      cfg.master_actuation_delay_max = cfg.slave_actuation_delay_max = from_millis(4.0);
+      const auto r = run(cfg, from_millis(ms));
+      CHECK(!r.diverged);
+      CHECK(r.master_actuation_delay == lag.delay);
+      CHECK(r.slave_actuation_delay == lag.delay);
+      CHECK(r.min_true_margin > -5e-5);
+      CHECK(r.max_book_excess < 1e-5);
+    }
+  }
+  for (int ms : {10, 50, 100}) {
+    auto cfg = coarse(0.5, 0.04);
+    cfg.master.actuation_delay = from_millis(2.0);
+    cfg.slave.actuation_delay = from_millis(2.0);
+    cfg.master_actuation_delay_max = cfg.slave_actuation_delay_max = from_millis(4.0);
+    const auto r = run(cfg, from_millis(ms));
+    CHECK(!r.diverged);
+    CHECK(r.master_actuation_delay >= from_millis(2.0));
+    CHECK(r.slave_actuation_delay >= from_millis(2.0));
+    CHECK(r.max_book_excess < 1e-12);
+    CHECK(r.min_true_margin > -1e-9);
+  }
+}

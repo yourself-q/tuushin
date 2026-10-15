@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "tuushin/codec/deadband.hpp"
+#include "tuushin/control/held_device.hpp"
 #include "tuushin/control/predictive_pc.hpp"
 #include "tuushin/control/reflection.hpp"
 #include "tuushin/control/tdpa.hpp"
@@ -73,6 +74,65 @@ class ActuatorSchedule {
   std::deque<std::pair<Nanos, double>> pending_;  // effective time, force
 };
 
+// The device model a controller books and predicts with, and the schedule
+// of the commands it issued. With the actuation delay known, one of each.
+// With it unknown, a bank of them, one per candidate delay on a grid, all
+// fed the same samples and commands: each candidate's model, wrong by the
+// forces it times wrongly, predicts the displacements the worse the further
+// its delay is from the device's (the prediction error method, run as a
+// bank: multiple-model adaptive estimation). The candidates score with a
+// HeldDeviceFilter each, which estimates the hand's damping and stiffness
+// along with the delay, as a hand's damping otherwise passes for an earlier
+// actuation; their force walks are adapted together.
+//
+// The controller uses the longest delay whose score the readings cannot
+// tell from the best one's (a likelihood-ratio confidence set), not the
+// best one itself: taken too short, the delay lets the PC spend energy the
+// device has yet to receive, and on a simulated 0.2 kg device under a hand
+// a 2 ms delay taken as 0-1 ms made it active, while 1.25-4 ms did not;
+// the best score alone wandered to 0.3 ms within the first half second.
+// In the simulated teleoperator, from a 55 um encoder the estimates ended
+// up to 0.25 ms short and 0.5 ms long, a slave's at the 4 ms maximum in
+// some motions, whose readings never told the candidates apart; from an
+// exact encoder, on the delay.
+class DeviceModel {
+ public:
+  // `delay` is the actuation delay, or with `max_delay` > 0 the guess the
+  // estimate starts from; the candidates then lie `step` apart from 0 to
+  // max_delay.
+  DeviceModel(double mass, Nanos dt, double resolution, double force_rate, bool adapt_force_rate,
+              Nanos delay, Nanos max_delay = 0, Nanos step = 0);
+
+  // Books and observes the sample from `from` to `now` in which the encoder
+  // saw the displacement dx (h = its length in s), and sets the forces in
+  // flight as the predictor's lead. Returns the work the port forces did
+  // on the two-port over it (positive = in), as the predictor in use
+  // splits it. `cut_after` as in MasterController::step.
+  double book_and_observe(Nanos from, Nanos now, double dx, double h, Nanos cut_after);
+  void command(Nanos now, double phi);
+
+  const control::DevicePredictor& predictor() const { return bank_[best_].dev; }
+  // The delay the predictor in use assumes: the estimate, if it is estimated.
+  Nanos actuation_delay() const { return bank_[best_].delay; }
+
+ private:
+  struct Candidate {
+    Nanos delay;
+    ActuatorSchedule actuator;
+    control::DevicePredictor dev;
+    control::HeldDeviceFilter id;
+    double score = 0.0;  // running mean of the squared innovation, m^2
+    double miss = 0.0;   // the last sample's squared innovation, m^2
+  };
+  std::vector<Candidate> bank_;
+  std::size_t best_ = 0;
+  long n_scored_ = 0;  // samples scored so far
+  double shorter_for_ = 0.0;  // s the readings have kept to a shorter delay
+  double dt_;  // s
+  bool adapt_;
+  double log_walk_ = 0.0;  // log of the factor on the filters' force walk
+};
+
 struct MasterConfig {
   Nanos dt = kNanosPerMilli;  // sample period
   Passivity passivity = Passivity::kReflective;
@@ -112,6 +172,11 @@ struct MasterConfig {
   // books then credit each force with the displacement while it acted, and
   // the predictive PC pays for the forces in flight before the new one.
   Nanos actuation_delay = 0;
+  // With a positive maximum the delay is estimated online instead, between
+  // 0 and the maximum on a grid of the given step (dt / 16 for 0), with
+  // actuation_delay as the first guess (DeviceModel).
+  Nanos actuation_delay_max = 0;
+  Nanos actuation_delay_step = 0;
 };
 
 class MasterController {
@@ -157,14 +222,16 @@ class MasterController {
   bool has_slave_sample() const { return has_value_; }
   // Energy books at the master device port (power into the teleoperator).
   const control::EnergyPort& port() const { return port_; }
+  // The actuation delay the controller books and predicts with: the
+  // configured one, or its estimate.
+  Nanos actuation_delay() const { return model_.actuation_delay(); }
   std::uint64_t samples_sent() const { return sent_; }
 
  private:
   MasterConfig cfg_;
   double dt_;
   control::EnergyPort port_;
-  control::DevicePredictor dev_;
-  ActuatorSchedule actuator_;
+  DeviceModel model_;
   codec::DeadbandEncoder<1> enc_;
   bool first_ = true;
   Nanos last_now_ = 0;
@@ -218,6 +285,8 @@ struct SlaveConfig {
   Nanos hold_after = 0;
   // As in MasterConfig.
   Nanos actuation_delay = 0;
+  Nanos actuation_delay_max = 0;
+  Nanos actuation_delay_step = 0;
 };
 
 class SlaveController {
@@ -257,6 +326,7 @@ class SlaveController {
   // kReflective: the store. kNone and kChannel: the channel end at the slave.
   const control::ReflectiveStore& store() const { return store_; }
   const control::EnergyPort& channel_port() const { return port_; }
+  Nanos actuation_delay() const { return model_.actuation_delay(); }
   std::uint64_t samples_sent() const { return sent_; }
 
  private:
@@ -264,8 +334,7 @@ class SlaveController {
   double dt_;
   control::EnergyPort port_;
   control::ReflectiveStore store_;
-  control::DevicePredictor dev_;
-  ActuatorSchedule actuator_;
+  DeviceModel model_;
   codec::DeadbandEncoder<1> enc_;
   double x_sampled_;
   double x_cmd_;

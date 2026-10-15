@@ -161,6 +161,13 @@ struct Teleop1DConfig {
   // (MasterParams::actuation_delay), 0 takes every force to act at once.
   Nanos master_model_actuation_delay = -1;
   Nanos slave_model_actuation_delay = -1;
+  // With a positive maximum the controller estimates its device's delay
+  // online instead (teleop::DeviceModel), up to the maximum, starting from
+  // the model delay above as its guess, or if that is negative from the
+  // maximum: the safe side, as a delay taken too long only holds the force
+  // back while one taken too short lets the PC spend early.
+  Nanos master_actuation_delay_max = 0;
+  Nanos slave_actuation_delay_max = 0;
   bool forward_deadband = false;
   codec::DeadbandParams forward_deadband_params{0.1, 0.002, from_millis(100)};
   bool backward_deadband = false;
@@ -228,6 +235,10 @@ struct Teleop1DResult {
   // the channel's net energy. Not computed for kReflective, whose coupling
   // sits inside the two-port.
   double min_channel_margin = 0.0;  // J
+  // The actuation delays the controllers ended with: the model delays, or
+  // their estimates.
+  Nanos master_actuation_delay = 0;
+  Nanos slave_actuation_delay = 0;
 };
 
 Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forward,

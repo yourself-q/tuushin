@@ -60,6 +60,8 @@ void usage() {
                "  --master-actuation-delay-ms D  delay before a master force takes effect\n"
                "  --slave-actuation-delay-ms D   the same for the slave\n"
                "  --actuation-delay-unknown  controllers take every force to act at once\n"
+               "  --estimate-actuation-delay MAX  controllers estimate their devices' delays\n"
+               "                        online, from 0 to MAX ms\n"
                "  --sample-jitter-ms J  each end samples up to J off its 1 ms grid (< 0.5)\n"
                "  --pc-hold N           samples a PC force must stay affordable if held (2)\n"
                "  --master-encoder Q    master encoder resolution in m (0 = exact)\n"
@@ -159,6 +161,10 @@ Options parse(int argc, char** argv) {
       o.cfg.master_model_actuation_delay = 0;
       o.cfg.slave_model_actuation_delay = 0;
     }
+    else if (a == "--estimate-actuation-delay") {
+      o.cfg.master_actuation_delay_max = o.cfg.slave_actuation_delay_max =
+          from_millis(std::stod(next()));
+    }
     else if (a == "--force-rate") o.cfg.force_rate = std::stod(next());
     else if (a == "--fixed-force-rate") o.cfg.adapt_force_rate = false;
     else if (a == "--pc-confidence") o.cfg.pc_confidence = std::stod(next());
@@ -232,6 +238,8 @@ void print_result(const sim::Teleop1DResult& r) {
   std::printf("min_passivity_margin   %.6g J\n", r.min_passivity_margin);
   std::printf("min_true_margin        %.6g J\n", r.min_true_margin);
   std::printf("max_book_excess        %.6g J\n", r.max_book_excess);
+  std::printf("master_actuation_delay %.4f ms\n", to_seconds(r.master_actuation_delay) * 1e3);
+  std::printf("slave_actuation_delay  %.4f ms\n", to_seconds(r.slave_actuation_delay) * 1e3);
   std::printf("min_channel_margin     %.6g J\n", r.min_channel_margin);
   std::printf("max_master_pos         %.4f m\n", r.max_master_pos);
   std::printf("max_display_force      %.3f N\n", r.max_display_force);
