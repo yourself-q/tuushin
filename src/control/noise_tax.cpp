@@ -2,11 +2,23 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace tuushin::control {
 
 namespace {
+
+// Bad arguments: an exception where there are exceptions, else (the
+// firmware, built without them) an abort. The firmware checks its own.
+[[noreturn]] void fail(const char* what) {
+#if defined(__cpp_exceptions)
+  throw std::invalid_argument(what);
+#else
+  (void)what;
+  std::abort();
+#endif
+}
 
 constexpr double kPi = 3.14159265358979323846;
 
@@ -57,7 +69,7 @@ double fourier_bias(double sigma) {
 
 DitherBounds dither_bounds(double lo, double hi) {
   if (!(lo >= 0.0) || !(hi >= lo)) {
-    throw std::invalid_argument("dither_bounds: need 0 <= lo <= hi");
+    fail("dither_bounds: need 0 <= lo <= hi");
   }
   DitherBounds d;
   d.bias = lo < kLast * kStep ? interpolate(kBias, lo) : kBias[kLast];
@@ -74,8 +86,9 @@ NoiseTax::NoiseTax(double bias, double proxy, double delta, double force_scale)
       log_delta2_(2.0 * std::log(1.0 / delta)) {
   if (!(bias >= 0.0) || !(proxy > 0.0) || !(delta > 0.0 && delta < 1.0) ||
       !(force_scale > 0.0)) {
-    throw std::invalid_argument("NoiseTax: need bias >= 0, proxy > 0, 0 < delta < 1, force_scale > 0");
+    fail("NoiseTax: need bias >= 0, proxy > 0, 0 < delta < 1, force_scale > 0");
   }
+  u0_ = bound(0.0);
 }
 
 double NoiseTax::bound(double v) const {
@@ -88,13 +101,19 @@ double NoiseTax::open() {
   opened_ = true;
   peak_ = v_;
   paid_ = bound(peak_);
+  planned_valid_ = false;
   return paid_;
 }
 
-double NoiseTax::slope(double v) const {
+NoiseTax::Tangent NoiseTax::tangent(double x) const {
   // U'(V) = (log((V + rho) / rho) + 2 log(1 / delta) + 1) / (2 U(V)).
-  const double w = v + rho_;
-  return (std::log(w / rho_) + log_delta2_ + 1.0) / (2.0 * bound(v));
+  const double w = x + rho_;
+  const double a = std::log(w / rho_) + log_delta2_;
+  Tangent t;
+  t.x = x;
+  t.u = std::sqrt(w * a);
+  t.du = (a + 1.0) / (2.0 * t.u);
+  return t;
 }
 
 double NoiseTax::charge(double prev, double phi) {
@@ -103,15 +122,24 @@ double NoiseTax::charge(double prev, double phi) {
   // The bias part: 2 bias per newton by which |phi| grows.
   const double kept = phi * prev > 0.0 ? std::fabs(prev) : 0.0;
   out += 2.0 * bias_ * std::max(0.0, std::fabs(phi) - kept);
+  // V* = V + s^2 phi^2 after the change, from V* before it with prev, as
+  // plan() computes it.
   const double s2 = proxy_ * proxy_;
+  const double reserved = v_ + s2 * prev * prev + 2.0 * s2 * phi * (phi - prev);
   v_ += s2 * (phi - prev) * (phi - prev);
-  const double reserved = v_ + s2 * phi * phi;
   if (reserved > peak_) {
     peak_ = reserved;
-    const double u = bound(peak_);
-    out += u - paid_;
-    paid_ = u;
+    // On the plan's tangent only where the plan has the change pay on it:
+    // a fall reaches no new peak but by rounding, and pays nothing there.
+    const bool planned = planned_valid_ && prev == planned_prev_ && phi * (phi - prev) > 0.0;
+    const double u = planned ? planned_.u + planned_.du * (reserved - planned_.x)
+                             : bound(reserved);
+    if (u > paid_) {
+      out += u - paid_;
+      paid_ = u;
+    }
   }
+  planned_valid_ = false;
   return out;
 }
 
@@ -120,26 +148,34 @@ double NoiseTax::cost(double prev, double phi) const {
   const double kept = phi * prev > 0.0 ? std::fabs(prev) : 0.0;
   double out = 2.0 * bias_ * std::max(0.0, std::fabs(phi) - kept);
   const double s2 = proxy_ * proxy_;
-  const double reserved = v_ + s2 * (phi - prev) * (phi - prev) + s2 * phi * phi;
-  if (reserved > peak_) out += bound(reserved) - bound(peak_);
+  const double reserved = v_ + s2 * prev * prev + 2.0 * s2 * phi * (phi - prev);
+  if (reserved > peak_) out += std::max(0.0, bound(reserved) - base());
   return out;
 }
 
-ChangeTax NoiseTax::plan() const { return {2.0 * bias_, proxy_ * proxy_ * slope(peak_), 0.0}; }
+ChangeTax NoiseTax::plan() const {
+  if (at_peak_.x != peak_) at_peak_ = tangent(peak_);
+  return {2.0 * bias_, proxy_ * proxy_ * at_peak_.du, 0.0};
+}
 
 ChangeTax NoiseTax::plan(double prev, double target) const {
   // A change to phi moves V* from v_ + s^2 prev^2 by d = 2 s^2 phi (phi -
   // prev), and U(V*) - U(peak) <= U(x) + U'(x) (V* - x) - U(peak) for every
   // x: with x the V* of the target, at most fixed + U'(x) d, fixed =
   // U(x) - U(peak) - U'(x) (x - v_ - s^2 prev^2) where that is positive.
+  // The charges are made against what was charged, which is at least
+  // U(peak).
   const double s2 = proxy_ * proxy_;
   const double from = v_ + s2 * prev * prev;
   const double d = 2.0 * s2 * target * (target - prev);
   const double x = from + d;
+  planned_valid_ = false;
   if (!(x > peak_)) return plan();
-  const double du = slope(x);
-  const double fixed = std::max(0.0, bound(x) - bound(peak_) - du * d);
-  return {2.0 * bias_, s2 * du, fixed};
+  planned_ = tangent(x);
+  planned_prev_ = prev;
+  planned_valid_ = true;
+  const double fixed = std::max(0.0, planned_.u - base() - planned_.du * d);
+  return {2.0 * bias_, s2 * planned_.du, fixed};
 }
 
 }  // namespace tuushin::control

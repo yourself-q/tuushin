@@ -147,8 +147,9 @@ TEST_CASE(noise_tax_plan_bounds_every_charge) {
 }
 
 // The plan on the tangent at a target bounds every change too, the more
-// tightly the nearer the change is to its target, and is exact there; cost()
-// is what charge() returns.
+// tightly the nearer the change is to its target, and is exact there. The
+// change is charged on that tangent: what cost() says at the target and
+// for a fall, and between cost() and the plan elsewhere.
 TEST_CASE(noise_tax_plan_at_a_target_bounds_every_charge_and_meets_it_there) {
   Rng rng(9);
   NoiseTax tax(0.003, 0.58, 1e-3, 0.25);
@@ -168,9 +169,19 @@ TEST_CASE(noise_tax_plan_at_a_target_bounds_every_charge_and_meets_it_there) {
       CHECK(c <= most + most * 1e-12 + tax.charged() * 1e-14);
       if (j == 0 && plan.fixed > 0.0) CHECK_NEAR(most, c, 1e-12 * (1.0 + c));
     }
-    const double phi = rng.uniform() < 0.3 ? 0.0 : target;
-    const double expected = tax.cost(prev, phi);
-    CHECK_NEAR(tax.charge(prev, phi), expected, 1e-15);
+    const double u = rng.uniform();
+    const double phi = u < 0.3 ? 0.0 : u < 0.6 ? 6.0 * (rng.uniform() - 0.3) : target;
+    const double least = tax.cost(prev, phi);
+    const double most = plan.most(prev, phi);
+    const double c = tax.charge(prev, phi);
+    // Both are differences of two values of U: rounding.
+    const double slack = 1e-15 + tax.charged() * 1e-14;
+    if (phi == target || phi * (phi - prev) <= 0.0) {
+      CHECK_NEAR(c, least, slack);
+    } else {
+      CHECK(c >= least - slack);
+      CHECK(c <= most + most * 1e-12 + tax.charged() * 1e-14);
+    }
     prev = phi;
   }
 }

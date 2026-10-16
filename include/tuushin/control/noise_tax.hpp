@@ -120,6 +120,18 @@ namespace tuushin::control {
 // costliest change, is where the two differ most: to 2 N from rest at
 // half a count, the tangent at the peak takes five times the charge.
 //
+// Charging on the plan. A change that was planned, and that raises V*, is
+// charged on the tangent its plan took, U(x) + U'(x) (V* - x), rather than
+// on U(V*), and so as the plan said:
+// above U wherever V* lands, as U is concave, and exact at the target. The
+// books are then charged at least U(V*) at every peak, and the excess of a
+// change that missed its target is taken off the next charges, which are
+// made against what was charged rather than against U(peak): over any run
+// the books pay U at the final peak plus at most the largest excess, not
+// the sum of them. It spares a logarithm and a square root on each change,
+// which in software double precision (a microcontroller with a
+// single-precision FPU, or none) is most of the tax's cost.
+//
 // What the bound assumes: Gaussian noise before the rounding, of a
 // standard deviation within the range given; independent from reading to
 // reading (white at the sampling rate) and of the motion; and the lead the
@@ -169,9 +181,13 @@ class NoiseTax {
   double open();
   // Books a change of the port force from `prev` to `phi`, decided without
   // the reading it takes effect on, and returns what to book as an output
-  // (J). Opens the books if they are not.
+  // (J). Opens the books if they are not. A change from the `prev` of the
+  // last plan(prev, target), with nothing charged since, is charged on
+  // that plan's tangent rather than on U: what the plan said it would
+  // cost, never less than U would charge (see "Charging on the plan").
   double charge(double prev, double phi);
-  // What charge(prev, phi) would return, apart from opening the books.
+  // What charge(prev, phi) would return, apart from opening the books,
+  // without a plan of the change.
   double cost(double prev, double phi) const;
   // The most charge() takes from now on, apart from opening the books: on
   // the tangent at the peak (no fixed part), or on the tangent at the V* a
@@ -187,12 +203,28 @@ class NoiseTax {
   double charged() const { return paid_; } // the noise part charged so far, J
 
  private:
-  double slope(double v) const;  // U'(v)
+  // U and U' at x, from one logarithm.
+  struct Tangent {
+    double x = -1.0;
+    double u = 0.0, du = 0.0;
+  };
+  Tangent tangent(double x) const;
+  // What the next charge is made against: U(peak) before the books open,
+  // what they were charged after.
+  double base() const { return opened_ ? paid_ : u0_; }
+
   double bias_, proxy_, rho_, log_delta2_;
+  double u0_;  // U(0)
   bool opened_ = false;
   double v_ = 0.0;     // V
   double peak_ = 0.0;  // the largest V* so far
-  double paid_ = 0.0;  // U(peak_) once opened
+  double paid_ = 0.0;  // charged so far once opened: at least U(peak_)
+  // The tangent at the peak, once plan() took it, and the one the last
+  // plan(prev, target) took, valid until the next charge.
+  mutable Tangent at_peak_;
+  mutable Tangent planned_;
+  mutable double planned_prev_ = 0.0;
+  mutable bool planned_valid_ = false;
 };
 
 }  // namespace tuushin::control
