@@ -107,6 +107,14 @@ class HapticLink {
   // original was: a copy that is to race the original along another path
   // must cross the same emulated channel, or it would win every race.
   void race_copy(Nanos now, const net::Route& to);
+  // Until `until` (the clock of on_datagram's rx_time), datagrams along
+  // `route` are taken but do not move the link there: a link that has
+  // just left `route` is not pulled back by what the peer sent along it
+  // before it could know.
+  void stay_off(const net::Route& route, Nanos until) {
+    stay_off_ = route;
+    stay_until_ = until;
+  }
 
   // Releases emulated datagrams that are due at `now`.
   void pump(Nanos now);
@@ -204,6 +212,8 @@ class HapticLink {
     }
   };
   std::unique_ptr<net::ChannelModel> emulation_;
+  net::Route stay_off_;
+  Nanos stay_until_ = 0;
   std::priority_queue<Pending, std::vector<Pending>, LaterRelease> pending_;
   std::uint64_t pending_order_ = 0;
 };

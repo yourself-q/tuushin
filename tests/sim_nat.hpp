@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <thread>
 #include <utility>
@@ -69,6 +71,10 @@ class SimNat {
     blocking_.store(true);
   }
   void unblock_peers() { blocking_.store(false); }
+  // Holds every datagram it passes on, either way, for `delay` (to the
+  // millisecond or so), like a slow link between the inside and the NAT.
+  // Before start() only.
+  void set_delay(std::chrono::microseconds delay) { delay_ = delay; }
 
   // Datagrams from outside dropped by the filter.
   std::uint64_t filtered() const { return filtered_.load(); }
@@ -87,6 +93,31 @@ class SimNat {
     net::UdpSocket socket;
     std::vector<net::Endpoint> sent;  // the destinations used, for filtering
   };
+
+  struct Held {
+    std::chrono::steady_clock::time_point release;
+    net::UdpSocket* from;
+    net::Endpoint to;
+    std::vector<std::uint8_t> bytes;
+  };
+
+  void pass_on(net::UdpSocket& from, const net::Endpoint& to, const std::uint8_t* data,
+               std::size_t size) {
+    if (delay_.count() > 0) {
+      held_.push_back(Held{std::chrono::steady_clock::now() + delay_, &from, to,
+                           std::vector<std::uint8_t>(data, data + size)});
+      return;
+    }
+    from.send_to(to, data, size);
+  }
+  void release_held() {
+    const auto now = std::chrono::steady_clock::now();
+    while (!held_.empty() && held_.front().release <= now) {
+      const Held& h = held_.front();
+      h.from->send_to(h.to, h.bytes.data(), h.bytes.size());
+      held_.pop_front();
+    }
+  }
 
   static net::UdpSocket loopback() { return net::UdpSocket(*net::Endpoint::resolve("127.0.0.1", 0)); }
 
@@ -125,12 +156,18 @@ class SimNat {
     std::vector<std::uint8_t> buf(4096);
     std::vector<pollfd> fds;
     while (!stop_.load()) {
-      if (rebind_.exchange(false)) outsides_.clear();
+      if (rebind_.exchange(false)) {
+        // What the forgotten mappings hold goes with them.
+        held_.clear();
+        outsides_.clear();
+      }
       fds.clear();
       const std::size_t proxies = proxies_.size(), outsides = outsides_.size();
       for (const auto& p : proxies_) fds.push_back(pollfd{p->socket.native_handle(), POLLIN, 0});
       for (const auto& o : outsides_) fds.push_back(pollfd{o->socket.native_handle(), POLLIN, 0});
-      if (::poll(fds.data(), static_cast<nfds_t>(fds.size()), 1) <= 0) continue;
+      const int ready = ::poll(fds.data(), static_cast<nfds_t>(fds.size()), 1);
+      release_held();
+      if (ready <= 0) continue;
       // Indices stay valid: new proxies and outside sockets are appended,
       // and only a rebind, above, removes any.
       for (std::size_t i = 0; i < proxies; ++i) {
@@ -140,7 +177,7 @@ class SimNat {
           const net::Endpoint x = proxies_[i]->outside;
           Outside& o = outside_for(from.canonical(), x);
           if (std::find(o.sent.begin(), o.sent.end(), x) == o.sent.end()) o.sent.push_back(x);
-          o.socket.send_to(x, buf.data(), *n);
+          pass_on(o.socket, x, buf.data(), *n);
         }
       }
       for (std::size_t i = 0; i < outsides; ++i) {
@@ -162,7 +199,7 @@ class SimNat {
           } else {
             delivered_.fetch_add(1);
           }
-          proxy_socket(y).socket.send_to(outsides_[i]->inside, bytes.data(), bytes.size());
+          pass_on(proxy_socket(y).socket, outsides_[i]->inside, bytes.data(), bytes.size());
         }
       }
     }
@@ -174,6 +211,8 @@ class SimNat {
   std::vector<std::unique_ptr<Proxy>> proxies_;
   std::vector<std::unique_ptr<Outside>> outsides_;
   std::vector<net::Endpoint> allowed_;
+  std::chrono::microseconds delay_{0};
+  std::deque<Held> held_;
   std::atomic<bool> stop_{false}, rebind_{false}, blocking_{false};
   std::atomic<std::uint64_t> filtered_{0}, delivered_{0};
   std::thread thread_;

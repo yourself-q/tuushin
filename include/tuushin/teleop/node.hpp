@@ -128,10 +128,17 @@ struct RendezvousConfig {
   // end's samples then come the direct way too, and this end's link
   // follows them. So a direct path that is open both ways and faster than
   // the relay takes the session over, and one that is slower, or shut,
-  // leaves it where it is. For one interval after its link has left the
-  // relay, an end also sends a copy of every datagram along the relay
-  // (make before break): an end that followed a path open one way only
-  // still reaches the other end, whose next sample through the relay
+  // leaves it where it is. For half an interval after its link has left
+  // the relay, an end's link takes what arrives along the relay without
+  // following it (HapticLink::stay_off): the samples the other end sent
+  // that way before it heard of the move are newer than the copy, and
+  // would pull it back; the two ends would go there and back, the stretch
+  // on the direct path growing by only 2(R - D) a round trip, R the
+  // relay's and D the direct path's. Half an interval covers a direct
+  // round trip as long as itself. For the whole interval, an end also
+  // sends a copy of every datagram along the relay (make before break):
+  // an end that followed a path open one way only still reaches the other
+  // end, whose first sample through the relay after the half interval
   // brings it back, and so does an end that followed a copy which won a
   // race the relay usually wins. A WebRTC agent likewise keeps checking
   // the candidate pairs it does not use, and may switch to a better one;

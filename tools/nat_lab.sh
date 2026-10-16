@@ -83,6 +83,14 @@
 #                          server, on 192.0.2.10:3478, and give the slave a
 #                          relay there (--turn); the PASS line says whether
 #                          the session ran through it
+#   --open-at S            with --turn: r1 drops what the two NATs send each
+#                          other until S seconds after the master starts, so
+#                          that the session starts on the relay; it must
+#                          then move to the direct path (the PASS line says
+#                          when it did, and how many samples went missing)
+#   --one-way              with --open-at: the opening lets through what natB
+#                          sends to natA only; the session must stay on the
+#                          relay, and lose nothing to the path
 #   --keep DIR             keep the logs in DIR
 #
 # Prints one line: PASS or FAIL, the scenario, and the time from the master's
@@ -104,6 +112,8 @@ NAT_A_INPUT=drop
 NAT_B_INPUT=drop
 MASTER_FIRST=0
 REBIND_AT=
+OPEN_AT=
+ONE_WAY=0
 TURN=0
 CGNAT_A=0
 CGNAT_B=0
@@ -129,6 +139,8 @@ while [ $# -gt 0 ]; do
     --master-first) MASTER_FIRST=1 ;;
     --rebind-at) REBIND_AT=$2; shift ;;
     --turn) TURN=1 ;;
+    --open-at) OPEN_AT=$2; shift ;;
+    --one-way) ONE_WAY=1 ;;
     --cgnat-a) CGNAT_A=1 ;;
     --cgnat-b) CGNAT_B=1 ;;
     --silent-cgnat) SILENT_CGNAT=1 ;;
@@ -149,6 +161,14 @@ mkdir -p "$LOG"
 [ "$WAN_HOPS" -ge 1 ] || { echo "--wan-hops must be at least 1" >&2; exit 1; }
 if [ -n "$REBIND_AT" ] && [ "$SAME_LAN" = 1 ]; then
   echo "--rebind-at moves the slave behind natB; it has no meaning with --same-lan" >&2
+  exit 1
+fi
+if [ -n "$OPEN_AT" ] && { [ "$TURN" = 0 ] || [ "$SAME_LAN" = 1 ]; }; then
+  echo "--open-at needs --turn, and the NATs apart (no --same-lan)" >&2
+  exit 1
+fi
+if [ "$ONE_WAY" = 1 ] && [ -z "$OPEN_AT" ]; then
+  echo "--one-way needs --open-at" >&2
   exit 1
 fi
 ROUTERS=
@@ -318,6 +338,22 @@ rebind() {
   echo "rebound at $(date +%s%N)" >"$LOG/rebind.txt"
 }
 
+# The direct path between the NATs is shut at r1 until the opening (both
+# outside prefixes: a CGNAT's address, or the rebinding's, is in them too).
+if [ -n "$OPEN_AT" ]; then
+  nsx r1 iptables -A FORWARD -s 198.51.100.0/24 -d 203.0.113.0/24 -j DROP
+  nsx r1 iptables -A FORWARD -s 203.0.113.0/24 -d 198.51.100.0/24 -j DROP
+fi
+open_path() {
+  sleep "$OPEN_AT"
+  if [ "$ONE_WAY" = 1 ]; then
+    nsx r1 iptables -D FORWARD -s 203.0.113.0/24 -d 198.51.100.0/24 -j DROP
+  else
+    nsx r1 iptables -F FORWARD
+  fi
+  echo "opened at $(date +%s%N)" >"$LOG/open.txt"
+}
+
 # host NS IF NAT NAT_IF ADDR
 host() {
   veth "$3" "$4" "$1" "$2"
@@ -367,10 +403,12 @@ start_slave() {
 DURATION=2
 # Enough session left after the rebinding whenever the meeting took.
 [ -z "$REBIND_AT" ] || DURATION=$(awk "BEGIN { print $REBIND_AT + 3 }")
+[ -z "$OPEN_AT" ] || DURATION=$(awk "BEGIN { print $OPEN_AT + 3 }")
 start_master() {
   local t0 t1 rc=0
   t0=$(date +%s%N)
   [ -z "$REBIND_AT" ] || rebind &
+  [ -z "$OPEN_AT" ] || open_path &
   # shellcheck disable=SC2086
   nsx master "$TOOL" master --no-rt --key-file "$KEY" --rendezvous 192.0.2.10 $PRIME \
     --duration "$DURATION" >"$LOG/master.out" 2>"$LOG/master.err" || rc=$?
@@ -401,6 +439,8 @@ SCENARIO="$SCENARIO input=$NAT_A_INPUT/$NAT_B_INPUT"
 SCENARIO="$SCENARIO master-first=$MASTER_FIRST prime-hops=${PRIME_HOPS:-default}"
 [ -z "$REBIND_AT" ] || SCENARIO="$SCENARIO rebind-at=${REBIND_AT}s"
 [ "$TURN" = 0 ] || SCENARIO="$SCENARIO turn"
+[ -z "$OPEN_AT" ] || SCENARIO="$SCENARIO open-at=${OPEN_AT}s"
+[ "$ONE_WAY" = 0 ] || SCENARIO="$SCENARIO one-way"
 [ "$CGNAT_A$CGNAT_B" = 00 ] || SCENARIO="$SCENARIO cgnat=$CGNAT_A/$CGNAT_B"
 [ "$SILENT_CGNAT" = 0 ] || SCENARIO="$SCENARIO silent-cgnat"
 [ "$NAT_A_ERRORS$NAT_B_ERRORS" = passpass ] || SCENARIO="$SCENARIO nat-errors=$NAT_A_ERRORS/$NAT_B_ERRORS"
@@ -417,10 +457,39 @@ if [ "$RC" = 0 ] && grep -q "^authenticated" "$LOG/master.out"; then
     grep -q "the other end moved [1-9]" "$LOG/master.out" || OK=0
     grep -q "ended by the master" "$LOG/slave.out" || OK=0
   fi
+  if [ -n "$OPEN_AT" ]; then
+    for _ in $(seq 1 30); do
+      grep -q "^session " "$LOG/slave.out" 2>/dev/null && break
+      sleep 0.1
+    done
+    if [ "$ONE_WAY" = 1 ]; then
+      # Stayed, and the master's samples all reached the slave.
+      ! grep -q "^left the relay" "$LOG/master.out" "$LOG/slave.out" || OK=0
+      grep -q "missing 0 " "$LOG/slave.out" || OK=0
+    else
+      grep -q "^left the relay" "$LOG/master.out" || OK=0
+      grep -q "^left the relay" "$LOG/slave.out" || OK=0
+    fi
+  fi
 fi
+# missing N from E: what the master's samples and the slave's lost
+missing() {
+  printf 'missing %s from the slave, %s from the master' \
+    "$(grep -o 'missing [0-9]*' "$LOG/master.out" | head -1 | cut -d' ' -f2)" \
+    "$(grep -o 'missing [0-9]*' "$LOG/slave.out" | head -1 | cut -d' ' -f2)"
+}
 if [ "$OK" = 1 ]; then
-  printf 'PASS %s  %d ms  %s\n' "$SCENARIO" "$ELAPSED_MS" \
-    "$(grep -o 'reached the slave at .*' "$LOG/master.out")"
+  if [ -n "$OPEN_AT" ]; then
+    printf 'PASS %s  %d ms  %s; %s; %s\n' "$SCENARIO" "$ELAPSED_MS" \
+      "$(grep -o 'reached the slave at .*' "$LOG/master.out")" \
+      "$(grep '^left the relay' "$LOG/master.out" || echo "stayed on the relay")" "$(missing)"
+  else
+    printf 'PASS %s  %d ms  %s\n' "$SCENARIO" "$ELAPSED_MS" \
+      "$(grep -o 'reached the slave at .*' "$LOG/master.out")"
+  fi
+elif [ -n "$OPEN_AT" ] && [ "$RC" = 0 ] && grep -q "^authenticated" "$LOG/master.out"; then
+  printf 'FAIL %s  %d ms  %s\n' "$SCENARIO" "$ELAPSED_MS" \
+    "$(grep '^left the relay' "$LOG/master.out" || echo "stayed on the relay"); $(missing)"
 elif [ "$RC" = 0 ] && grep -q "^authenticated" "$LOG/master.out"; then
   printf 'FAIL %s  %d ms  %s\n' "$SCENARIO" "$ELAPSED_MS" \
     "the session did not survive the rebinding: $(grep -o 'received [0-9]* from the slave' "$LOG/master.out")"

@@ -190,7 +190,7 @@ std::optional<HapticLink::Received> HapticLink::on_datagram(const std::uint8_t* 
   }
   if (verdict == SeqWindow::Verdict::kNew) {
     highest_rx_time_ = rx_time;
-    if (elsewhere) {
+    if (elsewhere && (rx_time >= stay_until_ || from != stay_off_)) {
       // The newest authentic datagram says where the peer is now.
       route_ = from;
       ++counters_.moved;

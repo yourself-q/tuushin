@@ -334,18 +334,20 @@ class SessionRejoin {
   // slave's relay, copies of that datagram to the other end's own
   // candidates every direct_check_interval (RendezvousConfig). Sent right
   // after the original, a copy is the newest datagram where it arrives
-  // first. For as long again after the link has left the relay, copies of
-  // every datagram along the relay too, so that the other end, which may
-  // not hear the direct path, misses nothing (make before break). No
-  // checks once the session is ending (`final`): the other end might stop
-  // before its next sample through the relay brings this end's link back
-  // from a path open one way only.
+  // first. Once the link has left the relay, it stays off it for half
+  // that interval (HapticLink::stay_off), and copies of every datagram go
+  // along the relay too for the whole interval, so that the other end,
+  // which may not hear the direct path, misses nothing (make before
+  // break). No checks once the session is ending (`final`): the other end
+  // might stop before its next sample through the relay brings this end's
+  // link back from a path open one way only.
   void sent(Nanos now, HapticLink& link, bool final) {
     const bool on_relay = relayed(link);
     if (on_relay) {
       relay_route_ = link.route();
     } else if (was_relayed_) {
       direct_at_ = now;
+      link.stay_off(relay_route_, now + cfg_.direct_check_interval / 2);
     }
     was_relayed_ = on_relay;
     const Nanos every = cfg_.direct_check_interval;
