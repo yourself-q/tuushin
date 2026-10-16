@@ -21,6 +21,8 @@ constexpr double kTwoPi = 6.283185307179586;
 constexpr double kClockLeak = 2e-4;
 constexpr Nanos kHelloEvery = 250 * kNanosPerMilli;
 constexpr Nanos kAckWait = 300 * kNanosPerMilli;
+// The commands connect() measures the actuation delay with.
+constexpr int kDelayProbes = 8;
 constexpr std::size_t kRttCap = std::size_t{1} << 20;
 
 std::string fmt(const char* format, double a, double b = 0.0, double c = 0.0) {
@@ -221,6 +223,17 @@ void RemoteDevice::on_state(const State& s, Nanos t) {
         const Nanos rtt = t - sent_at_[s.cmd_seq & 63] - Nanos{s.cmd_age_us} * 1000;
         if (rtt > 0 && (least_rtt_ == 0 || rtt < least_rtt_)) least_rtt_ = rtt;
         if (stats_.round_trip.size() < kRttCap) stats_.round_trip.push_back(static_cast<double>(rtt));
+        // On the clock the positions are placed on (sampled_at): if the
+        // clocks' mapping is off, by the link's asymmetry or the least
+        // delay's error, both are off alike, and the force is still timed
+        // right against the positions.
+        const Nanos took_effect =
+            clock_.to_host(clock_.extend(s.time_us - s.cmd_age_us), least_rtt_);
+        const Nanos act = took_effect - sent_at_[s.cmd_seq & 63];
+        if (stats_.actuation.size() < kRttCap) stats_.actuation.push_back(static_cast<double>(act));
+        act_[act_next_] = act;
+        act_next_ = (act_next_ + 1) % std::size(act_);
+        act_n_ = std::min(act_n_ + 1, std::size(act_));
       }
     }
     if ((s.flags & kStateCut) && (!cut_seen_ || cut_seq_seen_ != s.cmd_seq) && behind < 64) {
@@ -446,6 +459,32 @@ void RemoteDevice::connect() {
         now() + kAckWait);
     if (!ok) throw std::runtime_error("no answer from the device to zeroing it");
   }
+  // The actuation delay, before any force: commands that switch nothing
+  // on, each once the one before was applied. Sent as a State arrives,
+  // they meet the device's tick at much the same point each time, so a
+  // whole tick is added to the longest, until the session's commands
+  // have measured the waits for it (actuation_delay()).
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    act_n_ = act_next_ = 0;
+  }
+  for (int i = 0; i < kDelayProbes; ++i) {
+    send_command(0.0, 0);
+    const std::uint16_t probe = seq_;
+    if (!wait_for([&] { return echoed_any_ && echoed_ == probe; }, now() + kAckWait)) break;
+  }
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (act_n_ > 0) {
+      const Nanos longest = *std::max_element(act_, act_ + act_n_);
+      std::fill(std::begin(act_), std::end(act_), longest + Nanos{info_.tick_us} * 1000);
+      act_n_ = std::size(act_);
+      act_next_ = 0;
+    } else {
+      say("the device did not apply the commands that measure its actuation delay");
+    }
+  }
+
   // A State from after all of it.
   std::uint64_t n0;
   {
@@ -501,6 +540,12 @@ Nanos RemoteDevice::sampled_at(Nanos now) const {
   std::lock_guard<std::mutex> lk(mu_);
   if (!have_state_ || !clock_.valid()) return now;
   return std::min(now, clock_.to_host(clock_.extend(used_.time_us), least_rtt_));
+}
+
+std::optional<Nanos> RemoteDevice::actuation_delay() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (act_n_ == 0) return std::nullopt;
+  return *std::max_element(act_, act_ + act_n_);
 }
 
 double RemoteDevice::velocity() const {

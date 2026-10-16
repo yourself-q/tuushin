@@ -94,6 +94,11 @@ struct RemoteStats {
   // ways and the wait for the device's next tick, without the wait for
   // its next State.
   std::vector<double> round_trip;
+  // From sending a command to when the device applied it, with the
+  // device's time on the host's clock (Clock::to_host) (ns): the link one
+  // way and the wait for the device's tick, as the controllers have to
+  // time the force against the positions.
+  std::vector<double> actuation;
   Nanos worst_state_age = 0;  // the stalest State a read used (ns, host time)
 };
 
@@ -114,6 +119,10 @@ class RemoteDevice final : public teleop::Device1D {
   // The State's own time on the host's clock (Clock::to_host), at most
   // `now`; `now` before the clocks are matched.
   Nanos sampled_at(Nanos now) const override;
+  // The longest of the last 64 commands' (RemoteStats::actuation); until
+  // that many have been applied, at most the longest of the commands
+  // connect() sent to measure it, with a device tick added.
+  std::optional<Nanos> actuation_delay() const override;
   double velocity() const override;
   // A force f along +x is the torque f * r in x's sense of rotation. The
   // first command switches the driver on.
@@ -215,6 +224,9 @@ class RemoteDevice final : public teleop::Device1D {
   std::uint16_t echoed_ = 0;  // the newest command seen applied
   bool echoed_any_ = false;
   Nanos least_rtt_ = 0;
+  // The last actuation delays measured, a ring (actuation_delay()).
+  Nanos act_[64] = {};
+  std::size_t act_n_ = 0, act_next_ = 0;
 
   // The control thread's.
   bool connected_ = false;

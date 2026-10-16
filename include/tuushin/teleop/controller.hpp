@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <deque>
 #include <optional>
@@ -84,8 +85,19 @@ class ActuatorSchedule {
   // issued at `issue` takes effect.
   const std::vector<control::ForceSegment>& lead(Nanos from, Nanos issue);
   void command(Nanos now, double phi);
+  // The delay of the commands issued from now on, as a device that
+  // measures it reports it (Device1D::actuation_delay). A device applies
+  // its commands in the order they came, so none takes effect before the
+  // one issued before it, whatever the delays.
+  void set_delay(Nanos delay) { delay_ = delay > 0 ? delay : 0; }
+  Nanos delay() const { return delay_; }
 
  private:
+  // When a command issued at `issue` takes effect.
+  Nanos effective(Nanos issue) const {
+    return pending_.empty() ? issue + delay_ : std::max(issue + delay_, pending_.back().first);
+  }
+
   Nanos delay_;
   double dt_;  // ns
   double active_ = 0.0;
@@ -144,6 +156,10 @@ class DeviceModel {
   // commands issued since.
   void refresh_lead(Nanos to, Nanos issue);
   void command(Nanos now, double phi);
+  // The delay of the commands from now on, measured by the device
+  // (Device1D::actuation_delay). With the delay estimated it stays the
+  // estimate's: a bank of candidates has a delay each.
+  void set_actuation_delay(Nanos delay);
 
   const control::DevicePredictor& predictor() const { return bank_[best_].dev; }
   // The delay the predictor in use assumes: the estimate, if it is estimated.
@@ -292,8 +308,11 @@ class MasterController {
   // of it. It only grows.
   double reported_energy() const { return reported_; }
   // The actuation delay the controller books and predicts with: the
-  // configured one, or its estimate.
+  // configured one, the device's measurement, or the estimate.
   Nanos actuation_delay() const { return model_.actuation_delay(); }
+  // The device's measurement, for the commands from the next step on
+  // (DeviceModel::set_actuation_delay).
+  void set_actuation_delay(Nanos delay) { model_.set_actuation_delay(delay); }
   double reading_noise() const { return model_.reading_noise(); }  // m^2
   std::uint64_t samples_sent() const { return sent_; }
 
@@ -414,6 +433,7 @@ class SlaveController {
   const control::ReflectiveStore& store() const { return store_; }
   const control::EnergyPort& channel_port() const { return port_; }
   Nanos actuation_delay() const { return model_.actuation_delay(); }
+  void set_actuation_delay(Nanos delay) { model_.set_actuation_delay(delay); }
   double reading_noise() const { return model_.reading_noise(); }  // m^2
   std::uint64_t samples_sent() const { return sent_; }
 

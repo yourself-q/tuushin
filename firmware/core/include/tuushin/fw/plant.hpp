@@ -141,11 +141,20 @@ DeviceConfig device_config_for(const PlantParams& p, const char* name = "sim");
 // as a USB serial link does (full-speed USB polls once per millisecond).
 class SimHal : public Hal {
  public:
-  SimHal(Plant& plant, double latency = 0.0) : plant_(plant), latency_(latency) {}
+  // `latency` (s) each way on the link, or with `latency_to_host` >= 0
+  // only towards the device.
+  SimHal(Plant& plant, double latency = 0.0, double latency_to_host = -1.0)
+      : plant_(plant),
+        latency_(latency),
+        latency_to_host_(latency_to_host >= 0.0 ? latency_to_host : latency) {}
 
   // The board's clock (s); the plant advances to it on the next encoder read.
   void set_time(double t) { now_ = t; }
   double now() const { return now_; }
+  // How fast the board's crystal runs (ppm): micros() counts the time set
+  // that much fast, as a board's against its host's, while the plant and
+  // the link keep to the time set.
+  void set_clock_ppm(double ppm) { rate_ = 1.0 + ppm * 1e-6; }
 
   std::uint32_t micros() override;
   bool read_encoder(std::uint32_t* raw) override;
@@ -171,7 +180,9 @@ class SimHal : public Hal {
  private:
   Plant& plant_;
   double latency_;
+  double latency_to_host_;
   double now_ = 0.0;
+  double rate_ = 1.0;
   bool driver_ = false;
   bool encoder_broken_ = false;
   std::deque<std::pair<double, std::uint8_t>> to_device_, to_host_;

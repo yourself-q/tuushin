@@ -22,8 +22,10 @@ namespace {
 // test advances it, and the host reads it through RemoteConfig::clock.
 class SimLink final : public ByteStream {
  public:
-  SimLink(const PlantParams& p, const DeviceConfig& c, double latency)
-      : plant_(p), hal_(plant_, latency), core_(hal_, c) {
+  // `latency` each way, or with `latency_to_host` >= 0 towards the device.
+  SimLink(const PlantParams& p, const DeviceConfig& c, double latency,
+          double latency_to_host = -1.0)
+      : plant_(p), hal_(plant_, latency, latency_to_host), core_(hal_, c) {
     hal_.set_time(t_);
     core_.begin();
   }
@@ -101,8 +103,8 @@ struct Bench {
   std::unique_ptr<RemoteDevice> dev;
 
   explicit Bench(const PlantParams& p = quiet(), double latency = 0.5e-3,
-                 RemoteConfig cfg = RemoteConfig{}) {
-    auto owned = std::make_unique<SimLink>(p, sim_config(p), latency);
+                 RemoteConfig cfg = RemoteConfig{}, double latency_to_host = -1.0) {
+    auto owned = std::make_unique<SimLink>(p, sim_config(p), latency, latency_to_host);
     link = owned.get();
     cfg.clock = [l = link] { return l->clock(); };
     cfg.on_log = [this](const std::string& s) { logs.push_back(s); };
@@ -324,6 +326,40 @@ TEST_CASE(remote_measures_the_round_trip) {
   CHECK(hi <= 1.4e6 + 1e3);
   CHECK(b.dev->least_round_trip() == static_cast<Nanos>(lo));
   CHECK(s.cuts == 0 && s.cuts_between == 0);
+}
+
+TEST_CASE(remote_measures_the_actuation_delay) {
+  // 0.5 ms each way, the device ticking every 200 us and the host sending
+  // on its ticks: a command arrives between two ticks and takes effect on
+  // the next, 0.6 ms after it was sent.
+  Bench b(quiet(), 0.5e-3);
+  CHECK(!b.dev->actuation_delay());
+  b.dev->connect();
+  // Before any force, the commands connect() measured it with, and a tick.
+  REQUIRE(b.dev->actuation_delay().has_value());
+  CHECK_NEAR(static_cast<double>(*b.dev->actuation_delay()), 0.8e6, 5e3);
+  b.hold();
+  b.run(0.2, 0.2);
+  CHECK_NEAR(static_cast<double>(*b.dev->actuation_delay()), 0.6e6, 5e3);
+  const RemoteStats s = b.dev->stats();
+  REQUIRE(s.actuation.size() >= 150);
+  for (double a : s.actuation) CHECK_NEAR(a, 0.6e6, 5e3);
+
+  // 0.3 ms to the device and 0.7 ms back: a command takes effect 0.4 ms
+  // after it was sent, and a State is read 0.8 ms after it was sampled.
+  // The clocks' mapping takes the way back as half the round trip, 0.6
+  // ms, and so places the device's times 0.2 ms late: the positions, and
+  // the commands' effect with them, so the delay measured is 0.6 ms.
+  Bench a(quiet(), 0.3e-3, RemoteConfig{}, 0.7e-3);
+  a.dev->connect();
+  a.hold();
+  a.run(0.2, 0.2);
+  const Nanos now = a.link->clock();
+  a.dev->read_position(now);
+  const double late = static_cast<double>(a.dev->sampled_at(now)) -
+                      1e3 * static_cast<double>(a.dev->latest_state().time_us);
+  CHECK_NEAR(late, 0.2e6, 5e3);
+  CHECK_NEAR(static_cast<double>(*a.dev->actuation_delay()), 0.4e6 + late, 5e3);
 }
 
 TEST_CASE(remote_reports_the_watchdog_cut) {

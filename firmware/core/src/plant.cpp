@@ -148,7 +148,7 @@ std::uint32_t Plant::encoder_raw() {
 }
 
 std::uint32_t SimHal::micros() {
-  return static_cast<std::uint32_t>(static_cast<std::uint64_t>(std::llround(now_ * 1e6)));
+  return static_cast<std::uint32_t>(static_cast<std::uint64_t>(std::llround(now_ * rate_ * 1e6)));
 }
 
 bool SimHal::read_encoder(std::uint32_t* raw) {
@@ -179,7 +179,7 @@ std::size_t SimHal::read_bytes(std::uint8_t* buf, std::size_t cap) {
 }
 
 std::size_t SimHal::write_bytes(const std::uint8_t* buf, std::size_t n) {
-  for (std::size_t i = 0; i < n; ++i) to_host_.emplace_back(now_ + latency_, buf[i]);
+  for (std::size_t i = 0; i < n; ++i) to_host_.emplace_back(now_ + latency_to_host_, buf[i]);
   return n;
 }
 

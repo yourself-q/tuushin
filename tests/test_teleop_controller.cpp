@@ -247,6 +247,31 @@ TEST_CASE(actuator_schedule_splits_samples_where_commands_take_effect) {
   check(soon.lead(3 * ms), {{0.0, 0.4}});
 }
 
+TEST_CASE(actuator_schedule_keeps_commands_in_order_as_the_delay_changes) {
+  const Nanos ms = kNanosPerMilli;
+  auto check = [](const std::vector<control::ForceSegment>& segs,
+                  std::vector<control::ForceSegment> want) {
+    REQUIRE(segs.size() == want.size());
+    for (std::size_t i = 0; i < want.size(); ++i) {
+      CHECK(segs[i].phi == want[i].phi);
+      CHECK_NEAR(segs[i].samples, want[i].samples, 1e-12);
+    }
+  };
+  ActuatorSchedule s(800'000, ms);
+  s.command(0, 1.0);  // takes effect at 0.8 ms
+  // The device measured 0.2 ms since. A command issued at 0.5 ms would
+  // take effect at 0.7 ms, before the one issued before it; the device
+  // applies them in the order they came, so it takes effect at 0.8 ms.
+  s.set_delay(200'000);
+  check(s.lead(ms / 2), {{0.0, 0.3}});
+  s.command(ms / 2, 2.0);
+  check(s.advance(0, ms, 0), {{0.0, 0.8}, {2.0, 0.2}});
+  s.command(ms, 3.0);  // at 1.2 ms
+  check(s.advance(ms, 2 * ms, 0), {{2.0, 0.2}, {3.0, 0.8}});
+  s.set_delay(-1);
+  CHECK(s.delay() == 0);
+}
+
 TEST_CASE(master_books_forces_in_flight_by_when_they_act) {
   // A pure mass whose actuator applies each force 0.4 ms after it is
   // commanded, under forces that change every sample. Told the delay, the

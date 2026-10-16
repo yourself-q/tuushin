@@ -27,6 +27,15 @@ class Device1D {
   // the device's. The controllers book and predict with the sample's own
   // time, so that its age does not pass for motion.
   virtual Nanos sampled_at(Nanos now) const { return now; }
+  // How long after command_force a force takes effect, on the clock
+  // sampled_at() places the positions on, if the device measures it: a
+  // servo loop that says when it applied each command, as the firmware
+  // behind device::RemoteDevice does. The controllers then book and
+  // predict with it (ActuatorSchedule) rather than estimate it from the
+  // readings, which tell delays apart only as far as the motion lets
+  // them. It may change from command to command, as the host's ticks
+  // drift against the device's.
+  virtual std::optional<Nanos> actuation_delay() const { return std::nullopt; }
   // Velocity estimate at the last read (m/s).
   virtual double velocity() const = 0;
   // Force along +x (N), held until the next command.

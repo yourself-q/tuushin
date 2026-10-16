@@ -279,21 +279,25 @@ Nanos loop_delay_of(const device::RemoteDevice& dev) {
   return dev.connect_round_trip() + dev.state_period() / 2;
 }
 
-// How long after it is issued a command takes effect, on the host's clock:
-// the link one way, taken as half the least round trip as the clocks'
-// mapping takes it, and the wait for the device's next tick, counted
-// whole since a delay taken too short is the unsafe side. The positions'
-// age is no part of it: the controllers book each at its own time
-// (Device1D::sampled_at). Counting the age in as well put the estimate at
-// the top of its range, 4.75 ms, where the forces in flight over six
-// samples made the PC's bounds too wide to let any force through.
+// How long after it is issued a command takes effect, on the host's clock,
+// for a device that could not measure it: the link one way, taken as half
+// the least round trip as the clocks' mapping takes it, and the wait for
+// the device's next tick, counted whole since a delay taken too short is
+// the unsafe side. The positions' age is no part of it: the controllers
+// book each at its own time (Device1D::sampled_at). Counting the age in
+// as well put the estimate at the top of its range, 4.75 ms, where the
+// forces in flight over six samples made the PC's bounds too wide to let
+// any force through.
 Nanos actuation_delay_of(const device::RemoteDevice& dev) {
   return dev.connect_round_trip() / 2 + Nanos{dev.info().tick_us} * 1000;
 }
 
 // The controllers' device model for a device on a link: its mass and
-// encoder, and the delay of its actuation, estimated online with the
-// above as the first guess.
+// encoder, and the delay of its actuation as the device measures it
+// (Device1D::actuation_delay). Estimated from the readings instead, with
+// the above as the first guess, the delay ended 0.29 ms short on the
+// slave of device_lab.sh at a 200 us tick and 0.48 ms short at 1 ms (0.67
+// and 1.60 ms measured); the master's ended 0.48 and 1.03 ms long.
 template <class Config>
 void model_device(Config& c, const device::RemoteDevice& dev) {
   if (dev.model_mass() > 0.0) {
@@ -303,6 +307,11 @@ void model_device(Config& c, const device::RemoteDevice& dev) {
                  c.model_mass);
   }
   c.encoder_resolution = dev.encoder_resolution();
+  if (const auto measured = dev.actuation_delay()) {
+    c.actuation_delay = *measured;
+    c.actuation_delay_max = 0;
+    return;
+  }
   const Nanos delay = actuation_delay_of(dev);
   c.actuation_delay = delay;
   c.actuation_delay_max = std::max(2 * delay, delay + kNanosPerMilli);
@@ -369,6 +378,7 @@ void print_device(const device::RemoteDevice& dev) {
               static_cast<unsigned long long>(s.commands),
               static_cast<unsigned long long>(s.commands_short));
   print_stats("device rtt", net::delay_stats(s.round_trip), 1e6, "ms");
+  print_stats("device act", net::delay_stats(s.actuation), 1e6, "ms");
   std::printf("device: watchdog cuts %llu (and %llu between commands), %llu States saturated, "
               "stalest State %.2f ms, actuator work %.6g J\n",
               static_cast<unsigned long long>(s.cuts),
@@ -666,9 +676,11 @@ int run_master(const Options& o) {
   }
   if (rep.authenticated) std::printf("authenticated (%s)\n", crypto::NoiseNNpsk0::kProtocolName);
 
-  std::printf("session %08x, %llu ticks (%llu skipped), master PC active %.1f %%\n", rep.session,
-              static_cast<unsigned long long>(rep.ticks),
-              static_cast<unsigned long long>(rep.skipped), 100.0 * rep.master_pc_active);
+  std::printf("session %08x, %llu ticks (%llu skipped), master PC active %.1f %%, "
+              "actuation delay taken %.3f ms\n",
+              rep.session, static_cast<unsigned long long>(rep.ticks),
+              static_cast<unsigned long long>(rep.skipped), 100.0 * rep.master_pc_active,
+              to_millis(rep.actuation_delay));
   if (rep.ended_by_slave) std::printf("the slave ended the session\n");
   if (!rep.device_fault.empty()) std::printf("ended by the device: %s\n", rep.device_fault.c_str());
   if (rep.rejoins) {
@@ -784,9 +796,9 @@ int run_slave(const Options& o) {
                 !r.device_fault.empty() ? r.device_fault.c_str()
                 : r.ended_by_final      ? "the master"
                                         : "timeout or stop");
-    std::printf("%llu ticks (%llu skipped), slave PC active %.1f %%\n",
+    std::printf("%llu ticks (%llu skipped), slave PC active %.1f %%, actuation delay taken %.3f ms\n",
                 static_cast<unsigned long long>(r.ticks), static_cast<unsigned long long>(r.skipped),
-                100.0 * r.slave_pc_active);
+                100.0 * r.slave_pc_active, to_millis(r.actuation_delay));
     if (r.rejoins) {
       std::printf("rendezvous: the master announced anew %llu times during the session\n",
                   static_cast<unsigned long long>(r.rejoins));

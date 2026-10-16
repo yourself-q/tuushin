@@ -182,6 +182,7 @@ struct MasterNodeReport {
   double max_position = 0.0;  // m
   double max_force = 0.0;     // N
   double master_pc_active = 0.0;
+  Nanos actuation_delay = 0;  // the controller's at the end (MasterController)
 };
 
 // The handshake's prologue: what both ends must agree on, taken from the
@@ -262,6 +263,7 @@ struct SlaveSessionReport {
   double max_position = 0.0;
   double max_force = 0.0;
   double slave_pc_active = 0.0;
+  Nanos actuation_delay = 0;  // the controller's at the end (SlaveController)
   std::uint64_t rejoins = 0;  // the master announced anew during the session
 };
 

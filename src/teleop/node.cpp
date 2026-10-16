@@ -631,6 +631,7 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
     const auto work = device.port_work();
     const auto reserved = device.work_reserved();
     if (!final) {
+      if (const auto d = device.actuation_delay()) ctl.set_actuation_delay(*d);
       st = ctl.step(now, device.sampled_at(now), x, device.force_cut_after(), work, reserved);
       if (st.work_cap) {
         device.command_force_capped(-st.display_force, *st.work_cap);
@@ -673,6 +674,7 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
   if (rejoin) rep.rejoins = rejoin->rejoins();
   rep.master_pc_active =
       rep.ticks ? static_cast<double>(pc_count) / static_cast<double>(rep.ticks) : 0.0;
+  rep.actuation_delay = ctl.actuation_delay();
   rep.master_net = own.empty() ? 0.0 : own.back().second;
   rep.rtt = net::delay_stats(link.rtts());
 
@@ -1059,6 +1061,7 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
       const auto work = device.port_work();
       const auto reserved = device.work_reserved();
       if (!final) {
+        if (const auto d = device.actuation_delay()) ctl.set_actuation_delay(*d);
         st = ctl.step(now, device.sampled_at(now), x, device.velocity(), fc,
                        device.force_cut_after(), work, reserved);
         if (st.work_cap) {
@@ -1107,6 +1110,7 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
     rep.slave_net = ctl.terminal_net();
     rep.slave_pc_active =
         rep.ticks ? static_cast<double>(pc_count) / static_cast<double>(rep.ticks) : 0.0;
+    rep.actuation_delay = ctl.actuation_delay();
     // Announcements during the session were handled there.
     if (rv) rv_changes = rv->peer_changes();
     if (hooks.on_session_end) hooks.on_session_end(rep);

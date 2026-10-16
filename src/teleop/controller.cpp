@@ -53,7 +53,7 @@ const std::vector<control::ForceSegment>& ActuatorSchedule::advance(Nanos from, 
 const std::vector<control::ForceSegment>& ActuatorSchedule::lead(Nanos from, Nanos issue) {
   auto& segs = lead_;
   segs.clear();
-  const Nanos end = issue + delay_;
+  const Nanos end = effective(issue);
   if (end <= from) return segs;
   Nanos t = from;
   double phi = active_;
@@ -70,7 +70,7 @@ const std::vector<control::ForceSegment>& ActuatorSchedule::lead(Nanos from, Nan
 void ActuatorSchedule::command(Nanos now, double phi) {
   // Even without a delay the command waits for advance(): the sample it
   // ends may have been read before it was issued.
-  pending_.emplace_back(now + delay_, phi);
+  pending_.emplace_back(effective(now), phi);
 }
 
 namespace {
@@ -138,6 +138,12 @@ DeviceModel::DeviceModel(double mass, Nanos dt, double resolution, double force_
     // Start from the candidate nearest the guess.
     if (std::llabs(d - delay) < std::llabs(bank_[best_].delay - delay)) best_ = bank_.size() - 1;
   }
+}
+
+void DeviceModel::set_actuation_delay(Nanos delay) {
+  if (bank_.size() != 1) return;
+  bank_[0].actuator.set_delay(delay);
+  bank_[0].delay = bank_[0].actuator.delay();
 }
 
 // Each candidate books the sample by its own schedule and model: each force

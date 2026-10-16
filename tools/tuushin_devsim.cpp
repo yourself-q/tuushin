@@ -70,6 +70,8 @@ void usage() {
                "  --seed N              of the encoder noise (1)\n"
                "  --tick-us US          the servo loop's tick (200; the emulated board's is\n"
                "                        1000)\n"
+               "  --ppm PPM             how fast the board's clock runs against the host's\n"
+               "                        (0): its ticks and States drift against the host's\n"
                "  --duration S          exit after S seconds\n"
                "  --quiet               no status line every second\n");
 }
@@ -269,7 +271,7 @@ int main(int argc, char** argv) {
   bool pty = false, quiet = false, calibrated = false;
   int tcp_port = 0;
   std::string bind = "127.0.0.1", path_file;
-  double latency_ms = 0.5, duration = 0.0;
+  double latency_ms = 0.5, duration = 0.0, ppm = 0.0;
   std::uint32_t tick_us = 0;
   std::uint64_t seed = 1;
   fw::PlantParams pp;
@@ -303,6 +305,7 @@ int main(int argc, char** argv) {
       else if (a == "--noise") pp.encoder_noise = parse_double(next(), "noise");
       else if (a == "--seed") seed = static_cast<std::uint64_t>(parse_double(next(), "seed"));
       else if (a == "--tick-us") tick_us = static_cast<std::uint32_t>(parse_double(next(), "tick-us"));
+      else if (a == "--ppm") ppm = parse_double(next(), "ppm");
       else if (a == "--duration") duration = parse_double(next(), "duration");
       else if (a == "--quiet") quiet = true;
       else if (a == "-h" || a == "--help") { usage(); return 0; }
@@ -329,6 +332,8 @@ int main(int argc, char** argv) {
 
     fw::Plant plant(pp, seed);
     fw::SimHal hal(plant, latency_ms * 1e-3);
+    if (!(std::fabs(ppm) < 1e4)) throw std::runtime_error("--ppm must be within +-10000");
+    hal.set_clock_ppm(ppm);
     fw::DeviceConfig dc = fw::device_config_for(pp, "devsim");
     if (tick_us > 0) dc.tick_us = tick_us;
     if (calibrated) {
@@ -336,16 +341,19 @@ int main(int argc, char** argv) {
       hal.stored.direction = static_cast<std::int8_t>(pp.direction);
       hal.stored.zero_electric = static_cast<float>(pp.electrical_offset);
     }
-    const Nanos tick = static_cast<Nanos>(dc.tick_us) * 1000;
+    // The tick on the board's clock, which runs `ppm` fast.
+    const Nanos tick = static_cast<Nanos>(std::llround(dc.tick_us * 1e3 / (1.0 + ppm * 1e-6)));
     const std::string sched = rt::prefer_low_latency(tick);
     const Nanos t0 = monotonic_now();
     auto sim_time = [&](Nanos t) { return static_cast<double>(t - t0) * 1e-9; };
     hal.set_time(0.0);
     fw::DeviceCore core(hal, dc);
     core.begin();
-    std::fprintf(stderr, "devsim: %s, %u counts a turn, tick %u us, link %.2f ms each way, %s%s%s\n",
+    std::fprintf(stderr,
+                 "devsim: %s, %u counts a turn, tick %u us, clock %+.0f ppm, link %.2f ms each "
+                 "way, %s%s%s\n",
                  pty ? "pseudo-terminal" : ("tcp " + bind + ":" + std::to_string(tcp_port)).c_str(),
-                 pp.counts_per_rev, dc.tick_us, latency_ms, sched.c_str(),
+                 pp.counts_per_rev, dc.tick_us, ppm, latency_ms, sched.c_str(),
                  hand.present ? ", a hand on the knob once calibrated" : "",
                  stop.present ? ", an object" : "");
     // The hand takes hold once the device is calibrated, as a person lets

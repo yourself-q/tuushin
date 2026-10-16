@@ -543,6 +543,14 @@ costs a little transparency: a coarse master with 2 ms conveyed 66, 12
 and 8 % of the contact force instead of the 78, 14 and 9 % it conveys
 told the delay.
 
+A device that says when it applied each command needs none of this. The
+firmware behind `device::RemoteDevice` does, in every State, and the
+controllers take the delay from it (`Device1D::actuation_delay`), with
+one model and one schedule whose delay follows the measurement: a
+command never takes effect before the one sent before it, whatever the
+delays (A device in the loop, below). The estimate is for the devices
+that do not.
+
 ## Authentication
 
 Without a key, anyone who can send datagrams to the slave's port can drive
@@ -1183,8 +1191,39 @@ What the host takes from the device:
   motor's true work: −9.51 against −9.5 mJ at the master, +7.81 against
   +7.6 mJ at the slave; with damping, they differ by what the damping
   dissipates, outside the books.
-- **The actuation delay**: half the least round trip and one tick, as the
-  first guess of the online estimate (Actuation delay above).
+- **The actuation delay**, measured command by command. Each State
+  carries the sequence number of the command in effect and how long it
+  has been (`cmd_seq`, `cmd_age_us`); the host knows when it sent that
+  command, and places the device's time on its own clock as it places the
+  positions. The mapping's error, from the link's asymmetry or the least
+  delay's, is the positions' too, so the force is still timed right
+  against them. The controllers take the longest of the last 64
+  (`Device1D::actuation_delay`), and until those have come back, the
+  longest of eight commands `connect` sends with the driver off, and a
+  tick.
+
+The estimate this replaces (Actuation delay above) was wrong both ways
+on these devices. In two runs where the controllers still estimated it,
+the slave's commands took 0.67 and 1.60 ms to act (at a 200 µs and a
+1 ms tick) and the estimate said 0.375 and 1.125 ms, short by 0.29 and
+0.48 ms, the side that costs energy; the master's took 0.71 and 1.09 ms
+and the estimate said 1.19 and 2.13 ms, which holds the force back.
+Timed by the measurement, the master's passivity controller acted on
+fewer ticks and the operator felt more of the slave's force, in five
+runs of the lab's set-up below and three of each other, against as many
+runs before:
+
+| set-up | ticks the master's PC acted on | displayed force rms over the slave's |
+|---|---|---|
+| the table's | 92 → 81–89 % | 0.23–0.24 → 0.27–0.33 |
+| no damping on the devices, 300 N/m | 83–85 → 53–78 % | 0.49 → 0.53–0.71 |
+| 1 ms tick | 95–97 → 94 % | 0.10–0.126 → 0.133–0.136 |
+
+The delay is not one number for long. The device picks commands up on
+its own ticks, and its clock is not the host's: with the simulated
+device's clock 100 ppm fast or slow (`tuushin-devsim --ppm`), its ticks
+drift through the host's and the delay swept a whole tick, 0.61 to
+0.84 ms at a 200 µs tick and 1.01 to 2.02 ms at 1 ms.
 
 What the host gives the device besides the torque is **a cap on its
 work**. The books learn of the work a State and a link's latency after
@@ -1228,40 +1267,49 @@ an object half a radian on at the slave:
 
 | | master | slave |
 |---|---|---|
-| States, lost | 10032, 0 | 13193, 0 |
-| device round trip p50 (a command to the State applying it) | 1.40 ms | 1.28 ms |
+| States, lost | 10034, 0 | 13179, 0 |
+| device round trip p50 (a command to the State applying it) | 1.40 ms | 1.34 ms |
+| actuation delay p50 (a command to the tick applying it) | 0.70 ms | 0.69 ms |
 | coupling | | 524 N/m |
-| largest force | 3.52 N displayed | 11.4 N |
-| energy | 0.0303 J | −0.0294 J |
-| work cap overrun at most | 7.3 µJ | 20 µJ |
-| margin at the end, and at its lowest | +0.85 mJ, −0.024 mJ | |
+| largest force | 4.63 N displayed | 10.9 N |
+| energy | 0.0281 J | −0.0270 J |
+| work cap overrun at most | 6.9 µJ | 25 µJ |
+| margin at the end, and at its lowest | +1.02 mJ, −0.015 mJ | |
 
 Before the work cap the dip was the teleoperator's, not the books'. In a
 run followed sample by sample (no damping on the devices, a coupling of
 300 N/m, a dip of 1.57 mJ), the slave's passivity controller switched
 the force between nothing and 3 to 4 N from one sample to the next as
 the slave left the object, and the 17.5 g knob bounced off it: with
-States 0.8 to 1.8 ms old and a command acting 0.9 ms after it is sent,
-the speed reversed within a sample, and that one sample did 0.7 mJ of
-work; the master made the other 0.6 mJ. Under QEMU, the ESP32 firmware
+States 0.8 to 1.8 ms old and a command acting 0.6 to 0.8 ms after it is
+sent, the speed reversed within a sample, and that one sample did 0.7 mJ
+of work; the master made the other 0.6 mJ. Under QEMU, the ESP32 firmware
 at the slave dipped 0.35, 1.27 and 2.1 mJ in three runs. With the cap,
 and the tax of the rises it holds back given back, that set-up
 (`DEVICE_OPTS=",damping=0" SLAVE_ARGS="--kp 300"`) dipped 0.013 to 0.039
 mJ in three runs, the table's 0.019 to 0.038 mJ in five, at a 1 ms tick
 0.002 to 0.032 mJ in three, and under QEMU 0.008 to 0.019 mJ in three,
-where the ESP32 overran its cap by 1.8 to 4.8 µJ.
+where the ESP32 overran its cap by 1.8 to 4.8 µJ. With the forces also
+timed by the measured delay, 0.013 to 0.031, 0.015 to 0.021, 0.001 to
+0.038 and 0.012 to 0.025 mJ, the ESP32 overrunning its cap by 0.4 to
+27 µJ (the 27 in a second in which the emulated board missed 96 of its
+ticks); with the simulated device's clock 100 ppm fast or slow, 0.010
+and 0.038 mJ at the table's tick and 0.002 and 0.094 mJ at 1 ms.
 
 What is left is what the devices cannot foresee, and the books in
 flight. Mostly it is the master's overrun, which the margin meets where
-the slave's store is spent. At a 1 ms tick the slave once raised the
-force on a knob moving into the object at 0.17 m/s, which the object
-stopped within the tick: the rise took out none of the 0.085 mJ of tax
-it cost, and pushed the knob back with 0.038 mJ; the master's balance
-covered all but 0.031 mJ of the two. And the tax of a rise the device
-holds back stays in the books until the State that gives it back
-arrives, a round trip and a State's age after the command: 0.018 mJ at
-the start of one run, whose slave's host raised the force on a knob at
-rest every few milliseconds, and the device held each rise back.
+the slave's store is spent. At a 1 ms tick the slave raised the force on
+a knob moving into the object at about 0.16 m/s, which the object
+stopped within the tick, in one run of three before the delay was
+measured and one after, and in one of two with the device's clock
+100 ppm off, each time at the same point of the hand's motion: the rise
+took out none of the 0.066 to 0.085 mJ of tax it cost, and pushed the
+knob back with 0.038 to 0.11 mJ; the master's balance covered all but
+0.031 to 0.094 mJ of the two. And the tax of a rise the device holds
+back stays in the books until the State that gives it back arrives, a
+round trip and a State's age after the command: 0.018 mJ at the start
+of one run, whose slave's host raised the force on a knob at rest every
+few milliseconds, and the device held each rise back.
 
 ## Known issues
 
@@ -1304,13 +1352,21 @@ rest every few milliseconds, and the device held each rise back.
   generated 0.19 mJ (Model mismatch above). Coarse encoders, whose
   misses show among the innovations, generated nothing on the same
   devices.
-- **The actuation delay is estimated on simulated hands only.** Their
+- **A device that does not measure its actuation delay has it estimated,
+  and only on simulated hands has the estimate been tried.** Their
   impedance is constant; a real grip changes, and the filters let the
   damping and stiffness drift at a rate (a grip that changes over
   seconds) that no simulation has tested. The estimate needs the device
   to move under changing forces: until then it stays at the maximum,
   which holds the forces back. A delay that varies from command to
-  command is not modelled (Actuation delay above).
+  command is not modelled (Actuation delay above). A device that
+  measures it is timed by the longest of its last 64 commands, which
+  lags the device twice over. When a drifting clock carries one of the
+  device's ticks past the moment the commands arrive, the next command
+  waits a tick longer than those before it, and the controllers learn of
+  it a round trip later. And after a stall the controllers hold the
+  forces back as if the next 64 commands still took that long (up to
+  22 ms under QEMU, whose emulated board stalls now and then).
 - **No real device yet, one degree of freedom.** The firmware has run on
   a simulated motor, as a process and under QEMU, but not on a chip:
   its timing at 5 kHz, the encoders' drivers and the torque's true scale
@@ -1322,11 +1378,12 @@ rest every few milliseconds, and the device held each rise back.
   readings cannot foresee, a count's step and the velocity estimate's
   lag behind a stiff contact's push, overruns the cap by up to 70 µJ at
   a 5 kHz tick and 115 µJ at 1 kHz in the lab. The teleoperator's margin
-  still dips, by 0.002 to 0.039 mJ in the lab and under QEMU, and the
-  tax of a rise the device holds back is spent in the host's books until
-  the device gives it back, a round trip later (A device in the loop,
-  above). The prediction assumes a rigid shaft; a compliant coupling
-  between the motor and the knob is not modelled.
+  still dips, by 0.001 to 0.094 mJ in the lab and under QEMU (under 0.04
+  in all but one run), and the tax of a rise the device holds back is
+  spent in the host's books until the device gives it back, a round trip
+  later (A device in the loop, above). The prediction assumes a rigid
+  shaft; a compliant coupling between the motor and the knob is not
+  modelled.
 - **Only the slave takes a relay, over UDP.** One relay is enough to cross
   both NATs, but a slave without one cannot be reached through a symmetric
   NAT, and a master cannot offer a relay of its own. There is no TURN over
