@@ -33,6 +33,7 @@ struct Options {
   std::string trace_fwd, trace_bwd;
   std::vector<double> sweep;
   std::uint64_t seed = 1;
+  bool force_noise_known = false;
 };
 
 void usage() {
@@ -46,8 +47,16 @@ void usage() {
                "  --burst-loss a,b,c,d  Gilbert-Elliott p_gb,p_bg,loss_good,loss_bad\n"
                "  --trace-fwd FILE      replay a recorded master->slave path\n"
                "  --trace-bwd FILE      replay a recorded slave->master path\n"
-               "  --passivity S         none, channel (conventional TDPA, default) or\n"
-               "                        reflect (TDPA with energy reflection)\n"
+               "  --passivity S         none, channel (conventional TDPA, default),\n"
+               "                        reflect (TDPA with energy reflection) or model\n"
+               "                        (model-mediated: the master renders the slave's\n"
+               "                        estimate of the wall)\n"
+               "  --inconsistent-commands  model: the slave follows the master into a\n"
+               "                        wall the master does not render yet\n"
+               "  --relax-rate R        model: m/s at which a rendered surface moves away\n"
+               "                        from the master to the model's in contact (0.02)\n"
+               "  --active-relax-rate R model: the same towards the master (0)\n"
+               "  --estimate-damping    model: the slave estimates the wall's damping too\n"
                "  --no-tdpa             same as --passivity none\n"
                "  --constant-velocity-pc  PCs assume constant velocity over a sample\n"
                "  --model-mass M        master mass the PC believes in kg (true mass)\n"
@@ -83,7 +92,18 @@ void usage() {
                "  --slave-pc-rise N     the same at the slave (0)\n"
                "  --initial-energy E    reflect: energy in the store at start in J (0)\n"
                "  --deadband K          perceptual deadband with Weber fraction K, both ways\n"
-               "  --wall-k K            wall stiffness in N/m (5000)\n"
+               "  --wall-k K            wall stiffness in N/m, or N/m^n (5000)\n"
+               "  --wall-b B            wall damping in N s/m (10)\n"
+               "  --hand-freq F         the hand pushes towards the wall F times a second (0.5)\n"
+               "  --hand-amplitude A    from 0 to A m (0.04; the wall is at 0.02)\n"
+               "  --hand-k K            the hand's stiffness in N/m (300)\n"
+               "  --wall-exponent N     Hunt-Crossley wall: k d^N + (b + L d^N) d' (1)\n"
+               "  --wall-hc-damping L   its L in N s/m^(N+1) (0)\n"
+               "  --wall-motion A,F     the wall moves by A m at F Hz\n"
+               "  --force-noise N       the slave's force sensor reads N newtons of\n"
+               "                        Gaussian noise (0)\n"
+               "  --force-noise-known   model: the slave's estimator is told the noise;\n"
+               "                        else it estimates it\n"
                "  --contact-force       slave reports contact force, not coupling force\n"
                "                        (none and channel only)\n"
                "  --drift-gain G        position-drift compensation gain in 1/s (0 = off)\n"
@@ -186,7 +206,8 @@ Options parse(int argc, char** argv) {
       if (p == "none") o.cfg.passivity = P::kNone;
       else if (p == "channel") o.cfg.passivity = P::kChannel;
       else if (p == "reflect") o.cfg.passivity = P::kReflective;
-      else throw std::invalid_argument("--passivity must be none, channel or reflect");
+      else if (p == "model") o.cfg.passivity = P::kModelMediated;
+      else throw std::invalid_argument("--passivity must be none, channel, reflect or model");
     }
     else if (a == "--deadband") {
       const double k = std::stod(next());
@@ -195,6 +216,24 @@ Options parse(int argc, char** argv) {
       o.cfg.backward_deadband_params.k = k;
     }
     else if (a == "--wall-k") o.cfg.wall.k = std::stod(next());
+    else if (a == "--hand-freq") o.cfg.op.ref_freq = std::stod(next());
+    else if (a == "--hand-amplitude") o.cfg.op.ref_amplitude = std::stod(next());
+    else if (a == "--hand-k") o.cfg.op.hand_k = std::stod(next());
+    else if (a == "--wall-exponent") o.cfg.wall.exponent = std::stod(next());
+    else if (a == "--wall-hc-damping") o.cfg.wall.hc_damping = std::stod(next());
+    else if (a == "--wall-b") o.cfg.wall.b = std::stod(next());
+    else if (a == "--wall-motion") {
+      const auto v = parse_list(next());
+      if (v.size() != 2) throw std::invalid_argument("--wall-motion takes A,F");
+      o.cfg.wall.motion_amplitude = v[0];
+      o.cfg.wall.motion_freq = v[1];
+    }
+    else if (a == "--force-noise") o.cfg.force_sensor_noise = std::stod(next());
+    else if (a == "--force-noise-known") o.force_noise_known = true;
+    else if (a == "--inconsistent-commands") o.cfg.consistent_commands = false;
+    else if (a == "--relax-rate") o.cfg.wall_renderer.relax_rate = std::stod(next());
+    else if (a == "--active-relax-rate") o.cfg.wall_renderer.active_relax_rate = std::stod(next());
+    else if (a == "--estimate-damping") o.cfg.wall_estimator.estimate_damping = true;
     else if (a == "--contact-force") o.cfg.slave.report_contact_force = true;
     else if (a == "--drift-gain") o.cfg.slave.drift_gain = std::stod(next());
     else if (a == "--drift-ref") {
@@ -216,6 +255,7 @@ Options parse(int argc, char** argv) {
   if (!o.slave_compliance.empty()) {
     o.cfg.slave.compliance = compliance("--slave-compliance", o.cfg.slave.mass, o.slave_compliance);
   }
+  if (o.force_noise_known) o.cfg.wall_estimator.force_noise = o.cfg.force_sensor_noise;
   return o;
 }
 
@@ -245,6 +285,7 @@ void print_result(const sim::Teleop1DResult& r) {
   std::printf("\n");
   std::printf("min_passivity_margin   %.6g J\n", r.min_passivity_margin);
   std::printf("min_true_margin        %.6g J\n", r.min_true_margin);
+  std::printf("min_master_true_margin %.6g J\n", r.min_master_true_margin);
   std::printf("max_book_excess        %.6g J\n", r.max_book_excess);
   std::printf("master_actuation_delay %.4f ms\n", to_seconds(r.master_actuation_delay) * 1e3);
   std::printf("slave_actuation_delay  %.4f ms\n", to_seconds(r.slave_actuation_delay) * 1e3);
@@ -259,6 +300,9 @@ void print_result(const sim::Teleop1DResult& r) {
   std::printf("force_rmse             %.3f N\n", r.force_rmse);
   std::printf("pc_force_rmse          %.3f N\n", r.pc_force_rmse);
   std::printf("display_variation      %.1f N/s\n", r.display_force_variation);
+  std::printf("conveyed_force         %.1f %%\n", 100.0 * r.conveyed_force);
+  std::printf("max_contact_force      %.3f N\n", r.max_contact_force);
+  std::printf("max_slave_penetration  %.5f m\n", r.max_slave_penetration);
   std::printf("forward_packet_rate    %.1f /s (loss %.2f %%)\n", r.forward_packet_rate,
               100.0 * r.forward_loss);
   std::printf("backward_packet_rate   %.1f /s (loss %.2f %%)\n", r.backward_packet_rate,
@@ -280,17 +324,21 @@ int main(int argc, char** argv) {
     }
     std::printf("one_way_ms,diverged,min_margin_J,min_true_margin_J,max_force_N,"
                 "displayed_k_Npm,pos_rmse_m,drift_m,force_rmse_N,fwd_rate,bwd_rate,pc_m,pc_s,"
-                "pc_force_rmse_N,display_variation_Nps\n");
+                "pc_force_rmse_N,display_variation_Nps,master_true_margin_J,conveyed,"
+                "max_contact_N,max_penetration_m\n");
     for (const double d : o.sweep) {
       auto fwd = make_channel(o, d, o.trace_fwd, o.seed);
       auto bwd = make_channel(o, d, o.trace_bwd, o.seed + 1);
       const auto r = sim::run_teleop1d(o.cfg, *fwd, *bwd);
-      std::printf("%g,%d,%.4g,%.4g,%.3f,%.1f,%.5f,%.5f,%.3f,%.1f,%.1f,%.4f,%.4f,%.3f,%.1f\n", d,
+      std::printf("%g,%d,%.4g,%.4g,%.3f,%.1f,%.5f,%.5f,%.3f,%.1f,%.1f,%.4f,%.4f,%.3f,%.1f,%.4g,%.3f,"
+                  "%.3f,%.5f\n", d,
                   r.diverged ? 1 : 0, r.min_passivity_margin, r.min_true_margin,
                   r.max_display_force,
                   r.displayed_stiffness, r.pos_rmse, r.final_drift, r.force_rmse,
                   r.forward_packet_rate, r.backward_packet_rate, r.master_pc_active,
-                  r.slave_pc_active, r.pc_force_rmse, r.display_force_variation);
+                  r.slave_pc_active, r.pc_force_rmse, r.display_force_variation,
+                  r.min_master_true_margin, r.conveyed_force, r.max_contact_force,
+                  r.max_slave_penetration);
     }
     return 0;
   } catch (const std::exception& e) {

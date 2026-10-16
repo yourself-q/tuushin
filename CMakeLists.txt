@@ -23,6 +23,7 @@ add_library(tuushin
   src/control/reading_noise.cpp
   src/control/reflection.cpp
   src/control/tdpa.cpp
+  src/control/wall_model.cpp
   src/crypto/legacy_digest.cpp
   src/crypto/noise.cpp
   src/device/proto.cpp

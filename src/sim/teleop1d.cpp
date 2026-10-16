@@ -72,7 +72,7 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
     std::fprintf(log.get(),
                  "t,x_ref,x_m,v_m,f_hand,f_display,x_s,v_s,x_cmd,x_master_est,v_req,v_c,f_slave,"
                  "f_contact,ein_m,eout_m,ein_s,eout_s,store,grant_m,pc_m,pc_s,sent_fwd,sent_bwd,"
-                 "delay_m,delay_s\n");
+                 "delay_m,delay_s,model_k,model_surface,render_surface,x_command\n");
   }
 
   // Physics: the devices integrate between control steps with the forces
@@ -85,6 +85,7 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
   slave_dev.set_encoder_resolution(cfg.slave_encoder_resolution);
   master_dev.set_encoder_noise(cfg.master_encoder_noise, cfg.jitter_seed + 1);
   slave_dev.set_encoder_noise(cfg.slave_encoder_noise, cfg.jitter_seed + 2);
+  Rng force_noise(cfg.jitter_seed + 3);
   master_dev.set_friction(cfg.master.friction);
   slave_dev.set_friction(cfg.slave.friction);
   master_dev.set_compliance(cfg.master.compliance);
@@ -118,6 +119,7 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
                       : cfg.master_actuation_delay_max > 0    ? cfg.master_actuation_delay_max
                                                               : cfg.master.actuation_delay;
   mc.actuation_delay_max = cfg.master_actuation_delay_max;
+  mc.wall_renderer = cfg.wall_renderer;
   teleop::MasterController master(mc);
 
   teleop::SlaveConfig sc;
@@ -145,6 +147,8 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
                       : cfg.slave_actuation_delay_max > 0    ? cfg.slave_actuation_delay_max
                                                              : cfg.slave.actuation_delay;
   sc.actuation_delay_max = cfg.slave_actuation_delay_max;
+  sc.wall_estimator = cfg.wall_estimator;
+  sc.consistent_commands = cfg.consistent_commands;
   teleop::SlaveController slave(sc, slave_dev.read_position(0));
 
   Sender fwd_sender, bwd_sender;
@@ -158,6 +162,7 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
   std::int64_t drift_n = 0;
   std::int64_t pc_m_count = 0, pc_s_count = 0;
   double min_margin = 0.0, min_channel_margin = 0.0, min_true = 0.0, max_excess = 0.0;
+  double min_master_true = 0.0, sum_display = 0.0, sum_contact = 0.0;
   std::int64_t done = 0;
 
   auto check_plausible = [&](Nanos now) {
@@ -200,7 +205,10 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
 
     // 4. Slave step.
     const double f_contact = slave_dev.contact_force();
-    const auto ss = slave.step(now_s, x_s, v_s, f_contact, slave_dev.force_cut_after());
+    const double f_sensed =
+        f_contact + (cfg.force_sensor_noise > 0.0 ? force_noise.normal(0.0, cfg.force_sensor_noise)
+                                                  : 0.0);
+    const auto ss = slave.step(now_s, x_s, v_s, f_sensed, slave_dev.force_cut_after());
     slave_dev.command_force(ss.force);
     if (ss.send) bwd_sender.send(backward, bwd_queue, now_s, cfg.packet_bytes, ss.sample);
 
@@ -212,6 +220,7 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
     // its negative.
     const double true_net = -master_dev.actuator_work() - slave_dev.actuator_work();
     min_true = std::min(min_true, true_net);
+    min_master_true = std::min(min_master_true, -master_dev.actuator_work());
     max_excess = std::max(max_excess, terminal_net - true_net);
     if (!reflective) {
       const auto& sp = slave.channel_port();
@@ -235,7 +244,7 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
       const auto& sp = slave.channel_port();
       std::fprintf(log.get(),
                    "%.4f,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,"
-                   "%.6g,%.6g,%.6g,%.6g,%.6g,%d,%d,%d,%d,%.6g,%.6g\n",
+                   "%.6g,%.6g,%.6g,%.6g,%.6g,%d,%d,%d,%d,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
                    t, x_ref, x_m, v_m, f_hand, f_display, x_s, v_s, slave.command(),
                    slave.master_estimate(), slave.requested_velocity(), slave.command_velocity(),
                    slave.reported_force(), f_contact, mp.input_energy(), mp.output_energy(),
@@ -244,7 +253,9 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
                    reflective ? st.level() : terminal_net, mp.remote_input_energy(),
                    ms.pc_active ? 1 : 0, ss.pc_active ? 1 : 0, ms.send ? 1 : 0, ss.send ? 1 : 0,
                    to_seconds(master.actuation_delay()) * 1e3,
-                   to_seconds(slave.actuation_delay()) * 1e3);
+                   to_seconds(slave.actuation_delay()) * 1e3, master.renderer().model().stiffness,
+                   master.renderer().model().surface, master.renderer().surface(),
+                   master.command_position());
     }
 
     sum_pos_err2 += (x_m - x_s) * (x_m - x_s);
@@ -252,8 +263,13 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
     const double pc_err = f_display - master.requested_force();
     sum_pc_err2 += pc_err * pc_err;
     variation += std::fabs(f_display - f_prev);
+    sum_display += std::max(0.0, f_display);
+    sum_contact += std::max(0.0, f_contact);
+    r.max_contact_force = std::max(r.max_contact_force, f_contact);
+    const double wall_now = slave_dev.wall_position();
+    r.max_slave_penetration = std::max(r.max_slave_penetration, x_s - wall_now);
     f_prev = f_display;
-    const double penetration_m = x_m - cfg.wall.position;
+    const double penetration_m = x_m - wall_now;
     if (penetration_m > 0.0 && f_display > 0.0) {
       sum_kp_num += f_display * penetration_m;
       sum_kp_den += penetration_m * penetration_m;
@@ -290,6 +306,8 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
   r.slave_pc_active = static_cast<double>(pc_s_count) / n;
   r.min_passivity_margin = min_margin;
   r.min_true_margin = min_true;
+  r.min_master_true_margin = min_master_true;
+  r.conveyed_force = sum_contact > 0.0 ? sum_display / sum_contact : 0.0;
   r.max_book_excess = max_excess;
   r.min_channel_margin = min_channel_margin;
   r.master_actuation_delay = master.actuation_delay();

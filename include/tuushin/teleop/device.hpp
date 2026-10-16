@@ -100,8 +100,23 @@ struct OperatorParams {
 
 struct WallParams {
   double position = 0.02;  // m
-  double k = 5000.0;       // N/m
+  double k = 5000.0;       // N/m, or N/m^exponent
   double b = 10.0;         // N s/m, only while penetrating
+  // A Hunt-Crossley contact (K. H. Hunt and F. R. E. Crossley, J. Appl.
+  // Mech. 42(2), 1975), as tissue, rubber or a Hertzian contact pushes:
+  // k d^exponent + (b + hc_damping d^exponent) d' at a penetration d, which
+  // is no line through any samples. 1 and 0 make the spring-damper wall.
+  double exponent = 1.0;
+  double hc_damping = 0.0;  // N s/m^(exponent + 1)
+  // The wall moves as position + motion_amplitude sin(2 pi motion_freq t),
+  // as a beating organ or a part on a conveyor does.
+  double motion_amplitude = 0.0;  // m
+  double motion_freq = 0.0;       // Hz
+  double position_at(double t) const;
+  double velocity_at(double t) const;
+  // The force with which the wall pushes a point at x moving at v back at
+  // time t (N, at least 0).
+  double force(double t, double x, double v) const;
 };
 
 // Friction in a device's transmission besides the viscous damping, as in
@@ -263,6 +278,8 @@ class SimulatedSlave final : public SimulatedDevice {
   SimulatedSlave(double mass, double damping, const WallParams& wall, Nanos nominal_dt,
                  int substeps, Nanos start = 0, double position = 0.0);
   double contact_force() const override;
+  // Where the wall's surface is now.
+  double wall_position() const;
 
  private:
   double external_force(double t, double x, double v) const override;

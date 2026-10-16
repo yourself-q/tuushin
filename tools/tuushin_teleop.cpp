@@ -334,6 +334,7 @@ const char* scheme_name(teleop::Passivity p) {
     case teleop::Passivity::kNone: return "none";
     case teleop::Passivity::kChannel: return "channel";
     case teleop::Passivity::kReflective: return "reflect";
+    case teleop::Passivity::kModelMediated: return "model";
   }
   return "?";
 }

@@ -157,21 +157,31 @@ SimulatedSlave::SimulatedSlave(double mass, double damping, const WallParams& wa
                                Nanos nominal_dt, int substeps, Nanos start, double position)
     : SimulatedDevice(mass, damping, nominal_dt, substeps, start, position), wall_(wall) {}
 
-namespace {
-
-double wall_force(const WallParams& w, double x, double v) {
-  const double pen = x - w.position;
-  return pen > 0.0 ? std::max(0.0, w.k * pen + w.b * v) : 0.0;
+double WallParams::position_at(double t) const {
+  return position + motion_amplitude * std::sin(2.0 * kPi * motion_freq * t);
 }
 
-}  // namespace
+double WallParams::velocity_at(double t) const {
+  return motion_amplitude * 2.0 * kPi * motion_freq * std::cos(2.0 * kPi * motion_freq * t);
+}
 
-double SimulatedSlave::external_force(double, double x, double v) const {
-  return -wall_force(wall_, x, v);
+double WallParams::force(double t, double x, double v) const {
+  const double pen = x - position_at(t);
+  if (pen <= 0.0) return 0.0;
+  const double spring = exponent == 1.0 ? pen : std::pow(pen, exponent);
+  return std::max(0.0, k * spring + (b + hc_damping * spring) * (v - velocity_at(t)));
+}
+
+double SimulatedSlave::external_force(double t, double x, double v) const {
+  return -wall_.force(t, x, v);
 }
 
 double SimulatedSlave::contact_force() const {
-  return wall_force(wall_, distal_position(), distal_velocity());
+  return wall_.force(to_seconds(time() - start()), distal_position(), distal_velocity());
+}
+
+double SimulatedSlave::wall_position() const {
+  return wall_.position_at(to_seconds(time() - start()));
 }
 
 }  // namespace tuushin::teleop

@@ -13,6 +13,7 @@
 #include "tuushin/control/reading_noise.hpp"
 #include "tuushin/control/reflection.hpp"
 #include "tuushin/control/tdpa.hpp"
+#include "tuushin/control/wall_model.hpp"
 #include "tuushin/time.hpp"
 
 namespace tuushin::teleop {
@@ -38,7 +39,16 @@ namespace tuushin::teleop {
 //  kReflective one budget at the slave covering the channel and the coupling
 //              controller (control/reflection.hpp; Panzirsch et al.'s
 //              "Approach 3"); impedance-type PCs at both device ports.
-enum class Passivity { kNone, kChannel, kReflective };
+//  kModelMediated
+//              no force crosses the channel: the slave estimates the wall it
+//              touches and sends the model, the master renders it
+//              (control/wall_model.hpp) through an impedance-type PC on its
+//              own books, and the slave follows the master's position with
+//              the force the master displays as a feedforward. The master's
+//              device port is passive whatever the models are; the slave's
+//              actuator is a position servo with its own supply, and nothing
+//              books its energy.
+enum class Passivity { kNone, kChannel, kReflective, kModelMediated };
 
 // One haptic sample as the two ends exchange it.
 //  master -> slave: value = velocity (m/s), aux = position (m),
@@ -46,6 +56,12 @@ enum class Passivity { kNone, kChannel, kReflective };
 //  slave -> master: value = force (N), aux = free for monitoring,
 //                   energy = cumulative energy the slave grants the master
 //                   (kReflective) or its channel input energy (kChannel).
+// kModelMediated:
+//  master -> slave: value = velocity (m/s), aux = the position consistent
+//                   with the model (MasterController::command_position),
+//                   energy = the force the master displays (N).
+//  slave -> master: value = the wall's stiffness (N/m, 0 before a contact),
+//                   aux = its surface (m), energy = its damping (N s/m).
 struct Sample {
   double value = 0.0;
   double aux = 0.0;
@@ -234,6 +250,8 @@ struct MasterConfig {
   // actuation_delay as the first guess (DeviceModel).
   Nanos actuation_delay_max = 0;
   Nanos actuation_delay_step = 0;
+  // kModelMediated: how the master moves to a new model.
+  control::WallRendererParams wall_renderer;
 };
 
 class MasterController {
@@ -315,12 +333,23 @@ class MasterController {
   void set_actuation_delay(Nanos delay) { model_.set_actuation_delay(delay); }
   double reading_noise() const { return model_.reading_noise(); }  // m^2
   std::uint64_t samples_sent() const { return sent_; }
+  // kModelMediated: the model the master renders, and the position sent
+  // with the last step, the master's less the rendering's offset.
+  const control::WallRenderer& renderer() const { return renderer_; }
+  double command_position() const { return x_command_; }
 
  private:
+  // What the PC may still let out: the slave's grants or channel input,
+  // or with kModelMediated the device port's own input.
+  double balance() const;
+
   MasterConfig cfg_;
   double dt_;
   control::EnergyPort port_;
   DeviceModel model_;
+  control::WallRenderer renderer_;
+  std::optional<control::WallModel> received_model_;  // not yet rendered
+  double x_command_ = 0.0;
   codec::DeadbandEncoder<1> enc_;
   bool first_ = true;
   Nanos last_now_ = 0;      // when the last sample ended
@@ -380,6 +409,14 @@ struct SlaveConfig {
   Nanos actuation_delay = 0;
   Nanos actuation_delay_max = 0;
   Nanos actuation_delay_step = 0;
+  // kModelMediated: the estimate of the wall from the contact force, and
+  // whether the slave goes into the wall no further than the force the
+  // master displays explains (surface + force / stiffness, by its own
+  // model). Without that, a master that has not learnt of the wall yet,
+  // as at a first contact for a round trip, drives the slave into it on
+  // the coupling alone.
+  control::WallEstimatorParams wall_estimator;
+  bool consistent_commands = true;
 };
 
 class SlaveController {
@@ -436,6 +473,8 @@ class SlaveController {
   void set_actuation_delay(Nanos delay) { model_.set_actuation_delay(delay); }
   double reading_noise() const { return model_.reading_noise(); }  // m^2
   std::uint64_t samples_sent() const { return sent_; }
+  // kModelMediated: the slave's estimate of the wall.
+  const control::WallModel& wall() const { return estimator_.model(); }
 
  private:
   SlaveConfig cfg_;
@@ -443,6 +482,7 @@ class SlaveController {
   control::EnergyPort port_;
   control::ReflectiveStore store_;
   DeviceModel model_;
+  control::WallEstimator estimator_;
   codec::DeadbandEncoder<1> enc_;
   double x_sampled_;
   std::optional<double> port_work_;  // the device's measured work at the last sample

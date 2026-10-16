@@ -256,15 +256,32 @@ MasterController::MasterController(const MasterConfig& cfg)
       model_(cfg.model_mass, cfg.dt, cfg.encoder_resolution, cfg.force_rate, cfg.adapt_force_rate,
              cfg.actuation_delay, cfg.actuation_delay_max, cfg.actuation_delay_step,
              cfg.estimate_reading_noise),
+      renderer_(cfg.wall_renderer),
       enc_(cfg.deadband_params) {}
 
 void MasterController::receive(std::uint32_t seq, const Sample& s) {
+  const bool newest = !has_value_ || seq > last_seq_;
+  if (cfg_.passivity == Passivity::kModelMediated) {
+    if (newest) {
+      has_value_ = true;
+      last_seq_ = seq;
+      received_model_ = control::WallModel{s.value, s.aux, s.energy};
+    }
+    return;
+  }
   port_.on_remote_input_energy(s.energy);
-  if (!has_value_ || seq > last_seq_) {
+  if (newest) {
     has_value_ = true;
     last_seq_ = seq;
     f_reflected_ = s.value;
   }
+}
+
+double MasterController::balance() const {
+  // The model is the master's own: what the operator put into the port is
+  // all it may give back.
+  return cfg_.passivity == Passivity::kModelMediated ? port_.input_energy() - port_.output_energy()
+                                                     : port_.balance();
 }
 
 MasterController::Step MasterController::step(Nanos now, Nanos sampled, double position,
@@ -294,11 +311,24 @@ MasterController::Step MasterController::step(Nanos now, Nanos sampled, double p
   last_issued_ = now;
   const control::DevicePredictor& dev = model_.predictor();
 
+  // A coarse encoder's backward difference is mostly quantization noise
+  // (q / dt: 5.5 cm/s for 55 um at 1 kHz), which the slave's damping would
+  // turn into force noise; the filter's estimate is sent instead once it
+  // has a regular history.
+  v_sent_ = cfg_.encoder_resolution > 0.0 && dev.ready() ? dev.velocity_dt() / dt_ : v_meas_;
+
   Step out;
+  if (cfg_.passivity == Passivity::kModelMediated) {
+    if (received_model_) {
+      renderer_.update(*received_model_, position);
+      received_model_.reset();
+    }
+    f_reflected_ = renderer_.force(position, v_sent_, dt_);
+  }
   const double f_reflected = has_value_ ? f_reflected_ : 0.0;
   if (cfg_.passivity != Passivity::kNone) {
     const auto pc = cfg_.predictive_pc
-                        ? control::limit_force_predictive(port_.budget(), f_reflected, dev,
+                        ? control::limit_force_predictive(std::max(0.0, balance()), f_reflected, dev,
                                                           cfg_.pc_hold_samples, cfg_.pc_confidence,
                                                           cfg_.pc_tax_samples, cfg_.pc_rise_samples)
                         : control::limit_force(port_, f_reflected, v_meas_, dt_);
@@ -323,7 +353,7 @@ MasterController::Step MasterController::step(Nanos now, Nanos sampled, double p
     // the debt back out before its force does work again. A cap at the
     // work would let it spend again what paid the debt, and each overrun
     // the device's own misprediction makes would stay owed.
-    out.work_cap = *port_work_ + port_.balance();
+    out.work_cap = *port_work_ + balance();
   }
   // The device may take the port's work up to the largest cap it still
   // holds, and an input booked since that cap was sent lowered the work
@@ -333,13 +363,13 @@ MasterController::Step MasterController::step(Nanos now, Nanos sampled, double p
   const double hold = work_reserved ? std::max(0.0, *work_reserved - port_.budget()) : 0.0;
   reported_ = std::max(reported_, port_.reported_input_energy() - hold);
 
-  // A coarse encoder's backward difference is mostly quantization noise
-  // (q / dt: 5.5 cm/s for 55 um at 1 kHz), which the slave's damping would
-  // turn into force noise; the filter's estimate is sent instead once it
-  // has a regular history.
-  v_sent_ = cfg_.encoder_resolution > 0.0 && dev.ready() ? dev.velocity_dt() / dt_ : v_meas_;
   out.send = cfg_.deadband ? enc_.update(Vec1{{v_sent_}}, now) : true;
-  if (out.send) {
+  if (cfg_.passivity == Passivity::kModelMediated) {
+    x_command_ = position - renderer_.offset();
+    out.send = true;
+    out.sample = Sample{v_sent_, x_command_, f_display_};
+    ++sent_;
+  } else if (out.send) {
     out.sample = Sample{v_sent_, position, reported_};
     ++sent_;
   }
@@ -353,6 +383,7 @@ SlaveController::SlaveController(const SlaveConfig& cfg, double position)
       model_(cfg.model_mass, cfg.dt, cfg.encoder_resolution, cfg.force_rate, cfg.adapt_force_rate,
              cfg.actuation_delay, cfg.actuation_delay_max, cfg.actuation_delay_step,
              cfg.estimate_reading_noise),
+      estimator_(cfg.wall_estimator),
       enc_(cfg.deadband_params),
       x_sampled_(position),
       x_cmd_(position),
@@ -367,7 +398,7 @@ SlaveController::SlaveController(const SlaveConfig& cfg, double position)
 void SlaveController::receive(std::uint32_t seq, const Sample& s) {
   if (cfg_.passivity == Passivity::kReflective) {
     store_.on_master_input_energy(s.energy);
-  } else {
+  } else if (cfg_.passivity != Passivity::kModelMediated) {
     port_.on_remote_input_energy(s.energy);
   }
   if (!has_value_ || seq > last_seq_) {
@@ -460,6 +491,25 @@ SlaveController::Step SlaveController::step(Nanos now, Nanos sampled, double pos
                         : control::limit_force(grant.slave, phi, velocity, dt_);
     f_ctrl_ = -pc.value;
     out.pc_active = pc.active || grant.limited;
+  } else if (cfg_.passivity == Passivity::kModelMediated) {
+    // A position servo on the master's model-consistent position, with the
+    // force the operator feels as a feedforward: in contact with a wall the
+    // model describes, the slave then rests where the master is and pushes
+    // as hard as the operator does, whatever the coupling's stiffness.
+    estimator_.observe(position, velocity, contact_force);
+    const double f_ff = live ? std::max(0.0, last_.energy) : 0.0;
+    x_cmd_ = x_master_est_;
+    v_c_ = v_received;
+    const control::WallModel& wall = estimator_.model();
+    if (cfg_.consistent_commands && wall.known()) {
+      const double limit = wall.surface + f_ff / wall.stiffness;
+      if (x_cmd_ > limit) {
+        x_cmd_ = limit;
+        v_c_ = std::min(v_c_, 0.0);
+      }
+    }
+    f_ctrl_ = cfg_.kp * (x_cmd_ - position) + cfg_.kd * (v_c_ - velocity) + f_ff;
+    f_slave_ = contact_force;
   } else {
     // The coupling force for this step follows from the command up to the
     // previous step, so the force the PC books is exactly the force applied
@@ -510,6 +560,14 @@ SlaveController::Step SlaveController::step(Nanos now, Nanos sampled, double pos
   x_master_est_ += v_received * dt_;
   out.force = f_ctrl_;
 
+  if (cfg_.passivity == Passivity::kModelMediated) {
+    // The model, every sample: the master renders whichever came last.
+    const control::WallModel& wall = estimator_.model();
+    out.send = true;
+    out.sample = Sample{wall.stiffness, wall.surface, wall.damping};
+    ++sent_;
+    return out;
+  }
   out.send = cfg_.deadband ? enc_.update(Vec1{{f_slave_}}, now) : true;
   if (out.send) {
     const double energy = cfg_.passivity == Passivity::kReflective ? store_.granted()

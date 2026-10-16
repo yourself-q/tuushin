@@ -116,8 +116,20 @@ struct Teleop1DConfig {
   //              position itself, and impedance-type PCs at both device ports
   //              only scale forces, so there is no position drift and
   //              drift_gain is not used.
+  //  kModelMediated
+  //              the slave sends a model of the wall, which the master
+  //              renders through a PC on its own books (control/wall_model.hpp,
+  //              teleop::Passivity). Only the master's device port is
+  //              passive: min_master_true_margin, not min_true_margin, is the
+  //              margin to compare.
   using Passivity = teleop::Passivity;
   Passivity passivity = Passivity::kChannel;
+  // kModelMediated: the estimate at the slave, the rendering at the master,
+  // and whether the slave's commands are kept consistent with the force the
+  // master displays (teleop::SlaveConfig).
+  control::WallEstimatorParams wall_estimator;
+  control::WallRendererParams wall_renderer;
+  bool consistent_commands = true;
   // kReflective: energy in the slave-side store before anything entered (J).
   // The teleoperator is then passive with respect to this initial storage;
   // the device-port margin can go down to -initial_energy.
@@ -148,6 +160,9 @@ struct Teleop1DConfig {
   // counts (teleop::SimulatedDevice::set_encoder_noise).
   double master_encoder_noise = 0.0;
   double slave_encoder_noise = 0.0;
+  // Gaussian noise on the slave's force sensor, N (standard deviation).
+  // The metrics use the true contact force.
+  double force_sensor_noise = 0.0;
   bool encoder_resolution_known = true;
   // The predictors and their use by the PCs (teleop::MasterConfig): with
   // known resolutions, the Kalman filters' least force rate in N/s,
@@ -208,6 +223,12 @@ struct Teleop1DResult {
   // Total variation of the displayed force per second, sum |f_k - f_{k-1}|
   // over the run's length: how much it chatters.
   double display_force_variation = 0.0;  // N/s
+  // The displayed force over the run as a share of the contact force over
+  // it (sums of their positive parts): how much of the wall the operator
+  // felt, whichever end leads.
+  double conveyed_force = 0.0;
+  double max_contact_force = 0.0;     // N
+  double max_slave_penetration = 0.0; // m, into the wall
 
   double forward_packet_rate = 0.0;   // packets/s actually sent
   double backward_packet_rate = 0.0;
@@ -230,6 +251,9 @@ struct Teleop1DResult {
   // (teleop::SimulatedDevice::actuator_work), which the books only see
   // through the encoders. With exact encoders the two agree to rounding.
   double min_true_margin = 0.0;  // J
+  // The same at the master's device port alone: what the operator's hand
+  // took out of the teleoperator beyond what it put in, at worst.
+  double min_master_true_margin = 0.0;  // J
   // The largest amount by which the booked margin exceeded the true one at
   // any sample: positive means the books credited energy that never
   // entered, which the quantization tax is there to prevent.
