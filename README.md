@@ -570,6 +570,108 @@ command never takes effect before the one sent before it, whatever the
 delays (A device in the loop, below). The estimate is for the devices
 that do not.
 
+### Model-mediated teleoperation
+
+The schemes above send forces over the channel, so every force the
+operator feels comes a round trip late, and the PCs that keep the
+teleoperator passive take away whatever the delay would generate: at
+100 ms the reflective scheme's master PC acts in 91 % of the samples. In
+the model-mediated scheme (`tuushin-sim --passivity model`) no force
+crosses the channel. The slave fits a spring to its contact force over its
+position (`control/wall_model.hpp`: stiffness, surface and damping, each
+accepted only within a stated standard error) and sends the model every
+sample; the master renders it through an impedance-type PC on its own
+books, with no delay inside the operator's haptic loop; the slave follows
+the master's position with the force the master displays as a
+feedforward. Only the master's device port is passive by construction:
+the slave's actuator is a position servo with its own supply, which nothing
+books, so the margin across both ports (`min_true_margin`) is about
+−0.18 J on every run below, and the master's (`min_master_true_margin`)
+is the one to compare.
+
+Twelve hand motions, 0.3 to 0.8 Hz at 4 and 4.6 cm, 20 s each, exact
+readings:
+
+| one-way delay | model-mediated: stiffness | force error | conveyed | reflective: stiffness | force error | conveyed |
+|---|---|---|---|---|---|---|
+| 10 ms | 3468 N/m | 0.45 N | 100 % | 1094 N/m | 1.56 N | 101 % |
+| 50 ms | 1065 N/m | 0.69 N | 100 % | 192 N/m | 3.57 N | 41 % |
+| 100 ms | 498 N/m | 1.05 N | 101 % | 206 N/m | 5.38 N | 56 % |
+
+The force error is the RMS of the displayed against the contact force,
+delay included. The stiffness falls with the delay for one reason, the
+first touch: the master learns of the wall a round trip after the slave
+touches it, by when the hand is 11 mm deeper at 100 ms (its speed times
+the round trip). From the second touch on, the operator feels the wall
+at its own stiffness: on the 0.45 Hz motion at 100 ms each way, 5180 to
+5420 N/m against the wall's 5000 N/m, with the surface within 0.07 mm of
+where it is. No
+passivity controller can do anything about the first touch; sensing the
+wall before touching it could. The master's port gave out at most
+8.8e−8 J over these runs, the overrun of a one-sample prediction.
+
+With 55 µm encoders at both ends the PC error (the displayed force less
+what the model asks for) is 0.57 N at 100 ms against 0.25 N with exact
+readings, and the hand meets 1.15 force episodes per cycle against 1.01:
+the window of readings bounds where in its count the device lies and the
+taxes are refunded as the readings narrow it (`DevicePredictor::
+solve_window`). Before those bounds it was 5.68 N and 3.59 episodes.
+
+**Encoders that dither, again.** Half a count of noise breaks the
+quantization tax here too: it bounds nothing once the error is
+unbounded, the PC error is 14 N at every delay, and a held contact breaks
+into about four force episodes. `control/noise_tax.hpp` bounds the books' error
+instead with a stated probability δ (10⁻³), at every reading at once: the
+error splits into a bias of the device's place in its count, bounded from
+the exact distribution of the rounded Gaussian, and a martingale, bounded
+by Robbins' normal mixture and Ville's inequality, which grows as the
+square root of the sum of the squared force changes, not their sum. It
+holds when each change is booked by a reading it was not decided on:
+with a whole sample of actuation lead, or, with none, by reading the
+encoder again once the command has taken effect (`--reread`,
+`MasterConfig::reread`), which costs no delay. Half a count, 55 µm, the
+same motions:
+
+| one-way delay | quantization tax: PC error | episodes per cycle | noise tax, read again: PC error | episodes per cycle | exact readings: PC error |
+|---|---|---|---|---|---|
+| 10 ms | 13.96 N | 4.07 | 2.35 N | 2.34 | 0.04 N |
+| 50 ms | 13.63 N | 3.85 | 2.06 N | 1.94 | 0.19 N |
+| 100 ms | 14.27 N | 3.61 | 2.09 N | 2.08 | 0.25 N |
+
+The master's true margin stayed at 0 J in all of them. With a lead of
+one sample at both ends instead of the second reading, 4.69 N and 2.66
+at 100 ms.
+
+What is left, at 100 ms: books that knew the true work would reach
+0.99 N and 1.27 episodes, and the same encoders without noise 0.57 N. So
+about half the rest is the books and half the predictions made from noisy
+readings. The tax's confidence is not what binds: δ = 0.5 gives 1.75 N,
+δ = 10⁻⁶ 2.62 N. Neither is the noise level near half a count: a quarter
+count gives 2.05 N, where the bias the noise no longer smooths takes
+over; a whole count 6.71 N. In the runs the PC is engaged through the
+whole of a held contact and the displayed force swings by several newtons
+from sample to sample, 131 N/s of variation against 23 N/s with exact
+readings; as the bound grows with the squared changes, the chatter adds
+to what limits the PC. Rendering from the filtered position instead of
+the reading cut the chatter by a quarter but not the error.
+
+On the reflective scheme the second reading does not help: at 100 ms its
+PC acts in 91 % of the samples with exact readings too, and with the
+noise tax and the second reading its force error grows from 1.63 to
+3.11 N at 100 ms and from 2.38 to 3.16 N at 10 ms.
+
+The second reading has to be a conversion of its own, with noise
+independent of the first's, sampled close to the change: the motion in
+between is booked with the old force and not covered (1e−6 J per newton
+of change at 0.1 m/s and 10 µs, against the tax's 3e−5 J). The noise has
+to be Gaussian, white at the sampling rate and independent of the motion,
+of a standard deviation within the range given (`--noise-tolerance`).
+And the newest reading's noise times the force now is not charged: it
+does not accumulate, but it is outside the bound's time-uniformity, and
+on the reflective scheme leaves −2.7e−9 J. Whether an MT6701's noise is
+white, and whether two of its conversions are independent, has not been
+measured.
+
 ## Authentication
 
 Without a key, anyone who can send datagrams to the slave's port can drive
@@ -1512,7 +1614,11 @@ few milliseconds, and the device held each rise back.
   at 0.94 cm/s) but in our runs let the actuators generate about a
   microjoule. Encoders that dither cost far more: with half a count of
   noise the master conveys a fifth of the contact force at 10 ms, and
-  under a tenth at 50 and 100 ms (Encoders that dither, above).
+  under a tenth at 50 and 100 ms (Encoders that dither, above). The
+  model-mediated scheme with the noise tax and a second reading keeps
+  the PC error to about 2 N at 10 to 100 ms, against 0.04 to 0.25 N
+  with exact readings, and a held contact still breaks into two force
+  episodes (Model-mediated teleoperation, above).
 - **Exact readings of a misdescribed device are covered nearly, not
   entirely.** The model error margin covers misses like those already
   seen; a miss larger than any before it is not, and over nine hand
