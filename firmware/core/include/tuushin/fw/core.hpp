@@ -151,6 +151,9 @@ class DeviceCore {
   // independent, 0: the same error again).
   std::uint32_t rereads() const { return rereads_; }
   float reread_independence() const;
+  // The variance of the readings' errors as measured (counts^2), the
+  // rounding's included.
+  float reading_variance() const { return reading_var_; }
 
  private:
   enum class CalPhase { kNone, kSettle0, kSweepUp, kSettle1, kSweepDown, kSettle2 };
@@ -216,6 +219,7 @@ class DeviceCore {
   std::optional<control::NoiseTax> noise_;
   std::uint32_t rereads_ = 0;
   float reread_var_ = 0.0f;  // the mean square of second less first readings (counts^2)
+  float reread_ref_ = 0.0f;  // reading_var_ over the same rereads
   bool reread_told_ = false;
   // The work cap the last tick kept to, and work_ + tax_ as it decided.
   bool cap_held_ = false;
@@ -223,6 +227,7 @@ class DeviceCore {
   double booked_ = 0.0;
   double worst_overrun_ = 0.0;
   std::int32_t step_ = 0;  // the shaft's last step (counts)
+  float step_dt_ = 0.0f;   // over what time (s); 0 before the first
   // The variance of the encoder's reading errors (counts^2), measured
   // (keep_to_cap); a cautious count until it is.
   float reading_var_ = 1.0f;

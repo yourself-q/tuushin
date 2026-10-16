@@ -141,11 +141,22 @@ void DeviceCore::tick() {
     bound_ = turns_.count();
     vel_.update(dtheta, dt);
     obs_.update(dtheta, dt, motor_torque_);
-    // The second difference of the readings: of their errors, 6 times
-    // their variance, and of the shaft's motion, its acceleration.
-    const float d2 = static_cast<float>(step - step_);
+    // The second difference of the readings, weighted by the ticks'
+    // times, step dt' - step' dt: of their errors, dt'^2 + (dt + dt')^2 +
+    // dt^2 times their variance (6 dt^2 with even ticks), of a shaft
+    // turning steadily nothing however the ticks jitter, and of one
+    // speeding up, its acceleration. Unweighted, a knob turned at up to
+    // 6.5 rad/s across ticks 50 to 350 us apart read as an error of up to
+    // 0.98 counts rms, where the noise's was 0.58. What is left is the
+    // acceleration, times dt^2: at a 1 ms tick a knob ringing against an
+    // object read as 0.73 to 0.77 in device_lab.sh, at 200 us as 0.58.
+    if (step_dt_ > 0.0f) {
+      const float d2 = static_cast<float>(step) * step_dt_ - static_cast<float>(step_) * dt;
+      const float w = step_dt_ * step_dt_ + (dt + step_dt_) * (dt + step_dt_) + dt * dt;
+      reading_var_ += std::min(1.0f, dt * 1e6f / kReadingNoiseUs) * (d2 * d2 / w - reading_var_);
+    }
     step_ = step;
-    reading_var_ += std::min(1.0f, dt * 1e6f / kReadingNoiseUs) * (d2 * d2 / 6.0f - reading_var_);
+    step_dt_ = dt;
   }
   // What the last tick's torque and tax took past the cap it kept to: past
   // the work booked then, if the host had already lowered the cap below it.
@@ -708,6 +719,10 @@ void DeviceCore::reread(float was, float omega, std::uint32_t now) {
   ++rereads_;
   const float n = static_cast<float>(rereads_ < kRereadWindow ? rereads_ : kRereadWindow);
   reread_var_ += (r * r - reread_var_) / n;
+  // The readings' error variance over the same rereads, against which
+  // their mean square is told: the measure follows a tenth of a second,
+  // and taken at a single tick of 1 ms it varied by a seventh.
+  reread_ref_ += (reading_var_ - reread_ref_) / n;
   if (rereads_ == kRereadWindow && !reread_told_) {
     reread_told_ = true;
     char text[kMaxLogText + 1];
@@ -716,7 +731,7 @@ void DeviceCore::reread(float was, float omega, std::uint32_t now) {
     const float lo = cfg_.reading_noise_lo, hi = cfg_.reading_noise_hi;
     std::snprintf(text, sizeof text, "reread: indep %.2f, error %.2f rms, set %.2f-%.2f counts",
                   static_cast<double>(reread_independence()),
-                  static_cast<double>(std::sqrt(reading_var_)),
+                  static_cast<double>(std::sqrt(reread_ref_)),
                   static_cast<double>(std::sqrt(lo * lo + 1.0f / 12.0f)),
                   static_cast<double>(std::sqrt(hi * hi + 1.0f / 12.0f)));
     log(text);
@@ -724,7 +739,7 @@ void DeviceCore::reread(float was, float omega, std::uint32_t now) {
 }
 
 float DeviceCore::reread_independence() const {
-  return reading_var_ > 0.0f ? reread_var_ / (2.0f * reading_var_) : 0.0f;
+  return reread_ref_ > 0.0f ? reread_var_ / (2.0f * reread_ref_) : 0.0f;
 }
 
 void DeviceCore::drive(bool on) {

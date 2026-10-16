@@ -998,6 +998,41 @@ TEST_CASE(fw_reread_independence_is_measured) {
   }
 }
 
+TEST_CASE(fw_reading_noise_is_measured_across_uneven_ticks) {
+  // The readings' error variance, from their second differences weighted
+  // by the ticks' times: a hand turning the knob at up to 6.5 rad/s,
+  // ticks anywhere from 50 to 350 us apart, and the measure stays within
+  // 0.05 counts of the noise's, sqrt(0.5^2 + 1/12) rms, where unweighted
+  // it strayed 0.4.
+  PlantParams p;
+  Rig rig(p, config_for(p));
+  HandParams h;
+  h.present = true;
+  h.ref_offset = rig.plant.angle();
+  h.ref_amplitude = 2.0;
+  h.ref_freq = 1.0;
+  rig.plant.set_hand(h, rig.t);
+  std::uint64_t r = 7;
+  const double expected = std::sqrt(p.encoder_noise * p.encoder_noise + 1.0 / 12.0);
+  double worst = 0.0, fastest = 0.0, last = rig.plant.angle(), last_t = rig.t;
+  rig.run(4.0, [&](double now) {
+    r = r * 6364136223846793005ull + 1442695040888963407ull;
+    rig.tick = 50e-6 + 300e-6 * static_cast<double>(r >> 11) * 0x1.0p-53;
+    // The plant stands where the last tick read it.
+    const double a = rig.plant.angle(), at = rig.plant.time();
+    if (now > 1.0 && at > last_t) {
+      fastest = std::max(fastest, std::fabs(a - last) / (at - last_t));
+      worst = std::max(worst, std::fabs(std::sqrt(static_cast<double>(rig.core.reading_variance())) - expected));
+    }
+    last = a;
+    last_t = at;
+  });
+  std::printf("  fastest %.1f rad/s, reading error %.3f counts rms at the end, %.3f off at worst (expected %.3f)\n",
+              fastest, std::sqrt(static_cast<double>(rig.core.reading_variance())), worst, expected);
+  CHECK(fastest > 6.0);
+  CHECK(worst < 0.1);
+}
+
 TEST_CASE(fw_noise_books_open_with_the_host) {
   // The noise tax's bound holds for its books from where they open: they
   // open at the first change of the torque, and again at a Hello while no
