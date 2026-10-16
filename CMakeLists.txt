@@ -21,6 +21,7 @@ add_library(tuushin
   src/control/bounded_lp.cpp
   src/control/held_device.cpp
   src/control/predictive_pc.cpp
+  src/control/noise_tax.cpp
   src/control/reading_noise.cpp
   src/control/reflection.cpp
   src/control/tdpa.cpp

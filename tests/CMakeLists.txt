@@ -4,6 +4,7 @@ add_executable(tuushin_tests
   test_bounded_lp.cpp
   test_count_bounds.cpp
   test_tdpa.cpp
+  test_noise_tax.cpp
   test_reading_noise.cpp
   test_channel.cpp
   test_crypto.cpp
