@@ -212,6 +212,17 @@ class DeviceModel {
   // taxed as control::NoiseTax charges it, with `delta` and `force_scale`,
   // and other commands as above. With a resolution only.
   void set_noise_tax(double lo, double hi, double delta, double force_scale);
+  // Whether the device reads its encoder again once a command has taken
+  // effect, and reread() books by that reading: a command that takes effect
+  // at once, the first on its reading, is then also taxed as NoiseTax
+  // charges it, as the reading it is booked by is one it did not see.
+  void set_reread(bool on) { reread_ = on; }
+  // The correction to the books when the command just booked took effect
+  // with the encoder `dy` from the reading it was chosen on: the boundary
+  // between the force before and the force after moves to the new reading,
+  // -(phi - prev) dy (J). Zero unless set_reread() and the noise tax took
+  // the command.
+  double reread(double dy);
   // The noise tax when it applies to the next command, as
   // limit_force_predictive takes it; null otherwise.
   const control::NoiseTax* change_tax() const;
@@ -255,6 +266,9 @@ class DeviceModel {
   long readings_ = 0;  // readings observed so far
   std::size_t refund_lag_;
   std::optional<control::NoiseTax> noise_tax_;
+  bool reread_ = false;
+  double pending_change_ = 0.0;  // phi - prev of the command to reread after
+  long reread_reading_ = -1;     // the reading the last such command was chosen on
   // Whether the next command takes effect on a reading it did not see.
   bool on_unseen_reading() const;
 };
@@ -319,6 +333,11 @@ struct MasterConfig {
   double encoder_noise_hi = 0.0;
   double noise_tax_delta = 1e-3;
   double noise_tax_force_scale = 0.25;  // N
+  // Whether the device reads its encoder again after each command takes
+  // effect and the caller passes that reading to reread() before the next
+  // step: a force that takes effect at once is then taxed by the noise
+  // bound too (DeviceModel::set_reread).
+  bool reread = false;
   bool deadband = false;
   codec::DeadbandParams deadband_params{0.1, 0.002, from_millis(100)};
   // How long after a command the device applies it (ActuatorSchedule). The
@@ -389,6 +408,10 @@ class MasterController {
   Step step(Nanos now, Nanos sampled, double position, Nanos cut_after,
             std::optional<double> port_work = std::nullopt,
             std::optional<double> work_reserved = std::nullopt);
+  // With MasterConfig::reread: the encoder read again once the last step's
+  // command took effect, at which the books then take the force to change
+  // (DeviceModel::reread). Ignored when the device measures its work.
+  void reread(double position);
 
   // The velocity sent with the last step: the backward difference of the
   // encoder positions, or the device model's estimate with an encoder
@@ -486,6 +509,7 @@ struct SlaveConfig {
   double encoder_noise_hi = 0.0;
   double noise_tax_delta = 1e-3;
   double noise_tax_force_scale = 0.25;  // N
+  bool reread = false;
   bool deadband = false;
   codec::DeadbandParams deadband_params{0.1, 0.05, from_millis(100)};
   // Between samples the slave extrapolates the master position with the last
@@ -543,6 +567,8 @@ class SlaveController {
   Step step(Nanos now, Nanos sampled, double position, double velocity, double contact_force,
             Nanos cut_after, std::optional<double> port_work = std::nullopt,
             std::optional<double> work_reserved = std::nullopt);
+  // As MasterController::reread, with SlaveConfig::reread.
+  void reread(double position);
 
   // Diagnostics of the last step.
   double command() const { return x_cmd_; }            // coupling target (m)

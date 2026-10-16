@@ -51,7 +51,9 @@ namespace tuushin::control {
 //    quantization_tax() takes q |dphi|, 1.7 s |dphi| at half a count.
 //  * The end term phi_{N-1} xi_N, the newest reading's noise times the
 //    force now, is not charged: it does not accumulate, as the next
-//    reading replaces it, and no finite charge bounds it for every N. The
+//    reading replaces it, and no finite charge bounds it for every N. It is
+//    about s |phi| at any one reading, but its largest over a run grows as
+//    s |phi| sqrt(2 log N): it is outside the bound's time-uniformity. The
 //    books then bound the true work from below, at every reading with
 //    probability 1 - delta, up to the newest reading's noise times the
 //    force now.
@@ -64,6 +66,37 @@ namespace tuushin::control {
 // at t_k, which can steer it into the noise; a delay that is not a whole
 // number of samples changes the force within a sample, whose split the
 // model makes from readings the command saw. Neither is covered.
+//
+// Reading again. A device without a delay can still pair each change with
+// a reading it did not see, by reading its encoder again once the command
+// took effect (DeviceModel::set_reread): the books move the boundary
+// between the old force and the new one from the reading y_k the change
+// was decided on to that second reading y+_k, which corrects them by
+// -dphi_k (y+_k - y_k), and their error becomes
+//
+//   -sum_{k<N} dphi_k e+_k + phi_{N-1} e_N,
+//
+// with e+_k the second reading's error, which dphi_k did not see. This costs
+// no delay, where a lead costs a sample of it, and the decision still sees
+// the newest reading. It needs:
+//
+//  * a conversion of its own: noise independent of the first reading's.
+//    An encoder read again before it has converted again returns the first
+//    reading's error again, which covers nothing.
+//  * that conversion close to the change: the motion between the change
+//    and the instant the encoder samples, dphi v (t_sample - t_change), is
+//    booked with the old force and not covered. At 0.1 m/s and 10 us,
+//    1e-6 J per newton of change, against the tax's s per newton (about
+//    3e-5 J at 55 um and half a count).
+//
+// Both hold when the command is applied just before a conversion starts,
+// which on a device whose encoder converts on its own clock (an MT6701
+// over SSI) means timing the loop to it.
+//
+// In the 1-D teleoperation with model-mediated passivity, 100 ms each way
+// and half a count of dither on both sides, it takes the master's PC force
+// error from 14.3 N, with the interval tax, to 2.1 N, where a lead of one
+// sample with this tax gives 4.3 N (means over 12 runs of 20 s).
 //
 // Reserving for the fall. A fall adds to V as much as a rise does, so with
 // V alone a fall would be charged, and a controller with an empty budget

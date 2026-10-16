@@ -179,6 +179,10 @@ class SimulatedDevice : public Device1D {
     noise_counts_ = counts > 0.0 ? counts : 0.0;
     noise_ = Rng(seed);
   }
+  // Reads the encoder again where the device is now, with the noise drawn
+  // anew, as a second conversion after a command took effect does
+  // (MasterController::reread); what read_position() returns is unchanged.
+  double reread_position();
 
   // Friction besides the viscous damping, acting on the motor side.
   void set_friction(const FrictionParams& friction) { friction_ = friction; }

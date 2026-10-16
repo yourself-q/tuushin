@@ -123,6 +123,7 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
   }
   mc.noise_tax_delta = cfg.noise_tax_delta;
   mc.noise_tax_force_scale = cfg.noise_tax_force_scale;
+  mc.reread = cfg.reread;
   mc.deadband = cfg.forward_deadband;
   mc.deadband_params = cfg.forward_deadband_params;
   mc.actuation_delay = cfg.master_model_actuation_delay >= 0 ? cfg.master_model_actuation_delay
@@ -160,6 +161,7 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
   }
   sc.noise_tax_delta = cfg.noise_tax_delta;
   sc.noise_tax_force_scale = cfg.noise_tax_force_scale;
+  sc.reread = cfg.reread;
   sc.deadband = cfg.backward_deadband;
   sc.deadband_params = cfg.backward_deadband_params;
   sc.actuation_delay = cfg.slave_model_actuation_delay >= 0 ? cfg.slave_model_actuation_delay
@@ -221,6 +223,7 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
     const auto ms = master.step(now_m, x_m, master_dev.force_cut_after());
     const auto u_m = master.predictor().count_bounds();
     master_dev.command_force(-ms.display_force);
+    if (cfg.reread) master.reread(master_dev.reread_position());
     const double f_display = ms.display_force;
     if (ms.send) fwd_sender.send(forward, fwd_queue, now_m, cfg.packet_bytes, ms.sample);
 
@@ -231,6 +234,7 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
                                                   : 0.0);
     const auto ss = slave.step(now_s, x_s, v_s, f_sensed, slave_dev.force_cut_after());
     slave_dev.command_force(ss.force);
+    if (cfg.reread) slave.reread(slave_dev.reread_position());
     if (ss.send) bwd_sender.send(backward, bwd_queue, now_s, cfg.packet_bytes, ss.sample);
 
     // Metrics on the samples of this step.

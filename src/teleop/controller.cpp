@@ -149,8 +149,18 @@ DeviceModel::DeviceModel(double mass, Nanos dt, double resolution, double force_
 bool DeviceModel::on_unseen_reading() const {
   // A lead of whole samples: the command takes effect on a later reading,
   // not within a sample, which the model would split by readings it saw.
+  // Without a lead, the reading after the command, if the device takes
+  // one, for the first command on a reading: a later one takes effect
+  // after the device moved on from it.
   const double lead = predictor().lead_samples();
+  if (reread_ && lead <= 1e-9) return readings_ != reread_reading_;
   return lead >= 1.0 - 1e-9 && std::fabs(lead - std::round(lead)) <= 1e-6;
+}
+
+double DeviceModel::reread(double dy) {
+  const double w = -pending_change_ * dy;
+  pending_change_ = 0.0;
+  return w;
 }
 
 void DeviceModel::set_noise_tax(double lo, double hi, double delta, double force_scale) {
@@ -178,6 +188,10 @@ DeviceModel::Tax DeviceModel::book_tax(double phi) {
     t.charged += noise_tax_->open();
     if (on_unseen_reading()) {
       t.charged += noise_tax_->charge(dev.held_force(), phi);
+      if (reread_ && dev.lead_samples() <= 1e-9) {
+        pending_change_ = phi - dev.held_force();
+        reread_reading_ = readings_;
+      }
       return t;
     }
   }
@@ -372,6 +386,7 @@ MasterController::MasterController(const MasterConfig& cfg)
                           cfg.force_drift, static_cast<std::size_t>(std::max(0, cfg.refund_lag)));
   model_.set_noise_tax(cfg.encoder_noise_lo, cfg.encoder_noise_hi, cfg.noise_tax_delta,
                        cfg.noise_tax_force_scale);
+  model_.set_reread(cfg.reread);
 }
 
 void MasterController::receive(std::uint32_t seq, const Sample& s) {
@@ -512,6 +527,7 @@ SlaveController::SlaveController(const SlaveConfig& cfg, double position)
                           cfg.force_drift, static_cast<std::size_t>(std::max(0, cfg.refund_lag)));
   model_.set_noise_tax(cfg.encoder_noise_lo, cfg.encoder_noise_hi, cfg.noise_tax_delta,
                        cfg.noise_tax_force_scale);
+  model_.set_reread(cfg.reread);
   if (cfg.passivity == Passivity::kReflective && cfg.report_contact_force) {
     throw std::invalid_argument(
         "SlaveController: energy reflection needs the coupling force reported, not the contact "
@@ -531,6 +547,11 @@ void SlaveController::receive(std::uint32_t seq, const Sample& s) {
     last_seq_ = seq;
     last_ = s;
   }
+}
+
+void MasterController::reread(double position) {
+  if (port_work_) return;
+  port_.account_energy(model_.reread(position - x_sampled_));
 }
 
 SlaveController::Step SlaveController::step(Nanos now, Nanos sampled, double position,
@@ -700,6 +721,13 @@ SlaveController::Step SlaveController::step(Nanos now, Nanos sampled, double pos
     ++sent_;
   }
   return out;
+}
+
+void SlaveController::reread(double position) {
+  if (port_work_) return;
+  const double w = model_.reread(position - x_sampled_);
+  terminal_net_ += w;
+  if (cfg_.passivity == Passivity::kReflective) store_.account_slave_energy(w);
 }
 
 }  // namespace tuushin::teleop

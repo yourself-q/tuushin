@@ -566,3 +566,37 @@ TEST_CASE(teleop_reflective_tdpa_estimates_the_forces_in_flight) {
     CHECK(r.min_true_margin > -1e-9);
   }
 }
+
+TEST_CASE(teleop_model_mediated_books_dithering_encoders_by_a_second_reading) {
+  // Half a count of dither, 100 ms each way, a force that acts at once. The
+  // interval tax bounds nothing for noisy readings; the noise tax needs
+  // each change booked by a reading its choice did not see, which without
+  // an actuation lead only a second reading after the command provides.
+  // With it the master's PC error falls from 15 N to 2.5 N and the master
+  // port stays passive.
+  sim::Teleop1DConfig cfg;
+  cfg.passivity = Passivity::kModelMediated;
+  cfg.duration = from_seconds(20.0);
+  cfg.op.ref_freq = 0.45;
+  cfg.op.ref_amplitude = 0.04;
+  cfg.master_encoder_resolution = cfg.slave_encoder_resolution = 55e-6;
+  cfg.master_encoder_noise = cfg.slave_encoder_noise = 0.5;
+  const auto interval = run(cfg, from_millis(100));
+  cfg.encoder_noise_known = true;
+  const auto unread = run(cfg, from_millis(100));
+  cfg.reread = true;
+  const auto reread = run(cfg, from_millis(100));
+  CHECK(!reread.diverged);
+  CHECK(reread.min_master_true_margin >= 0.0);
+  CHECK(interval.pc_force_rmse > 10.0);
+  // Without the second reading the noise tax does not apply.
+  CHECK(unread.pc_force_rmse > 10.0);
+  CHECK(reread.pc_force_rmse < 0.25 * interval.pc_force_rmse);
+  // The reflective books, with the same tax: what remains is the end term,
+  // the newest reading's noise times the force now, which is not charged.
+  cfg.passivity = Passivity::kReflective;
+  const auto reflective = run(cfg, from_millis(100));
+  CHECK(!reflective.diverged);
+  CHECK(reflective.min_true_margin > -1e-7);
+  CHECK(reflective.max_display_force > 1.0);
+}

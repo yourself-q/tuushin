@@ -167,6 +167,9 @@ struct Teleop1DConfig {
   double encoder_noise_tolerance = 0.1;
   double noise_tax_delta = 1e-3;
   double noise_tax_force_scale = 0.25;
+  // Whether each device reads its encoder again after a command took
+  // effect, for the books (teleop::MasterConfig::reread).
+  bool reread = false;
   // Gaussian noise on the slave's force sensor, N (standard deviation).
   // The metrics use the true contact force.
   double force_sensor_noise = 0.0;

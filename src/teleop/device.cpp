@@ -64,6 +64,12 @@ double SimulatedDevice::read_position(Nanos now) {
   return y_;
 }
 
+double SimulatedDevice::reread_position() {
+  if (q_ <= 0.0) return x_;
+  const double dither = noise_counts_ > 0.0 ? noise_counts_ * noise_.normal() : 0.0;
+  return std::round(x_ / q_ + dither) * q_;
+}
+
 void SimulatedDevice::command_force(double f) {
   if (delay_ > 0) {
     pending_.emplace_back(t_ + delay_, f);
