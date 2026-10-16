@@ -561,6 +561,10 @@ bool RemoteDevice::limits_work() const {
   return connected_ && (info_.flags & kInfoWorkCap) != 0;
 }
 
+bool RemoteDevice::taxes_changes() const {
+  return connected_ && (info_.flags & kInfoTaxesChanges) != 0;
+}
+
 void RemoteDevice::command_force_capped(double f, double work_cap) {
   if (!connected_) return;
   if (!limits_work()) {
@@ -632,8 +636,11 @@ std::optional<double> RemoteDevice::port_work() const {
   if (!connected_) return std::nullopt;
   // The device sums the torque times the angle; with x = sign r theta and
   // the torque sign f r, that is f times x as the controllers see them.
-  // Its tax is work the books have to count as done, less the tax of the
-  // rises it held back, which the books took when they were commanded.
+  // Its tax is work the books have to count as done: of every change of
+  // the torque with firmware that says so (taxes_changes()); with firmware
+  // before it, of the rises it made beyond the host's under a work cap,
+  // less the tax of those it held back, which the books took when they
+  // were commanded.
   return used_.work - work0_ + (used_.tax - tax0_);
 }
 

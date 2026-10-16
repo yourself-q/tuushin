@@ -95,6 +95,9 @@ enum class DeviceKind : std::uint8_t {
 // Info::flags
 constexpr std::uint8_t kInfoCalibrated = 0x01;  // the electrical zero is known
 constexpr std::uint8_t kInfoWorkCap = 0x02;     // keeps to Command::work_cap
+// State::tax is the tax of every change of the torque applied, the host's
+// commands' too: the host's books charge none of their own.
+constexpr std::uint8_t kInfoTaxesChanges = 0x04;
 
 struct Info {
   std::uint8_t protocol = kProtocolVersion;
@@ -143,15 +146,17 @@ struct State {
   // displacement while it acted, over every tick) since the device started
   // (J): what the host's energy books try to know, from the device's side.
   double work = 0.0;
-  // The quantization tax the device booked for raising the torque on its
-  // own, under a work cap, since it started, less the tax of the host's
-  // rises the cap kept it from making (J): with the host's, the tax of
-  // the torques applied. Work counted in encoder counts is off by up to
-  // half a count times each change of the torque (summed by parts), and
-  // a host that books it with its own changes' tax
-  // (control::quantization_tax) knows nothing of the device's. It falls
-  // as well as rises, below 0 too. The cap holds work + tax. 0 from a
-  // device that does not send it.
+  // The tax the device booked since it started (J). Work counted in
+  // encoder counts is off by each change of the torque times the error of
+  // the reading it took effect on (summed by parts), which the tax bounds:
+  // with kInfoTaxesChanges, for every change of the torque applied
+  // (control::quantization_tax for readings off by at most a count,
+  // control::NoiseTax for noisy ones), and work + tax bounds the work
+  // done from above. Without the flag, for the rises the device made on
+  // its own under a work cap, less the tax of the host's rises the cap
+  // kept it from making, which with the host's own tax makes the tax of
+  // the torques applied, and it may fall below 0. The cap holds work +
+  // tax. 0 from a device that does not send it.
   double tax = 0.0;
 };
 

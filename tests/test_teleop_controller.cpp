@@ -3,6 +3,7 @@
 
 #include "test.hpp"
 #include "tuushin/control/held_device.hpp"
+#include "tuushin/control/noise_tax.hpp"
 #include "tuushin/rng.hpp"
 #include "tuushin/teleop/controller.hpp"
 #include "tuushin/teleop/device.hpp"
@@ -300,6 +301,49 @@ TEST_CASE(master_books_forces_in_flight_by_when_they_act) {
   }
   CHECK(std::fabs(error[0]) < 1e-15);
   CHECK(std::fabs(error[1]) > 1e-6);
+}
+
+TEST_CASE(master_leaves_the_tax_to_a_device_that_books_it) {
+  // A dithering 55 um encoder, forces that act a sample after they are
+  // commanded and change every sample: each change is taxed as NoiseTax
+  // charges it. The books take the tax unless the device books it in the
+  // work it reports, where taking it again would charge every change
+  // twice: then they differ from the taxed ones by exactly the tax.
+  WallParams far;
+  far.position = 10.0;
+  const double q = 55e-6;
+  double net[2];
+  double tax = 0.0;
+  for (const bool device : {false, true}) {
+    SimulatedSlave dev(0.2, 0.0, far, kNanosPerMilli, 10);
+    dev.set_encoder_resolution(q);
+    dev.set_encoder_noise(0.5);
+    dev.set_actuation_delay(kNanosPerMilli);
+    MasterConfig cfg;
+    cfg.passivity = Passivity::kNone;
+    cfg.actuation_delay = kNanosPerMilli;
+    cfg.encoder_resolution = q;
+    cfg.encoder_noise_lo = 0.45;
+    cfg.encoder_noise_hi = 0.55;
+    cfg.device_taxes_changes = device;
+    MasterController m(cfg);
+    const auto d = control::dither_bounds(0.45, 0.55);
+    control::NoiseTax books(q * d.bias, q * d.proxy, cfg.noise_tax_delta,
+                            cfg.noise_tax_force_scale);
+    double prev = 0.0, charged = 0.0;
+    for (int k = 0; k < 40; ++k) {
+      const Nanos now = k * kNanosPerMilli;
+      m.receive(k + 1, Sample{3.0 * std::sin(0.7 * k), 0.0, 0.0});
+      const auto s = m.step(now, dev.read_position(now));
+      dev.command_force(-s.display_force);
+      charged += books.charge(prev, s.display_force);
+      prev = s.display_force;
+    }
+    net[device ? 1 : 0] = m.port().input_energy() - m.port().output_energy();
+    tax = charged;
+  }
+  CHECK(tax > 1e-5);
+  CHECK_NEAR(net[1] - net[0], tax, 1e-9 * tax);
 }
 
 TEST_CASE(held_device_filter_finds_the_hands_damping_and_stiffness) {

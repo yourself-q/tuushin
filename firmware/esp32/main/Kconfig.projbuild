@@ -230,6 +230,42 @@ menu "tuushin device"
             help
                 A reading takes some 50 us at 1 MHz and 120 us at 400 kHz,
                 which a 200 us tick cannot spare.
+
+        config TUUSHIN_ENC_REREAD
+            bool "Read the encoder again after each change of the torque"
+            depends on !TUUSHIN_ENCODER_AS5600
+            default y
+            help
+                A second transfer once the new duties are out: the books
+                take the change at that reading, which nothing decided on,
+                so that a noisy encoder's error can be taxed by its bound
+                (the noise range below). It costs a transfer, some 6 us at
+                4 MHz, on each tick that changes the torque. The device
+                checks that the second reading is a conversion of its own
+                and logs the check ("reread: indep ...") after 4096 of
+                them: near 1 it is, near 0 the encoder repeated its last
+                conversion. Not for the AS5600, whose filter settles over
+                longer than the tick.
+
+        config TUUSHIN_ENC_NOISE_LO_MILLICOUNTS
+            int "Encoder noise before its rounding, lowest (thousandths of a count)"
+            range 0 10000
+            default 0
+            help
+                The standard deviation of the encoder's noise before it
+                rounds to a count, as a range the true one lies in. With
+                a second reading and the highest above 0 the device taxes
+                each change of the torque by the noise's bound
+                (control/noise_tax.hpp); with the highest 0, by the count's
+                width, which bounds only noiseless readings. The reread
+                log gives the readings' error, rounding included, beside
+                what this range makes it: set the range so that the
+                measured error lies within it, with a margin.
+
+        config TUUSHIN_ENC_NOISE_HI_MILLICOUNTS
+            int "Encoder noise before its rounding, highest (thousandths of a count; 0: unknown)"
+            range 0 10000
+            default 0
     endmenu
 
     menu "Supply"

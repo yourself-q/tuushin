@@ -133,7 +133,9 @@ class Plant {
 };
 
 // The firmware's view of a simulated motor: its parameters as a datasheet
-// would give them, the knob's inertia, and kSimulated for its kind.
+// would give them, the knob's inertia, and kSimulated for its kind; the
+// encoder's noise within 10 % of the plant's, as the host is told it in
+// the teleoperation's simulation (sim::Teleop1DConfig).
 DeviceConfig device_config_for(const PlantParams& p, const char* name = "sim");
 
 // The board, simulated: a Hal over a Plant, on a clock the caller sets, with
@@ -158,6 +160,7 @@ class SimHal : public Hal {
 
   std::uint32_t micros() override;
   bool read_encoder(std::uint32_t* raw) override;
+  bool reread_encoder(std::uint32_t* raw) override;
   void set_duties(float a, float b, float c) override;
   void enable_driver(bool on) override;
   float supply_voltage() override { return static_cast<float>(plant_.params().supply); }
@@ -175,6 +178,11 @@ class SimHal : public Hal {
   bool driver_on() const { return driver_; }
   // Fails the encoder from now on, as a loose wire does.
   void break_encoder(bool broken) { encoder_broken_ = broken; }
+  // What reading the encoder again gives: a conversion of its own at the
+  // same instant (the plant does not move within a tick), none, or the
+  // first reading again, as an encoder that filters over the tick does.
+  enum class Reread { kFresh, kNone, kSame };
+  void set_reread(Reread r) { reread_ = r; }
   Calibration stored;
 
  private:
@@ -185,6 +193,8 @@ class SimHal : public Hal {
   double rate_ = 1.0;
   bool driver_ = false;
   bool encoder_broken_ = false;
+  Reread reread_ = Reread::kFresh;
+  std::uint32_t last_raw_ = 0;
   std::deque<std::pair<double, std::uint8_t>> to_device_, to_host_;
 };
 

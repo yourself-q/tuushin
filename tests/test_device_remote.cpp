@@ -230,14 +230,17 @@ TEST_CASE(remote_force_turns_the_knob_against_a_hand) {
 TEST_CASE(remote_port_work_is_the_devices_from_the_connect_on) {
   // What the controllers book: the work the host's torque did, which the
   // firmware sums over its ticks, counted from the connect so that a
-  // calibration's sweeps are not in it; with no damping on the device's
-  // ticks, all the work the motor did.
+  // calibration's sweeps are not in it, with no damping on the device's
+  // ticks all the work the motor did; and the tax of the torque's changes,
+  // which the firmware books as it applies them.
   for (bool reverse : {false, true}) {
     RemoteConfig cfg;
     cfg.reverse = reverse;
     Bench b(quiet(), 0.5e-3, cfg);
     CHECK(!b.dev->port_work().has_value());
+    CHECK(!b.dev->taxes_changes());
     b.dev->connect();
+    CHECK(b.dev->taxes_changes());
     REQUIRE(b.dev->port_work().has_value());
     CHECK(*b.dev->port_work() == 0.0);
     const double w0 = b.link->plant().motor_work();
@@ -247,8 +250,11 @@ TEST_CASE(remote_port_work_is_the_devices_from_the_connect_on) {
     // 1 N out to 4 mm against the hand's spring, then 0.5 N the other way
     // to 2 mm on the other side: 4 mJ and 3 mJ.
     const double w = *b.dev->port_work();
-    CHECK_NEAR(w, b.link->plant().motor_work() - w0, 2e-5);
-    CHECK_NEAR(w, b.dev->actuator_work(), 0.0);
+    CHECK_NEAR(b.dev->actuator_work(), b.link->plant().motor_work() - w0, 2e-5);
+    // Without the encoder's noise, a count per N m by which the torque
+    // grows: to 1 N, and to 0.5 N the other way.
+    const double q = b.dev->encoder_resolution();
+    CHECK_NEAR(w - b.dev->actuator_work(), q * (1.0 + 0.5), 1e-9);
     CHECK_NEAR(w, 1.0 * 0.004 + 0.5 * 0.006, 3e-4);
   }
 }

@@ -68,6 +68,12 @@ class Device1D {
   // was done, and a device against a stiff object can do a contact's
   // worth of it in that time; the device can stop it within a tick.
   virtual bool limits_work() const { return false; }
+  // Whether port_work() carries the tax of every change of the force, the
+  // bound on what the encoder's resolution and noise hide in the work,
+  // booked by the device as it applies the changes (device::kInfoTaxesChanges).
+  // The controllers then book none of their own for the changes they
+  // command, which would count it twice.
+  virtual bool taxes_changes() const { return false; }
   // command_force, with port_work() kept at most `work_cap` (J, on
   // port_work()'s count) while this force is in effect, if the device
   // limits_work(); a force that takes energy out is never held back.

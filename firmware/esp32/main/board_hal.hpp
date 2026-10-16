@@ -21,6 +21,21 @@ class BoardHal final : public fw::Hal {
 
   std::uint32_t micros() override;
   bool read_encoder(std::uint32_t* raw) override { return encoder_.read(raw); }
+  // Another transfer, if the menuconfig takes one (TUUSHIN_ENC_REREAD).
+  // The new duties are out but take effect with the PWM's next period, up
+  // to 50 us on at 20 kHz, and the current follows them over the windings'
+  // L / R: no reading is at the change, and the one at once is as near it
+  // as the core assumes (see "Reading again" in firmware/core/src/core.cpp).
+  // A transfer that fails twice leaves that change booked by the tick's
+  // reading, and counts in bad_frames().
+  bool reread_encoder(std::uint32_t* raw) override {
+#if CONFIG_TUUSHIN_ENC_REREAD
+    return encoder_.read(raw);
+#else
+    (void)raw;
+    return false;
+#endif
+  }
   void set_duties(float a, float b, float c) override { bridge_.set(a, b, c); }
   void enable_driver(bool on) override { bridge_.enable(on); }
   float supply_voltage() override { return supply_.voltage(); }

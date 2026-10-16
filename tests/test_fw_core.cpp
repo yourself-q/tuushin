@@ -23,9 +23,14 @@ namespace {
 constexpr double kTwoPiD = 6.283185307179586;
 
 // The firmware's view of the simulated motor: the same parameters, unless a
-// test makes them differ.
+// test makes them differ, and the encoder's noise within 10 % of the
+// plant's, as device_config_for gives it.
 DeviceConfig config_for(const PlantParams& p) {
   DeviceConfig c;
+  if (p.encoder_noise > 0.0) {
+    c.reading_noise_lo = static_cast<float>(p.encoder_noise / 1.1);
+    c.reading_noise_hi = static_cast<float>(p.encoder_noise * 1.1);
+  }
   c.motor.pole_pairs = p.pole_pairs;
   c.motor.phase_resistance = static_cast<float>(p.phase_resistance);
   c.motor.torque_constant = static_cast<float>(p.kt);
@@ -394,6 +399,7 @@ TEST_CASE(fw_work_cap_holds_the_work_on_a_hand) {
     rig.run(0.01);
     REQUIRE(rig.have_info);
     CHECK(rig.info.flags & kInfoWorkCap);
+    CHECK(rig.info.flags & kInfoTaxesChanges);
     HandParams h;
     h.present = true;
     h.k = 0.1;
@@ -448,10 +454,15 @@ TEST_CASE(fw_work_cap_holds_the_work_on_a_hand) {
 
 TEST_CASE(fw_work_cap_far_off_changes_nothing) {
   // A cap the work never comes near: the torque is the host's, and the
-  // device taxes none of its changes, which the host's books tax.
+  // device taxes each of its changes once, as applied, on the noise tax's
+  // books (control::NoiseTax), as the configuration gives the encoder's
+  // noise. The host's sine, a small change every millisecond, costs a
+  // fraction of what the interval tax would take for it.
   PlantParams p;
-  Rig rig(p, config_for(p));
+  const DeviceConfig cfg = config_for(p);
+  Rig rig(p, cfg);
   REQUIRE(rig.calibrate());
+  REQUIRE(rig.core.noise_tax() != nullptr);
   HandParams h;
   h.present = true;
   h.ref_offset = rig.plant.angle();
@@ -459,18 +470,37 @@ TEST_CASE(fw_work_cap_far_off_changes_nothing) {
   h.ref_freq = 1.0;
   rig.plant.set_hand(h, rig.t);
   rig.states.clear();
+  const double q = kTwoPiD / p.counts_per_rev;
+  const control::DitherBounds d = control::dither_bounds(cfg.reading_noise_lo, cfg.reading_noise_hi);
+  control::NoiseTax books(q * d.bias, q * d.proxy, cfg.noise_tax_delta, cfg.noise_tax_torque);
+  const double tax0 = rig.core.tax();
+  double expected = 0.0, interval = 0.0;
+  float prev = rig.core.applied_torque();
+  auto charge = [&] {
+    const float a = rig.core.applied_torque();
+    if (a != prev) {
+      expected += books.charge(prev, a);
+      const double kept = a * prev > 0.0f ? std::fabs(prev) : 0.0;
+      interval += q * std::max(0.0, std::fabs(static_cast<double>(a)) - kept);
+    }
+    prev = a;
+  };
   auto next = std::make_shared<double>(rig.t);
   rig.run(1.0, [&](double now) {
+    charge();
     if (now + 1e-12 < *next) return;
     *next += 1e-3;
     rig.command_capped(0.03 * std::sin(2 * 3.14159 * 3.0 * now), 1.0);
   });
+  charge();
   REQUIRE(!rig.states.empty());
-  for (const State& st : rig.states) {
-    CHECK(st.tax == 0.0);
-    CHECK(!(st.flags & kStateCapped));
-  }
+  for (const State& st : rig.states) CHECK(!(st.flags & kStateCapped));
   CHECK(rig.core.worst_overrun() == 0.0);
+  CHECK(expected > 0.0);
+  // The device's q is in single precision.
+  CHECK_NEAR(rig.core.tax() - tax0, expected, 1e-6 * expected);
+  CHECK(expected < 0.5 * interval);
+  std::printf("  noise tax %.3e J, interval tax %.3e J of the same changes\n", expected, interval);
 }
 
 TEST_CASE(fw_work_cap_lets_a_torque_take_energy_out) {
@@ -781,7 +811,11 @@ TEST_CASE(fw_work_cap_spent_keeps_the_torque_steady) {
   // tax at every count, twice what it took out. A torque that would do
   // work on a knob at rest stays off, whether a hand holds the knob or
   // not, and even as the encoder's noise makes the knob seem to move
-  // against it now and then.
+  // against it now and then. With the noise, the torque's rise from rest
+  // pays the noise tax, 2.0e-5 J with the books' opening where the
+  // interval tax took 5.4e-6, which at 1.6 rad/s, less the estimate's
+  // spread, it does not take back within kTaxHorizonUs: the hand turns
+  // the knob twice as fast there.
   for (int scene : {0, 1, 2}) {
     for (bool noisy : {false, true}) {
       PlantParams p = noisy ? PlantParams{} : quiet_plant();
@@ -792,7 +826,7 @@ TEST_CASE(fw_work_cap_spent_keeps_the_torque_steady) {
       h.k = 0.5;
       h.b = 5e-3;
       h.ref_offset = rig.plant.angle();
-      h.ref_amplitude = scene == 0 ? 2.0 : 0.0;  // up to 1.6 rad/s
+      h.ref_amplitude = scene == 0 ? (noisy ? 4.0 : 2.0) : 0.0;  // up to 1.6 or 3.4 rad/s
       h.ref_freq = 0.25;
       rig.plant.set_hand(h, rig.t);
       const double w0 = rig.core.last_state().work;
@@ -828,28 +862,19 @@ TEST_CASE(fw_work_cap_spent_keeps_the_torque_steady) {
 }
 
 TEST_CASE(fw_work_cap_taxes_the_torques_applied) {
-  // The host's books tax the rises it commands; the device taxes those it
-  // makes beyond them and gives back the tax of those it holds back, so
-  // that the two together tax the torques applied. A cap spent while the
-  // knob is at rest holds back every rise, whose tax comes back; a cap
-  // far off then lets the torque on, and the device taxes that rise.
+  // The device taxes the torques it applies, not those commanded: a cap
+  // spent while the knob is at rest holds back every rise the host asks
+  // for, which then costs nothing; a cap far off lets the torque on, and
+  // the device taxes that rise, q per N m without the encoder's noise.
   PlantParams p = quiet_plant();
   Rig rig(p, config_for(p));
   REQUIRE(rig.calibrate());
+  REQUIRE(rig.core.noise_tax() == nullptr);
   const double q = kTwoPiD / p.counts_per_rev;
-  auto growth = [](double from, double to) {
-    const double kept = from * to > 0.0 ? std::fabs(from) : 0.0;
-    return std::max(0.0, std::fabs(to) - kept);
-  };
-  const double w0 = rig.core.last_state().work;
-  const double tax0 = rig.core.last_state().tax;
-  double host_tax = 0.0;
-  double sent = 0.0;
+  const double w0 = rig.core.work();
+  const double tax0 = rig.core.tax();
   double most = 0.0;  // the largest torque applied
   auto hold = [&](double dur, double torque, double cap) {
-    const double t = static_cast<float>(torque);
-    host_tax += q * growth(sent, t);
-    sent = t;
     auto next = std::make_shared<double>(rig.t);
     rig.run(dur, [&](double now) {
       most = std::max(most, std::fabs(static_cast<double>(rig.core.applied_torque())));
@@ -864,14 +889,149 @@ TEST_CASE(fw_work_cap_taxes_the_torques_applied) {
   hold(1e-3, 0.0, spent);
   hold(5e-3, 0.01, spent);
   CHECK(most < 1e-6);
-  const State s1 = rig.states.back();
-  CHECK(s1.work == w0);
-  CHECK_NEAR(s1.tax - tax0, -host_tax, 1e-10);
-  CHECK_NEAR(host_tax, q * 0.04, 1e-10);
+  CHECK(rig.core.work() == w0);
+  CHECK(rig.core.tax() == tax0);
 
   hold(5e-3, 0.01, w0 + 1.0);
   CHECK_NEAR(most, 0.01, 1e-4);
-  const State s2 = rig.states.back();
-  CHECK(s2.work > w0);
-  CHECK_NEAR(host_tax + (s2.tax - tax0), q * 0.01, 1e-10);
+  CHECK(rig.core.work() > w0);
+  CHECK_NEAR(rig.core.tax() - tax0, q * 0.01, 1e-10);
+}
+
+TEST_CASE(fw_noise_tax_bounds_the_true_work) {
+  // A hand moves the knob slowly, and a host renders a stiff spring from
+  // the noisy counts the States carry, at 1 kHz, whose torque then dithers
+  // with the readings. The books, the work and the tax, bound the work the
+  // torque truly did, the torque times the shaft's turn, from below at
+  // every tick, up to the newest reading's error times the torque
+  // (control/noise_tax.hpp): with the encoder read again after every
+  // change, with the second reading the first one again, and without. The
+  // interval tax of the same changes, which bounds nothing here, is
+  // several times the noise tax: it grows with every dither, where the
+  // noise tax grows with their root sum of squares.
+  for (SimHal::Reread mode : {SimHal::Reread::kFresh, SimHal::Reread::kSame, SimHal::Reread::kNone}) {
+    PlantParams p;
+    Rig rig(p, config_for(p));
+    rig.hal.set_reread(mode);
+    REQUIRE(rig.calibrate());
+    HandParams h;
+    h.present = true;
+    h.k = 0.5;
+    h.b = 5e-3;
+    h.ref_offset = rig.plant.angle();
+    h.ref_amplitude = 0.05;
+    h.ref_freq = 0.5;
+    rig.plant.set_hand(h, rig.t);
+    const double q = kTwoPiD / p.counts_per_rev;
+    const double error_sd = std::sqrt(p.encoder_noise * p.encoder_noise + 1.0 / 12.0) * q;
+    const double books0 = rig.core.work() + rig.core.tax();
+    const double tax0 = rig.core.tax();
+    const std::int32_t c0 = rig.core.count();
+    double truth = 0.0, interval = 0.0, worst = -1.0, short_raw = 0.0;
+    double angle = rig.plant.angle();
+    float held = rig.core.applied_torque();
+    auto next = std::make_shared<double>(rig.t);
+    rig.run(5.0, [&](double now) {
+      // The plant as of the last tick's reading, and the torque that tick
+      // applied, which acts until this one's.
+      const double a = rig.plant.angle();
+      truth += static_cast<double>(held) * (a - angle);
+      angle = a;
+      const float now_held = rig.core.applied_torque();
+      const double kept = now_held * held > 0.0f ? std::fabs(held) : 0.0;
+      interval += q * std::max(0.0, std::fabs(static_cast<double>(now_held)) - kept);
+      const double end = std::max(std::fabs(held), std::fabs(now_held)) * 5.0 * error_sd;
+      held = now_held;
+      const double books = rig.core.work() + rig.core.tax() - books0;
+      worst = std::max(worst, truth - books - end);
+      short_raw = std::max(short_raw, truth - books);
+      if (now + 1e-12 < *next || rig.states.empty()) return;
+      *next += 1e-3;
+      const double x = static_cast<double>(rig.states.back().count - c0) * q;
+      rig.command(std::clamp(-1.0 * x, -0.02, 0.02));
+    });
+    const double tax = rig.core.tax() - tax0;
+    std::printf("  reread %d: true work %.4e J, books %.4e J, short by %.2e J at worst (%.2e past the end "
+                "term); %u rereads, noise tax %.2e J, interval %.2e J\n",
+                static_cast<int>(mode), truth, rig.core.work() + rig.core.tax() - books0, short_raw, worst,
+                rig.core.rereads(), tax, interval);
+    CHECK(worst <= 0.0);
+    CHECK(tax < 0.25 * interval);
+    CHECK(std::fabs(truth) > 1e-5);  // the spring did work
+    CHECK(rig.core.rereads() > 0 || mode == SimHal::Reread::kNone);
+  }
+}
+
+TEST_CASE(fw_reread_independence_is_measured) {
+  // The device checks that its second readings are conversions of their
+  // own: independent errors make the square of the second less the first
+  // twice the readings' error variance, and the same error again makes it
+  // none. It tells of it in a log once kRereadWindow (4096) are in.
+  for (SimHal::Reread mode : {SimHal::Reread::kFresh, SimHal::Reread::kSame, SimHal::Reread::kNone}) {
+    PlantParams p;
+    Rig rig(p, config_for(p));
+    rig.hal.set_reread(mode);
+    REQUIRE(rig.calibrate());
+    HandParams h;
+    h.present = true;
+    h.k = 0.5;
+    h.b = 5e-3;
+    h.ref_offset = rig.plant.angle();
+    h.ref_amplitude = 0.0;
+    rig.plant.set_hand(h, rig.t);
+    int k = 0;
+    rig.run(1.0, [&](double) { rig.command(++k % 2 ? 0.005 : 0.006); });
+    std::printf("  reread %d: %u rereads, independence %.3f\n", static_cast<int>(mode),
+                rig.core.rereads(), static_cast<double>(rig.core.reread_independence()));
+    if (mode == SimHal::Reread::kNone) {
+      CHECK(rig.core.rereads() == 0);
+      CHECK(!rig.logged("reread:"));
+      continue;
+    }
+    CHECK(rig.core.rereads() >= 4096);
+    CHECK(rig.logged("reread: indep"));
+    if (mode == SimHal::Reread::kFresh) {
+      CHECK_NEAR(rig.core.reread_independence(), 1.0, 0.1);
+    } else {
+      CHECK(rig.core.reread_independence() < 0.05f);
+    }
+  }
+}
+
+TEST_CASE(fw_noise_books_open_with_the_host) {
+  // The noise tax's bound holds for its books from where they open: they
+  // open at the first change of the torque, and again at a Hello while no
+  // host drives. A noise range that makes no sense leaves the interval
+  // tax, and says so.
+  PlantParams p;
+  DeviceConfig bad = config_for(p);
+  bad.reading_noise_lo = 0.6f;
+  bad.reading_noise_hi = 0.5f;
+  Rig wrong(p, bad);
+  wrong.run(0.01);
+  CHECK(wrong.core.noise_tax() == nullptr);
+  CHECK(wrong.logged("reading noise misconfigured"));
+
+  Rig rig(p, config_for(p));
+  REQUIRE(rig.calibrate());
+  REQUIRE(rig.core.noise_tax() != nullptr);
+  CHECK(!rig.core.noise_tax()->opened());
+  rig.command(0.01);
+  rig.run(0.01);
+  CHECK(rig.core.noise_tax()->opened());
+  CHECK(rig.core.noise_tax()->variance() > 0.0);
+  const double tax = rig.core.tax();
+  CHECK(tax > 0.0);
+  // A Hello while the host drives keeps the books.
+  rig.bare(MsgType::kHello);
+  rig.run(0.01);
+  CHECK(rig.core.noise_tax()->opened());
+  // Released, a Hello starts new books; the tax booked stays booked.
+  rig.command(0.0, 0);
+  rig.run(0.01);
+  rig.bare(MsgType::kHello);
+  rig.run(0.01);
+  CHECK(!rig.core.noise_tax()->opened());
+  CHECK(rig.core.noise_tax()->variance() == 0.0);
+  CHECK(rig.core.tax() >= tax);
 }

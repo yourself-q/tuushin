@@ -68,6 +68,10 @@ DeviceConfig device_config_for(const PlantParams& p, const char* name) {
   c.inertia = static_cast<float>(p.inertia);
   c.supply_min = static_cast<float>(0.8 * p.supply);
   c.supply_max = static_cast<float>(1.2 * p.supply);
+  if (p.encoder_noise > 0.0) {
+    c.reading_noise_lo = static_cast<float>(p.encoder_noise / 1.1);
+    c.reading_noise_hi = static_cast<float>(p.encoder_noise * 1.1);
+  }
   c.kind = device::DeviceKind::kSimulated;
   std::snprintf(c.name, sizeof c.name, "%s", name);
   return c;
@@ -154,7 +158,13 @@ std::uint32_t SimHal::micros() {
 bool SimHal::read_encoder(std::uint32_t* raw) {
   plant_.advance(now_);
   if (encoder_broken_) return false;
-  *raw = plant_.encoder_raw();
+  *raw = last_raw_ = plant_.encoder_raw();
+  return true;
+}
+
+bool SimHal::reread_encoder(std::uint32_t* raw) {
+  if (encoder_broken_ || reread_ == Reread::kNone) return false;
+  *raw = reread_ == Reread::kSame ? last_raw_ : plant_.encoder_raw();
   return true;
 }
 

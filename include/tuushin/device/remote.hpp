@@ -128,11 +128,14 @@ class RemoteDevice final : public teleop::Device1D {
   // first command switches the driver on.
   void command_force(double f) override;
   Nanos force_cut_after() const override;
-  // The work the State used last reports, with the tax the device booked
-  // on its own under a work cap, since connect().
+  // The work the State used last reports, with the tax the device booked,
+  // since connect().
   std::optional<double> port_work() const override;
   // With firmware that keeps work caps (Info::flags & kInfoWorkCap).
   bool limits_work() const override;
+  // With firmware that taxes every change of its torque
+  // (Info::flags & kInfoTaxesChanges).
+  bool taxes_changes() const override;
   // The cap goes to the device on its own count; with firmware that keeps
   // none, the force goes without it.
   void command_force_capped(double f, double work_cap) override;

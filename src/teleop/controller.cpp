@@ -174,7 +174,7 @@ void DeviceModel::set_noise_tax(double lo, double hi, double delta, double force
 }
 
 const control::NoiseTax* DeviceModel::change_tax() const {
-  return noise_tax_ && on_unseen_reading() ? &*noise_tax_ : nullptr;
+  return noise_tax_ && (device_taxes_ || on_unseen_reading()) ? &*noise_tax_ : nullptr;
 }
 
 DeviceModel::Tax DeviceModel::book_tax(double phi) {
@@ -182,6 +182,14 @@ DeviceModel::Tax DeviceModel::book_tax(double phi) {
   const control::DevicePredictor& dev = predictor();
   const double q = dev.resolution();
   if (!(q > 0.0)) return t;
+  if (device_taxes_) {
+    // The device books the tax of each change as it applies it, in the
+    // work it reports: the books here are only the plan of its charges.
+    // The device's own changes, a work cap's or a voltage limit's, and
+    // its noise range, are not in them.
+    if (noise_tax_) noise_tax_->charge(dev.held_force(), phi);
+    return t;
+  }
   if (noise_tax_) {
     // Opened with the first command, before any force: U(0) is a debt the
     // first rise must repay, as with a deficit.
@@ -387,6 +395,7 @@ MasterController::MasterController(const MasterConfig& cfg)
   model_.set_noise_tax(cfg.encoder_noise_lo, cfg.encoder_noise_hi, cfg.noise_tax_delta,
                        cfg.noise_tax_force_scale);
   model_.set_reread(cfg.reread);
+  model_.set_device_taxes(cfg.device_taxes_changes);
 }
 
 void MasterController::receive(std::uint32_t seq, const Sample& s) {
@@ -536,6 +545,7 @@ SlaveController::SlaveController(const SlaveConfig& cfg, double position)
   model_.set_noise_tax(cfg.encoder_noise_lo, cfg.encoder_noise_hi, cfg.noise_tax_delta,
                        cfg.noise_tax_force_scale);
   model_.set_reread(cfg.reread);
+  model_.set_device_taxes(cfg.device_taxes_changes);
   if (cfg.passivity == Passivity::kReflective && cfg.report_contact_force) {
     throw std::invalid_argument(
         "SlaveController: energy reflection needs the coupling force reported, not the contact "

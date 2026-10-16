@@ -1558,14 +1558,31 @@ Patten 1991), taking the worse of a rotor alone and of one held by a
 hand of any inertia, and lowers the torque until the work fits what is
 left. Once the cap is spent it holds the torque while the torque does no
 work, and lets it rise again only where the work the rise takes out
-repays the quantization tax it costs. A rise it holds back it does not
-make, and it gives back the tax the host's books took for it when they
-commanded it (`State::tax` falls). Until it did, a slave on the emulated
-board, at rest against the object while its host raised the force twice,
-left the store 0.09 mJ down for as long as it stayed there: more than
-half of that run's lowest margin, −0.166 mJ. What it cannot foresee, the
-books then owe. A shaft at a count's edge steps the torque's way
-unannounced, the torque times a count: 38 µJ at the ceiling. And the
+repays the tax it costs. The device taxes every change of the torque it
+applies, the host's, the cap's, the voltage limit's, as it applies it,
+and reports the tax with the work (`State::tax`; `kInfoTaxesChanges` in
+its Info), so that the host's books take none of their own. A rise it
+holds back then costs nothing: when the host taxed its commands, a slave
+on the emulated board, at rest against the object while its host raised
+the force twice, left the store 0.09 mJ down for as long as it stayed
+there, more than half of that run's lowest margin, −0.166 mJ, until the
+device gave back the tax of what it held back. With the encoder's noise
+configured, the tax is the noise tax (Encoders that dither, again, under
+Model-mediated teleoperation above), and each change is booked by a
+second reading taken once the new duties are out, which nothing decided
+on (`Hal::reread_encoder`; "Reading again" in
+`firmware/core/src/core.cpp`). On the simulated motor at half a count,
+the noise tax takes 3.4e−5 J where the interval tax takes 6.9e−5 J for
+the same motions under a cap far off, and 3.0e−5 against 2.1e−4 J on a
+stiff spring, with the true work never above the books; a first rise
+from rest costs about 3.6 times the interval tax. The device checks that
+the second reading is a conversion of its own: the two readings'
+difference, less the motion the velocity predicts, has twice the
+readings' variance for independent noise and none for the same error
+read again (0.98 and 0 on the simulated motor), and it logs the measure
+after 4096 rereads. What the device cannot foresee as it keeps to the
+cap, the books then owe. A shaft at a count's edge steps the torque's
+way unannounced, the torque times a count: 38 µJ at the ceiling. And the
 velocity estimate lags a stiff contact's push as it changes, which the
 torque turns into work at τ·dt for each rad/s it misses: where the cap
 is spent, a knob thrown off the object meets a torque the prediction
@@ -1705,6 +1722,22 @@ few milliseconds, and the device held each rise back.
   without current sensing, so the energy books are as right as the
   motor's resistance and torque constant, and the resistance drifts with
   the windings' temperature.
+- **A device's noise tax rests on a second conversion, on time it has
+  not been measured to have, and on the change's instant.** Whether an
+  MT6701 or an AS5047P converts anew for a second transfer some 10 µs
+  after the first, and whether its noise is white at the tick, is
+  unmeasured: their datasheets do not give the conversion's timing or
+  filter, and the device's own check (`reread: indep` in its log) is
+  what will tell. The tax is computed in double precision, which these
+  chips do in software: with one logarithm and one square root a change
+  and some forty other operations, about 5000 cycles on an ESP32-S3 by
+  Espressif's figures (1619 for a double `cos`, 70 for an addition),
+  some 20 µs of the 200 µs tick, also unmeasured. And the books put each
+  change where the duties are set, while the current follows them over
+  the windings' L / R, some 0.2 ms on a gimbal motor: a spring rendered
+  by the device lags by that much, which makes energy the books do not
+  see, about k ω² (L / R), 0.25 mW for 1 N m/rad at 1 rad/s, as much in
+  a tenth of a second as the noise tax charges in a run.
 - **A device keeps to its work cap closely, not exactly.** What its
   readings cannot foresee, a count's step and the velocity estimate's
   lag behind a stiff contact's push, overruns the cap by up to 70 µJ at

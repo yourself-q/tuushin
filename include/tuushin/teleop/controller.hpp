@@ -217,6 +217,11 @@ class DeviceModel {
   // at once, the first on its reading, is then also taxed as NoiseTax
   // charges it, as the reading it is booked by is one it did not see.
   void set_reread(bool on) { reread_ = on; }
+  // Whether the device books the tax of every change of its force itself,
+  // in the work it reports (Device1D::taxes_changes): book_tax() then
+  // books none, and keeps the noise tax's books only as the plan of what
+  // the device will charge (change_tax()).
+  void set_device_taxes(bool on) { device_taxes_ = on; }
   // The correction to the books when the command just booked took effect
   // with the encoder `dy` from the reading it was chosen on: the boundary
   // between the force before and the force after moves to the new reading,
@@ -224,7 +229,8 @@ class DeviceModel {
   // the command.
   double reread(double dy);
   // The noise tax when it applies to the next command, as
-  // limit_force_predictive takes it; null otherwise.
+  // limit_force_predictive takes it (with set_device_taxes(), whenever it
+  // is set); null otherwise.
   const control::NoiseTax* change_tax() const;
   // The noise tax's books, if it was set.
   const control::NoiseTax* noise_tax() const { return noise_tax_ ? &*noise_tax_ : nullptr; }
@@ -267,6 +273,7 @@ class DeviceModel {
   std::size_t refund_lag_;
   std::optional<control::NoiseTax> noise_tax_;
   bool reread_ = false;
+  bool device_taxes_ = false;
   double pending_change_ = 0.0;  // phi - prev of the command to reread after
   long reread_reading_ = -1;     // the reading the last such command was chosen on
   // Whether the next command takes effect on a reading it did not see.
@@ -338,6 +345,10 @@ struct MasterConfig {
   // step: a force that takes effect at once is then taxed by the noise
   // bound too (DeviceModel::set_reread).
   bool reread = false;
+  // Whether the device books the tax of every change of its force in the
+  // port_work() it reports (Device1D::taxes_changes), and the books take
+  // none of their own (DeviceModel::set_device_taxes).
+  bool device_taxes_changes = false;
   bool deadband = false;
   codec::DeadbandParams deadband_params{0.1, 0.002, from_millis(100)};
   // How long after a command the device applies it (ActuatorSchedule). The
@@ -511,6 +522,7 @@ struct SlaveConfig {
   double noise_tax_delta = 1e-3;
   double noise_tax_force_scale = 0.25;  // N
   bool reread = false;
+  bool device_taxes_changes = false;
   bool deadband = false;
   codec::DeadbandParams deadband_params{0.1, 0.05, from_millis(100)};
   // Between samples the slave extrapolates the master position with the last

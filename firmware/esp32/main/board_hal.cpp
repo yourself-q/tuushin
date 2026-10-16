@@ -42,6 +42,8 @@ fw::DeviceConfig board_config() {
   c.supply_max = CONFIG_TUUSHIN_SUPPLY_MAX_MV * 1e-3f;
   c.align_voltage = CONFIG_TUUSHIN_ALIGN_MV * 1e-3f;
   c.tick_us = CONFIG_TUUSHIN_TICK_US;
+  c.reading_noise_lo = CONFIG_TUUSHIN_ENC_NOISE_LO_MILLICOUNTS * 1e-3f;
+  c.reading_noise_hi = CONFIG_TUUSHIN_ENC_NOISE_HI_MILLICOUNTS * 1e-3f;
   c.kind = device::DeviceKind::kTorqueMotor;
   std::snprintf(c.name, sizeof c.name, "%s", CONFIG_TUUSHIN_NAME);
   return c;

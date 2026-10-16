@@ -30,6 +30,8 @@ class EmulatedHal final : public fw::Hal {
 
   std::uint32_t micros() override;
   bool read_encoder(std::uint32_t* raw) override;
+  // A conversion of its own: the simulated encoder's noise is drawn anew.
+  bool reread_encoder(std::uint32_t* raw) override { return read_encoder(raw); }
   void set_duties(float a, float b, float c) override;
   void enable_driver(bool on) override;
   float supply_voltage() override { return static_cast<float>(plant_.params().supply); }

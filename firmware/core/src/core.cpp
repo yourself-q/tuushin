@@ -30,6 +30,9 @@ constexpr float kTaxHorizonUs = 1000.0f;
 // reading errors are measured (keep_to_cap).
 constexpr float kRiseConfidence = 4.0f;
 constexpr float kReadingNoiseUs = 100000.0f;
+// How many second readings the check of their independence averages over,
+// and tells of once it has (DeviceCore::reread).
+constexpr std::uint32_t kRereadWindow = 4096;
 
 std::uint16_t saturate16(std::uint32_t v) {
   return v > 0xFFFF ? 0xFFFF : static_cast<std::uint16_t>(v);
@@ -68,7 +71,19 @@ DeviceCore::DeviceCore(Hal& hal, const DeviceConfig& cfg)
       link_timeout_us_(cfg.link_timeout_us),
       torque_limit_(cfg.max_torque),
       velocity_limit_(cfg.velocity_limit),
-      damping_(cfg.damping) {}
+      damping_(cfg.damping) {
+  const float lo = cfg.reading_noise_lo, hi = cfg.reading_noise_hi;
+  noisy_ = hi > 0.0f && lo >= 0.0f && lo <= hi && cfg.noise_tax_delta > 0.0f &&
+           cfg.noise_tax_delta < 1.0f && cfg.noise_tax_torque > 0.0f;
+  open_noise_books();
+}
+
+void DeviceCore::open_noise_books() {
+  if (!noisy_) return;
+  const double q = static_cast<double>(kTwoPi) / static_cast<double>(cfg_.counts_per_rev);
+  const control::DitherBounds d = control::dither_bounds(cfg_.reading_noise_lo, cfg_.reading_noise_hi);
+  noise_.emplace(q * d.bias, q * d.proxy, cfg_.noise_tax_delta, cfg_.noise_tax_torque);
+}
 
 void DeviceCore::begin() {
   hal_.enable_driver(false);
@@ -80,9 +95,11 @@ void DeviceCore::begin() {
   if (hal_.read_encoder(&raw)) {
     turns_.reset(raw);
     raw_ = raw;
+    bound_ = turns_.count();
   } else {
     latch(Fault::kEncoder);
   }
+  if (cfg_.reading_noise_hi > 0.0f && !noisy_) log("reading noise misconfigured: taxed as if none");
   last_us_ = hal_.micros();
   next_state_us_ = last_us_ + state_period_us_;
   started_ = true;
@@ -105,10 +122,13 @@ void DeviceCore::tick() {
   const float dt = static_cast<float>(static_cast<std::uint32_t>(now - last_us_)) * 1e-6f;
   last_us_ = now;
   const float count_to_rad = kTwoPi / static_cast<float>(cfg_.counts_per_rev);
+  const float was = applied_;  // the torque held since the last tick
 
-  // The encoder, and the work the torque held since the last tick did.
+  // The encoder, and the work the torque held since the last tick did:
+  // from the count its books start at to this reading.
   std::uint32_t raw;
-  if (!hal_.read_encoder(&raw)) {
+  const bool read = hal_.read_encoder(&raw);
+  if (!read) {
     latch(Fault::kEncoder);
   } else {
     const std::int32_t step = turns_.update(raw);
@@ -116,7 +136,9 @@ void DeviceCore::tick() {
     const float most = 2.0f * velocity_limit_ * dt / count_to_rad + 16.0f;
     if (std::fabs(static_cast<float>(step)) > most) latch(Fault::kEncoderJump);
     const float dtheta = static_cast<float>(step) * count_to_rad;
-    work_ += static_cast<double>(applied_) * static_cast<double>(dtheta);
+    work_ += static_cast<double>(was) * static_cast<double>(turns_.count() - bound_) *
+             static_cast<double>(count_to_rad);
+    bound_ = turns_.count();
     vel_.update(dtheta, dt);
     obs_.update(dtheta, dt, motor_torque_);
     // The second difference of the readings: of their errors, 6 times
@@ -161,14 +183,6 @@ void DeviceCore::tick() {
     }
   }
 
-  // The torque the last tick asked for: the work cap's tax is on its
-  // changes, as the host's books tax the commands'. (A voltage clamp
-  // that comes and goes changes the torque applied besides, which the
-  // State's saturated flag tells.)
-  const float before = asked_;
-  asked_ = 0.0f;
-  const bool fresh = fresh_cmd_;
-  fresh_cmd_ = false;
   applied_ = 0.0f;
   motor_torque_ = 0.0f;
   saturated_ = false;
@@ -183,12 +197,7 @@ void DeviceCore::tick() {
       cap_used_ = cmd_.work_cap;
       booked_ = work_ + tax_;
     }
-    // The rise of the torque the host's books taxed: the command's over
-    // the one before, in the tick it takes effect.
-    const float taxed =
-        fresh ? growth(clampf(prev_cmd_, -torque_limit_, torque_limit_), host) : 0.0f;
-    if (host != 0.0f && capped) host = keep_to_cap(host, dt, before, taxed);
-    asked_ = host;
+    if (host != 0.0f && capped) host = keep_to_cap(host, dt, was);
     if (host == 0.0f && damping_ == 0.0f) {
       // No torque to make: open the windings, which then carry no current
       // at all, instead of driving against an estimate of the back-EMF,
@@ -198,15 +207,14 @@ void DeviceCore::tick() {
       drive(true);
       foc(host, omega, vbus);
     }
-    if (capped) {
-      // The tax of the torques applied, not of the ones commanded: the
-      // rise beyond what the host taxed is the device's to tax, and what
-      // the host taxed beyond the rise made, the device's to give back.
-      const float g = growth(before, host) - taxed;
-      tax_ += static_cast<double>(g) * static_cast<double>(count_to_rad);
-    }
   }
-
+  // Every change of the torque applied, the host's, the cap's, the
+  // voltage's, a cut's: the books' boundary moves to the second reading,
+  // and the change is taxed.
+  if (applied_ != was) {
+    if (read) reread(was, omega, now);
+    tax_ += charge_change(was, applied_);
+  }
 
   // States go out on a lattice of the period, not a period after the last
   // one went: a tick that came a little early would otherwise wait a whole
@@ -227,10 +235,15 @@ void DeviceCore::handle(const Message& m, std::uint32_t now) {
   std::uint8_t frame[kMaxFrame];
   switch (m.type) {
     case MsgType::kHello: {
+      // A host starting its books: the noise tax's start with them, as its
+      // bound holds for the books from where it starts (NoiseTax). Not
+      // while a host drives, whose books would lose it.
+      if (!enabled_) open_noise_books();
       Info info;
       info.kind = cfg_.kind;
       info.pole_pairs = static_cast<std::uint8_t>(cfg_.motor.pole_pairs);
-      info.flags = static_cast<std::uint8_t>((cal_.valid ? kInfoCalibrated : 0) | kInfoWorkCap);
+      info.flags = static_cast<std::uint8_t>((cal_.valid ? kInfoCalibrated : 0) | kInfoWorkCap |
+                                             kInfoTaxesChanges);
       info.counts_per_rev = cfg_.counts_per_rev;
       info.max_torque = cfg_.max_torque;
       info.inertia = cfg_.inertia;
@@ -290,8 +303,6 @@ void DeviceCore::on_command(const Command& c, std::uint32_t now) {
     set_enabled(false);
     if (c.flags & kCmdClearFault) fault_ = Fault::kNone;
   }
-  prev_cmd_ = have_cmd_ && (cmd_.flags & kCmdEnable) ? cmd_.torque : 0.0f;
-  fresh_cmd_ = true;
   cmd_ = c;
   have_cmd_ = true;
   cmd_us_ = now;
@@ -494,22 +505,13 @@ void DeviceCore::foc(float host, float omega, float vbus) {
 // cut torque slow a held knob twice as fast as it did, overran the cap
 // by 46 uJ where the bound keeps within a count (below).
 //
-// Raising the torque costs besides: the work is counted in whole counts,
-// and summed by parts the count is off by up to half a count q against
-// every change of the torque, which the host's books tax for the changes
-// it commands (control::quantization_tax) and the device has to tax for
-// its own. Without that, a knob dithering across a count at a spent cap
-// books a count's worth of work each time the device lets the torque back
-// on for the step that went the torque's way: 0.5 mJ in a second, held by
-// a hand, that the motor never did. So the device pays q times the rise
-// beyond what the last tick kept and the host taxed, and gives back q
-// times what the host taxed beyond the rise it made: a rise the cap held
-// back was never made, and its tax, booked anyway, stayed in the host's
-// books as energy spent. On the emulated board the host of a slave at
-// rest against a wall raised the force twice on the strength of a push
-// the wall had just stopped, and booked 0.09 mJ of tax for rises the
-// device never made; the store stayed that far down for as long as the
-// slave stayed there. Given back, the tax returns with the next State.
+// Raising the torque costs besides: every change of the torque applied is
+// taxed (charge_change), and a rise is taxed beyond what of the last
+// tick's torque it keeps, at most at the line change_line() gives. Without
+// the tax, a knob dithering across a count at a spent cap books a count's
+// worth of work each time the device lets the torque back on for the step
+// that went the torque's way: 0.5 mJ in a second, held by a hand, that the
+// motor never did.
 //
 // It then keeps two limits, as the host's predictive PC does
 // (control/predictive_pc.hpp, "Repaying the tax"):
@@ -547,7 +549,7 @@ void DeviceCore::foc(float host, float omega, float vbus) {
 // at the slave, half of them below 33 uJ. A margin for the estimate's
 // spread does not pay: it cut a torque braking a hand's slow turn and
 // let it back on at every count, at the tax each time.
-float DeviceCore::keep_to_cap(float tau, float dt, float before, float taxed) {
+float DeviceCore::keep_to_cap(float tau, float dt, float before) {
   const float left = static_cast<float>(cmd_.work_cap - (work_ + tax_));
   const float room = left > 0.0f ? left : 0.0f;
   const float q = kTwoPi / static_cast<float>(cfg_.counts_per_rev);
@@ -562,7 +564,7 @@ float DeviceCore::keep_to_cap(float tau, float dt, float before, float taxed) {
   // it holds the shaft back, which a hand may stop doing.
   const float push = std::max(tau * obs_.acceleration(1.0f), tau * obs_.acceleration(0.0f));
   const float e = push > 0.0f ? 0.5f * push * dt * dt : 0.0f;
-  const float free = (before * tau > 0.0f ? std::fabs(before) : 0.0f) + taxed;
+  const float free = before * tau > 0.0f ? std::fabs(before) : 0.0f;
   const float l0 = free / mag;  // where the tax starts
   const float horizon = std::max(1.0f, kTaxHorizonUs * 1e-6f / dt);  // ticks
 
@@ -572,6 +574,18 @@ float DeviceCore::keep_to_cap(float tau, float dt, float before, float taxed) {
     if (held < 1.0f) capped_ = true;
     return held * tau;
   }
+  // What a rise to l tau pays at most: on the line change_line() gives,
+  // exact at the most the tick's work allows, convex in l beyond the free
+  // part, with the books' opening if it opens them. The fixed part makes
+  // it more than the tax at l0, which is no rise.
+  const control::ChangeTax line = change_line(before, held * tau);
+  const float opening = noise_ && !noise_->opened() ? static_cast<float>(noise_->bound(0.0)) : 0.0f;
+  auto tax = [&](float l) {
+    const double phi = static_cast<double>(l * tau);
+    const double reserve = phi * (phi - static_cast<double>(before));
+    return opening + static_cast<float>(line.fixed + line.rise * std::max(0.0, std::fabs(phi) - free) +
+                                        2.0 * line.slope * std::max(0.0, reserve));
+  };
   // The rise's tax less the most work it takes out within the horizon,
   // on the velocity less kRiseConfidence of its estimate's spread at rest
   // the torque's way. The readings' errors are rounding, at least, and
@@ -584,7 +598,7 @@ float DeviceCore::keep_to_cap(float tau, float dt, float before, float taxed) {
       const float c = e + b * l;
       n = c > 0.0f ? clampf(-sure / (2.0f * c), 1.0f, horizon) : horizon;
     }
-    return q * (l * mag - free) + (sure * n + e * n * n) * l + b * n * n * l * l;
+    return tax(l) + (sure * n + e * n * n) * l + b * n * n * l * l;
   };
   if (due(held) <= room) {
     if (held < 1.0f) capped_ = true;
@@ -614,6 +628,103 @@ float DeviceCore::keep_to_cap(float tau, float dt, float before, float taxed) {
     }
   }
   return low * tau;
+}
+
+// Taxing the changes. The books sum the torque held times each step of the
+// count, and the count is off from the shaft by the reading's error: summed
+// by parts, their error is the sum of every change of the torque times the
+// error of the reading it took effect at (control/noise_tax.hpp). The
+// device taxes every change of the torque it applies, the host's commands,
+// the cap's cuts, the voltage's clamps and their release, a cut's, and
+// tells the host so (kInfoTaxesChanges), whose books then leave the tax to
+// it. Taxed by both, as they were, the host's tax of a command and the
+// device's of what it applied had to be reconciled: the device gave back
+// the host's tax of a rise the cap held back, which assumed the host taxed
+// q per N m of a command's rise. On the emulated board the host of a slave
+// at rest against a wall raised the force twice on the strength of a push
+// the wall had just stopped, and booked 0.09 mJ of tax for rises the device
+// never made, which the give-back returned. But a host that taxes for noise
+// (control::NoiseTax), or within the bounds of its counts, taxes less, and
+// the give-back then took the books below the true work; and the voltage's
+// clamps were taxed by neither. Taxed where they are applied, the changes
+// are taxed once, as made.
+//
+// With the encoder's noise configured, the tax is control::NoiseTax's,
+// which bounds the books' error with probability 1 - delta where the
+// interval tax bounds nothing, as a dithering reading's error is not
+// within a count; without, control::quantization_tax's, q per N m by which
+// the torque grows. Either holds for changes decided without the reading
+// they pair with. The host's are: its command came from States sent before
+// this tick's reading. The cap's and the voltage's are decided on the
+// reading, through the velocity estimate, and lean the safe way, though
+// that is no proof: both take torque off where the shaft looks to move
+// the torque's way, where a reading ahead of the shaft makes the books
+// count more work than was done, and give it back where it looks to move
+// against the torque, where a reading behind does the same.
+//
+// Reading again. Where the board can (Hal::reread_encoder), the books'
+// boundary moves from the tick's reading to a second one taken once the
+// change took effect, which nothing decided on: the torque held before is
+// booked up to it, and the new one from it. Every change then pairs with a
+// reading it did not see, the cap's and the voltage's too
+// (control/noise_tax.hpp, "Reading again"). That needs the second reading
+// to be a conversion of its own, which the device checks: the second less
+// the first, less the motion the velocity predicts between them, has twice
+// the readings' error variance for independent errors and none for the
+// same error again (reread_independence(), told in a log after
+// kRereadWindow of them). What it leaves uncovered: the motion between the
+// change and the instant the encoder samples, booked with the old torque;
+// and the current, which follows the voltage over the windings' L / R,
+// about 0.2 ms for a gimbal motor, so that the torque changes over that
+// time and not at the instant the books put the change at. The latter is
+// the error of every change's timing, taxed or not: at 1 rad/s, 0.01 N m
+// changed over 0.2 ms is off by up to 2 uJ, as much as the noise tax of a
+// small change.
+double DeviceCore::charge_change(float before, float to) {
+  if (noise_) return noise_->charge(before, to);
+  const float q = kTwoPi / static_cast<float>(cfg_.counts_per_rev);
+  return static_cast<double>(growth(before, to)) * static_cast<double>(q);
+}
+
+control::ChangeTax DeviceCore::change_line(float before, float target) const {
+  if (noise_) return noise_->plan(before, target);
+  return {static_cast<double>(kTwoPi) / static_cast<double>(cfg_.counts_per_rev), 0.0, 0.0};
+}
+
+void DeviceCore::reread(float was, float omega, std::uint32_t now) {
+  std::uint32_t again;
+  if (!hal_.reread_encoder(&again)) return;
+  const std::int32_t cpr = static_cast<std::int32_t>(cfg_.counts_per_rev);
+  std::int32_t d = static_cast<std::int32_t>(again) - static_cast<std::int32_t>(raw_);
+  if (d > cpr / 2) d -= cpr;
+  if (d < -cpr / 2) d += cpr;
+  const float q = kTwoPi / static_cast<float>(cfg_.counts_per_rev);
+  work_ += static_cast<double>(was) * static_cast<double>(d) * static_cast<double>(q);
+  bound_ = turns_.count() + d;
+
+  // The check of the second reading's independence.
+  const float elapsed = static_cast<float>(static_cast<std::uint32_t>(hal_.micros() - now)) * 1e-6f;
+  const float r = static_cast<float>(d) - omega * elapsed / q;
+  ++rereads_;
+  const float n = static_cast<float>(rereads_ < kRereadWindow ? rereads_ : kRereadWindow);
+  reread_var_ += (r * r - reread_var_) / n;
+  if (rereads_ == kRereadWindow && !reread_told_) {
+    reread_told_ = true;
+    char text[kMaxLogText + 1];
+    // The readings' errors as measured, and as the configured noise makes
+    // them with the rounding's.
+    const float lo = cfg_.reading_noise_lo, hi = cfg_.reading_noise_hi;
+    std::snprintf(text, sizeof text, "reread: indep %.2f, error %.2f rms, set %.2f-%.2f counts",
+                  static_cast<double>(reread_independence()),
+                  static_cast<double>(std::sqrt(reading_var_)),
+                  static_cast<double>(std::sqrt(lo * lo + 1.0f / 12.0f)),
+                  static_cast<double>(std::sqrt(hi * hi + 1.0f / 12.0f)));
+    log(text);
+  }
+}
+
+float DeviceCore::reread_independence() const {
+  return reading_var_ > 0.0f ? reread_var_ / (2.0f * reading_var_) : 0.0f;
 }
 
 void DeviceCore::drive(bool on) {

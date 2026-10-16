@@ -318,6 +318,8 @@ void model_device(Config& c, const device::RemoteDevice& dev) {
                  c.model_mass);
   }
   c.encoder_resolution = dev.encoder_resolution();
+  // Firmware that taxes its torque's changes books the tax in its work.
+  c.device_taxes_changes = dev.taxes_changes();
   if (const auto measured = dev.actuation_delay()) {
     c.actuation_delay = *measured;
     c.actuation_delay_max = 0;
@@ -327,7 +329,6 @@ void model_device(Config& c, const device::RemoteDevice& dev) {
   c.actuation_delay = delay;
   c.actuation_delay_max = std::max(2 * delay, delay + kNanosPerMilli);
 }
-
 
 const char* scheme_name(teleop::Passivity p) {
   switch (p) {

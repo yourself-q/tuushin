@@ -208,6 +208,22 @@ Ctrl-C stops any command and switches the driver off.
    `--k` over that bound shows why it is one: the knob buzzes or swings
    up.
 
+5. **The encoder's noise.** The spring changes the torque on nearly every
+   tick, and with `CONFIG_TUUSHIN_ENC_REREAD` (the default for the MT6701
+   and the AS5047P) the device reads the encoder again after each change.
+   After 4096 of those, under a second of turning the knob, it logs
+   "reread: indep I, error E rms, set A-B counts". I near 1 says the
+   second reading is a conversion of its own, and E is the readings' error
+   in counts, the rounding's included; near 0, the encoder returned its
+   last conversion again, and the noise tax cannot be used: turn the
+   reread off. With I near 1, set the noise range in menuconfig
+   (`CONFIG_TUUSHIN_ENC_NOISE_LO_MILLICOUNTS` and `_HI_`, the noise before
+   the rounding, sqrt(E^2 - 1/12) counts) with a margin each way, so that
+   the logged A-B brackets E: the device then taxes each change of the
+   torque by the noise's bound (`control/noise_tax.hpp`) rather than by
+   the count's width, which bounds only noiseless readings. Unset, it
+   keeps the count's width.
+
 Then the session: `tuushin-teleop slave --device serial:PORT,radius=R`
 (top README), with `R` the radius where the hand holds the knob.
 
@@ -284,6 +300,11 @@ What it took, and what differs from a chip:
 - Running on a chip: the tick's time at 5 kHz, the encoders' drivers
   (the MT6701's SSI frame and CRC, the AS5047P's parity, the AS5600's
   magnet status), the ADC, and the USB Serial/JTAG link's latency.
+- The encoders' noise, and whether a second transfer is a conversion of
+  its own (step 5 above). The noise tax's cost in the tick: computed in
+  double precision, in software on these chips, some 5000 cycles a
+  change on an ESP32-S3 by Espressif's per-operation figures, about 20 us
+  of a 200 us tick; on an ESP32-C3, which has no FPU at all, more.
 - Measuring the friction and the cogging (`hold` measures the torque
   constant, by hand).
 - Cogging compensation, and a temperature model of the windings.
