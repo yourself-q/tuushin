@@ -44,6 +44,15 @@ fw::DeviceConfig board_config() {
   c.tick_us = CONFIG_TUUSHIN_TICK_US;
   c.reading_noise_lo = CONFIG_TUUSHIN_ENC_NOISE_LO_MILLICOUNTS * 1e-3f;
   c.reading_noise_hi = CONFIG_TUUSHIN_ENC_NOISE_HI_MILLICOUNTS * 1e-3f;
+  if (CONFIG_TUUSHIN_PHASE_INDUCTANCE_UH > 0 && c.motor.phase_resistance > 0.0f) {
+    const float lag = CONFIG_TUUSHIN_PHASE_INDUCTANCE_UH * 1e-6f / c.motor.phase_resistance;
+    const float spread = 1.0f + CONFIG_TUUSHIN_CURRENT_LAG_SPREAD_PCT * 0.01f;
+    c.current_lag_lo = lag / spread;
+    c.current_lag_hi = lag * spread;
+  }
+  // The compare registers take a new duty where the timer next reaches
+  // zero (Bridge), a period on at the most.
+  c.duty_delay = 1.0f / static_cast<float>(CONFIG_TUUSHIN_PWM_HZ);
   c.kind = device::DeviceKind::kTorqueMotor;
   std::snprintf(c.name, sizeof c.name, "%s", CONFIG_TUUSHIN_NAME);
   return c;

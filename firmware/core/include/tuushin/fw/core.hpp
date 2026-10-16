@@ -111,6 +111,13 @@ struct DeviceConfig {
   float reading_noise_hi = 0.0f;
   float noise_tax_delta = 1e-3f;
   float noise_tax_torque = 0.005f;  // the host's 0.25 N at a 20 mm radius
+  // The windings' L / R at the least and the most (s), and the longest a
+  // new duty waits for the PWM's next period (s): the torque follows a
+  // change over these, which the books follow (CurrentLag). hi = 0: at
+  // once.
+  float current_lag_lo = 0.0f;
+  float current_lag_hi = 0.0f;
+  float duty_delay = 0.0f;
   device::DeviceKind kind = device::DeviceKind::kTorqueMotor;
   std::uint32_t firmware = 0x000200;
   char name[16] = "tuushin";
@@ -207,6 +214,8 @@ class DeviceCore {
   bool cut_ = false;
   std::uint32_t cut_after_us_ = 0;
   float applied_ = 0.0f;
+  // The host's torque as the windings' current makes it (DeviceConfig::current_lag_hi).
+  CurrentLag lag_;
   float motor_torque_ = 0.0f;  // the host's and the damping's, as the motor makes them (N m)
   bool saturated_ = false;
   bool capped_ = false;  // in some tick since the last State

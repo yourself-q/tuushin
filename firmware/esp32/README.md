@@ -33,9 +33,14 @@ have no current sensing. For a torque `T` the core applies
 so the torque the shaft gets is only as right as the phase resistance `R`
 and the torque constant `kt` it is given, and `R` grows with the windings'
 temperature (copper, about 0.4 % a kelvin). The work each State reports is
-the commanded torque times the displacement, which the host's energy
-books use: an error in `kt / R` is an error in them. See First power-on
-for measuring it.
+the torque times the displacement, which the host's energy books use: an
+error in `kt / R` is an error in them. See First power-on for measuring
+it. The torque booked is the one the windings' current makes, which
+follows the voltage over their `L / R` (`CONFIG_TUUSHIN_PHASE_INDUCTANCE_UH`)
+from where the PWM's next period starts: the core keeps it as an
+interval, for an `L / R` within 20 % of the one given and any instant in
+the period (`CONFIG_TUUSHIN_CURRENT_LAG_SPREAD_PCT`), books its middle
+and taxes half its width.
 
 The calibration finds the motor's electrical zero: it holds the rotor on
 electrical angle 0 with `CONFIG_TUUSHIN_ALIGN_MV` on the d axis, turns the
@@ -124,6 +129,9 @@ parameters to set, from its data or a measurement:
   the calibration checks it;
 - phase resistance, phase to neutral: half of what an ohmmeter reads
   between two of its terminals;
+- phase inductance, phase to neutral: half of what an LCR meter reads
+  between two of its terminals (a GBM2804-100T was measured at 2.0 mH
+  against 6.3 Ω, an `L / R` of 0.32 ms);
 - the torque constant, amplitude-invariant (N m per ampere of q-axis
   current), or its KV (rpm per volt of line-to-line peak back-EMF) with
   the torque constant 0: `kt = 1.5 / (sqrt(3) KV 2 pi / 60)`. A listed no-load
@@ -270,7 +278,10 @@ What it took, and what differs from a chip:
   and cannot keep up with 5 kHz. The plant's integration step is 250 us
   (`CONFIG_TUUSHIN_EMULATED_STEP_US`): pressed into a stop, its angle
   strays 0.47 mrad rms from a 5 us step, against 0.37 for 100 us and 4.3
-  for 500 us.
+  for 500 us. With the windings' inductance it is half of L / R while
+  their current flows, 150 us for the defaults, and a step ends where
+  the PWM's period does: about eight steps a tick instead of four, which
+  took the simulation's load while driving from some 12 % to 33 %.
 - **The forces are computed in float** (`PlantParams::float_forces`):
   under QEMU a double `sin` costs 4 to 5 us and a float one under 1.3,
   since the ESP32 has no double-precision unit. The state, the time and the

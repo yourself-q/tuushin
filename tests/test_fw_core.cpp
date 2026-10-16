@@ -37,6 +37,12 @@ DeviceConfig config_for(const PlantParams& p) {
   c.counts_per_rev = p.counts_per_rev;
   c.max_torque = 0.1f;
   c.inertia = static_cast<float>(p.inertia);
+  if (p.phase_inductance > 0.0) {
+    const double lag = p.phase_inductance / p.phase_resistance;
+    c.current_lag_lo = static_cast<float>(lag / 1.2);
+    c.current_lag_hi = static_cast<float>(lag * 1.2);
+  }
+  c.duty_delay = static_cast<float>(p.pwm_period);
   c.kind = DeviceKind::kSimulated;
   std::strcpy(c.name, "test");
   return c;
@@ -287,6 +293,102 @@ TEST_CASE(fw_velocity_observer_answers_for_any_inertia) {
                       std::fabs(alone.velocity(0.0f) - held.velocity())});
   }
   CHECK(worst < 1e-3f);
+}
+
+namespace {
+
+// A first-order current's torque going from *y towards v over s (s) with
+// time constant tau (0: at once); returns its integral over s.
+double follow(double* y, double v, double s, double tau) {
+  if (s <= 0.0) return 0.0;
+  if (tau <= 0.0) {
+    *y = v;
+    return v * s;
+  }
+  const double gone = -std::expm1(-s / tau);
+  const double area = v * s + (*y - v) * tau * gone;
+  *y += (v - *y) * gone;
+  return area;
+}
+
+}  // namespace
+
+TEST_CASE(fw_current_lag_holds_the_current_between_its_ends) {
+  // A current that follows the torque set over any L / R within the
+  // bounds, after any delay within them, and runs down at any rate with
+  // the bridge open, stays between the ends, tick by tick and on average,
+  // and between two readings that a change falls between at an instant
+  // not known; and what it does from here, torque held for a tick and
+  // then let go, lies between what ahead() says for the ends.
+  const float lo = 0.25e-3f, hi = 0.36e-3f, delay = 50e-6f, dt = 200e-6f;
+  std::mt19937 rng(11);
+  std::uniform_real_distribution<double> torque(-0.1, 0.1), unit(0.0, 1.0);
+  double worst_out = 0.0, widest = 0.0, ahead_out = 0.0, over_out = 0.0;
+  int aheads = 0;
+  for (double tau : {double(lo), 0.5 * (lo + hi), double(hi)}) {
+    for (double tau_off : {0.0, tau / 3.0, tau}) {
+      CurrentLag lag(lo, hi, delay);
+      CHECK(lag.on());
+      double y = 0.0, u = 0.0;  // the true current's torque, and its target
+      for (int i = 0; i < 4000; ++i) {
+        const double r = unit(rng);
+        const bool driving = r > 0.1;
+        const double next = !driving ? 0.0 : r < 0.4 ? u : torque(rng);
+        {
+          // Between two readings 20 us apart, the duties written at some
+          // instant between them.
+          const double gap = 20e-6, w = gap * unit(rng), d = delay * unit(rng);
+          double z = y, area = follow(&z, u, std::min(gap, w + (driving ? d : 0.0)), tau);
+          area += follow(&z, next, gap - std::min(gap, w + (driving ? d : 0.0)), driving ? tau : tau_off);
+          const CurrentLag::Span between = lag.over(static_cast<float>(next), driving, float(gap));
+          over_out = std::max({over_out, between.lo - area / gap, area / gap - between.hi});
+          const CurrentLag::Span at = lag.over(static_cast<float>(next), driving, 0.0f);
+          CHECK(at.lo == lag.now().lo && at.hi == lag.now().hi);
+        }
+        lag.set(static_cast<float>(next), driving);
+        double area;
+        if (driving) {
+          const double d = next != u ? delay * unit(rng) : 0.0;
+          area = follow(&y, u, d, tau);
+          area += follow(&y, next, dt - d, tau);
+        } else {
+          area = follow(&y, 0.0, dt, tau_off);
+        }
+        u = next;
+        const CurrentLag::Span made = lag.advance(dt), now = lag.now();
+        const double mean = area / dt;
+        worst_out = std::max({worst_out, made.lo - mean, mean - made.hi, now.lo - y, y - now.hi});
+        widest = std::max(widest, double(made.hi - made.lo));
+        if (driving && i % 50 == 0) {
+          // From here: a torque held for a tick, then 0, driven throughout.
+          for (int k = 0; k < 4; ++k) {
+            const double t = torque(rng), d1 = delay * unit(rng), d2 = delay * unit(rng);
+            double z = y;
+            double total = follow(&z, u, d1, tau);
+            total += follow(&z, t, dt - d1 + d2, tau);
+            total += follow(&z, 0.0, 100 * tau, tau);
+            const float a_lo = lag.ahead(-1.0f, static_cast<float>(t), dt);
+            const float a_hi = lag.ahead(1.0f, static_cast<float>(t), dt);
+            ahead_out = std::max({ahead_out, a_lo - total, total - a_hi});
+            ++aheads;
+          }
+        }
+      }
+    }
+  }
+  CHECK(worst_out < 1e-6);   // N m
+  CHECK(ahead_out < 1e-9);   // N m s
+  CHECK(over_out < 1e-6);    // N m
+  CHECK(widest > 0.01);      // the bounds are not trivially met
+  CHECK(aheads > 500);
+  // Without the lag the torque is the torque set, at once.
+  CurrentLag none(0.0f, 0.0f, 0.0f);
+  CHECK(!none.on());
+  none.set(0.05f, true);
+  CHECK(none.ahead(1.0f, 0.05f, dt) == 0.05f * dt);
+  std::printf("  worst outside: %.2g N m tick by tick, %.2g N m between readings, %.2g N m s ahead (%d); "
+              "widest %.4f N m\n",
+              worst_out, over_out, ahead_out, aheads, widest);
 }
 
 TEST_CASE(fw_calibration_finds_how_the_motor_sits) {
@@ -804,6 +906,68 @@ TEST_CASE(fw_plant_float_forces_track_double) {
   }
 }
 
+TEST_CASE(fw_plant_windings_follow_over_l_over_r) {
+  // With an inductance the q current follows a step in the q voltage over
+  // L / R, from where the PWM's next period starts; with the driver off it
+  // runs down through the diodes sooner than over L / R; and on a spinning
+  // rotor the back-EMF holds it where the resistance alone does.
+  PlantParams p = quiet_plant();
+  p.phase_inductance = 1.5e-3;
+  p.pwm_period = 50e-6;
+  const double tau = p.phase_inductance / p.phase_resistance;
+  auto drive = [&](Plant& pl, double k) {  // the q voltage k * supply
+    const double phi = p.pole_pairs * pl.angle() - p.electrical_offset + kTwoPiD / 4;
+    pl.set_duties(0.5 + k * std::cos(phi), 0.5 + k * std::cos(phi - kTwoPiD / 3),
+                  0.5 + k * std::cos(phi + kTwoPiD / 3));
+  };
+  {
+    PlantParams q = p;
+    q.inertia = 1e3;  // a rotor that does not turn
+    Plant pl(q);
+    pl.enable(true);
+    pl.advance(10e-6);
+    drive(pl, 0.4);
+    const double i0 = 0.4 * p.supply / p.phase_resistance;
+    pl.advance(49e-6);
+    CHECK(pl.q_current() == 0.0);  // the period has not started
+    pl.advance(50e-6 + tau);
+    const double at_tau = pl.q_current() / i0;
+    pl.advance(50e-6 + 10 * tau);
+    const double settled = pl.q_current() / i0;
+    CHECK(std::fabs(at_tau - (1.0 - std::exp(-1.0))) < 0.002);
+    CHECK(std::fabs(settled - 1.0) < 0.001);
+    const double t_off = pl.time();
+    pl.enable(false);
+    pl.advance(t_off + 0.5 * tau);
+    const double half = pl.q_current() / i0;
+    CHECK(half > 0.0 && half < std::exp(-0.5));  // sooner than over L / R
+    pl.advance(t_off + tau);
+    const double gone = pl.q_current();
+    pl.advance(t_off + 1e-3);
+    CHECK(gone == 0.0 && pl.q_current() == 0.0);
+    std::printf("  step: %.4f of the current at L/R, %.4f at 10 L/R; off: %.3f at L/R/2, %g at L/R\n",
+                at_tau, settled, half, gone);
+  }
+  {
+    // A free rotor driven at a tenth of the supply up to some 10 rad/s.
+    PlantParams q = p;
+    q.phase_inductance = 0.0;
+    q.pwm_period = 0.0;
+    Plant with(p), without(q);
+    for (Plant* pl : {&with, &without}) {
+      pl->enable(true);
+      for (int i = 1; i <= 25000; ++i) {
+        drive(*pl, 0.05);
+        pl->advance(i * 20e-6);
+      }
+    }
+    const double w = with.velocity(), wo = without.velocity();
+    CHECK(wo > 5.0);
+    CHECK(std::fabs(w - wo) < 0.01 * wo);
+    std::printf("  free: %.3f rad/s with the inductance, %.3f without\n", w, wo);
+  }
+}
+
 TEST_CASE(fw_work_cap_spent_keeps_the_torque_steady) {
   // A cap spent 1 mJ ago, as a host's books in deficit leave it. A torque
   // that takes energy out of the knob a hand turns stays on: cut whenever
@@ -1069,4 +1233,150 @@ TEST_CASE(fw_noise_books_open_with_the_host) {
   CHECK(!rig.core.noise_tax()->opened());
   CHECK(rig.core.noise_tax()->variance() == 0.0);
   CHECK(rig.core.tax() >= tax);
+}
+
+namespace {
+
+struct LagScene {
+  double books = 0.0, tax = 0.0, truth = 0.0;
+};
+
+// The device's books, and its tax, against the motor's true work over a
+// scene, from its start.
+LagScene measure_lag(Rig& rig, double dur, const std::function<void(double)>& each) {
+  LagScene sc;
+  const double b0 = rig.core.last_state().work, t0 = rig.core.last_state().tax;
+  const double w0 = rig.plant.motor_work();
+  rig.run(dur, each);
+  sc.books = rig.core.last_state().work - b0;
+  sc.tax = rig.core.last_state().tax - t0;
+  sc.truth = rig.plant.motor_work() - w0;
+  return sc;
+}
+
+DeviceConfig without_lag(DeviceConfig c) {
+  c.current_lag_lo = c.current_lag_hi = c.duty_delay = 0.0f;
+  return c;
+}
+
+// A host's wall at 2 N m/rad on the device's angle, 0.1 rad on, with a
+// hand pushing into it.
+LagScene wall_scene(const PlantParams& p, const DeviceConfig& c, double tick) {
+  Rig rig(p, c);
+  rig.tick = tick;
+  if (!rig.calibrate()) {
+    CHECK(false);
+    return {};
+  }
+  HandParams h;
+  h.present = true;
+  h.k = 0.5;
+  h.ref_offset = rig.plant.angle();
+  h.ref_amplitude = 0.4;
+  h.ref_freq = 2.0;
+  rig.plant.set_hand(h, rig.t);
+  const double cpr = p.counts_per_rev;
+  const double wall = rig.core.last_state().count * kTwoPiD / cpr + 0.1;
+  auto next = std::make_shared<double>(rig.t);
+  return measure_lag(rig, 2.0, [&](double now) {
+    if (now + 1e-12 < *next) return;
+    *next += 1e-3;
+    const double pen = rig.core.last_state().count * kTwoPiD / cpr - wall;
+    rig.command(pen > 0 ? std::max(-0.1, -2.0 * pen) : 0.0);
+  });
+}
+
+// A hand moving the knob and a torque varying at 3 Hz.
+LagScene hand_scene(const PlantParams& p, const DeviceConfig& c) {
+  Rig rig(p, c);
+  if (!rig.calibrate()) {
+    CHECK(false);
+    return {};
+  }
+  HandParams h;
+  h.present = true;
+  h.ref_offset = rig.plant.angle();
+  h.ref_amplitude = 3.0;
+  h.ref_freq = 1.0;
+  rig.plant.set_hand(h, rig.t);
+  return measure_lag(rig, 2.0, rig.host_at_1khz([](double t) { return 0.03 * std::sin(kTwoPiD * 3.0 * t); }));
+}
+
+}  // namespace
+
+TEST_CASE(fw_books_cover_a_wall_through_the_windings_lag) {
+  // Where the torque follows the angle, the current's lag behind it
+  // returns energy the torque set does not: the books that take the
+  // torque set at once fall short of the motor's work by more than the
+  // tax, and the books that take the current's interval do not.
+  PlantParams p;
+  p.phase_inductance = 1.5e-3;
+  for (double period : {0.0, 50e-6}) {
+    p.pwm_period = period;
+    for (double tick : {200e-6, 1e-3}) {
+      const LagScene sc = wall_scene(p, config_for(p), tick);
+      CHECK(sc.books + sc.tax >= sc.truth);
+      CHECK(sc.books >= sc.truth);  // the middle, with the tax besides
+      std::printf("  P %2.0f us, tick %4.0f us: books - true %+8.2f uJ, tax %7.2f uJ\n", period * 1e6,
+                  tick * 1e6, (sc.books - sc.truth) * 1e6, sc.tax * 1e6);
+    }
+  }
+  p.pwm_period = 0.0;
+  const LagScene blind = wall_scene(p, without_lag(config_for(p)), 200e-6);
+  CHECK(blind.books + blind.tax < blind.truth);
+  std::printf("  without the lag: books - true %+8.2f uJ, tax %7.2f uJ\n", (blind.books - blind.truth) * 1e6,
+              blind.tax * 1e6);
+}
+
+TEST_CASE(fw_books_take_the_current_where_a_hand_moves) {
+  // Where a hand moves the knob under a varying torque, the books that
+  // take the torque set at once count work the current has not yet done
+  // (safely, but by close to a millijoule over two seconds); the middle of
+  // the current's interval is near the motor's work.
+  PlantParams p;
+  p.phase_inductance = 1.5e-3;
+  const LagScene lag = hand_scene(p, config_for(p));
+  const LagScene blind = hand_scene(p, without_lag(config_for(p)));
+  CHECK(blind.books - blind.truth > 500e-6);
+  CHECK(std::fabs(lag.books - lag.truth) < 0.25 * (blind.books - blind.truth));
+  CHECK(lag.books + lag.tax >= lag.truth);
+  std::printf("  books - true: %+8.2f uJ (tax %.2f) with the lag, %+8.2f uJ (tax %.2f) without\n",
+              (lag.books - lag.truth) * 1e6, lag.tax * 1e6, (blind.books - blind.truth) * 1e6, blind.tax * 1e6);
+}
+
+TEST_CASE(fw_work_cap_keeps_what_the_current_has_yet_to_do) {
+  // A knob leaving a stop under a capped torque: the current flowing when
+  // the room runs out goes on doing work, and the device leaves room for
+  // it, so neither its books nor the motor overrun the cap.
+  for (double inductance : {1.5e-3, 2.0e-3}) {
+    for (double period : {0.0, 50e-6}) {
+      for (double tick : {200e-6, 1e-3}) {
+        PlantParams p = quiet_plant();
+        p.phase_inductance = inductance;
+        p.pwm_period = period;
+        Rig rig(p, config_for(p));
+        rig.tick = tick;
+        REQUIRE(rig.calibrate());
+        StopParams stop;
+        stop.present = true;
+        stop.angle = rig.plant.angle() - 0.02;
+        rig.plant.set_stop(stop);
+        const double cap = 100e-6;
+        const double w0 = rig.core.last_state().work;
+        auto next = std::make_shared<double>(rig.t);
+        const LagScene sc = measure_lag(rig, 0.03, [&](double now) {
+          if (now + 1e-12 < *next) return;
+          *next += 1e-3;
+          rig.command_capped(-0.01, w0 + cap);
+        });
+        CHECK(sc.truth <= cap);
+        CHECK(sc.truth > 0.3 * cap);  // and it does not keep too much
+        CHECK(sc.books >= sc.truth);
+        CHECK(rig.core.worst_overrun() < 0.1e-6);
+        std::printf("  L %.1f mH, P %2.0f us, tick %4.0f us: true %6.2f uJ of %.0f, overrun %.3f uJ\n",
+                    inductance * 1e3, period * 1e6, tick * 1e6, sc.truth * 1e6, cap * 1e6,
+                    rig.core.worst_overrun() * 1e6);
+      }
+    }
+  }
 }

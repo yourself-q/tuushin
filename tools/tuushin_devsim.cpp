@@ -68,6 +68,10 @@ void usage() {
                "  --counts N            encoder counts a turn (16384)\n"
                "  --noise COUNTS        encoder noise, standard deviation (0.5)\n"
                "  --seed N              of the encoder noise (1)\n"
+               "  --inductance MH       the windings' inductance, phase to neutral, in mH:\n"
+               "                        the current follows the voltage over L / R (0)\n"
+               "  --pwm-us US           the PWM's period: a new duty waits for the next\n"
+               "                        one (0)\n"
                "  --tick-us US          the servo loop's tick (200; the emulated board's is\n"
                "                        1000)\n"
                "  --ppm PPM             how fast the board's clock runs against the host's\n"
@@ -304,6 +308,8 @@ int main(int argc, char** argv) {
       else if (a == "--counts") pp.counts_per_rev = static_cast<std::uint32_t>(parse_double(next(), "counts"));
       else if (a == "--noise") pp.encoder_noise = parse_double(next(), "noise");
       else if (a == "--seed") seed = static_cast<std::uint64_t>(parse_double(next(), "seed"));
+      else if (a == "--inductance") pp.phase_inductance = parse_double(next(), "inductance") * 1e-3;
+      else if (a == "--pwm-us") pp.pwm_period = parse_double(next(), "pwm-us") * 1e-6;
       else if (a == "--tick-us") tick_us = static_cast<std::uint32_t>(parse_double(next(), "tick-us"));
       else if (a == "--ppm") ppm = parse_double(next(), "ppm");
       else if (a == "--duration") duration = parse_double(next(), "duration");
@@ -313,6 +319,12 @@ int main(int argc, char** argv) {
     }
     if (pty == (tcp_port != 0)) throw std::runtime_error("give one of --pty and --tcp PORT");
     if (tcp_port < 0 || tcp_port > 65535) throw std::runtime_error("bad port");
+    if (!(pp.phase_inductance >= 0.0 && pp.phase_inductance < 0.1)) {
+      throw std::runtime_error("--inductance must be within 0 to 100 mH");
+    }
+    if (!(pp.pwm_period >= 0.0 && pp.pwm_period < 1e-3)) {
+      throw std::runtime_error("--pwm-us must be within 0 to 1000");
+    }
 
     std::unique_ptr<Port> port;
     if (pty) {

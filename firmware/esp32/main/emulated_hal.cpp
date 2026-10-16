@@ -17,6 +17,8 @@ fw::PlantParams EmulatedHal::plant_params() {
   p.inertia = CONFIG_TUUSHIN_INERTIA_GMM2 * 1e-9;
   p.supply = CONFIG_TUUSHIN_SUPPLY_MV * 1e-3;
   p.encoder_noise = CONFIG_TUUSHIN_EMULATED_NOISE_MILLICOUNTS * 1e-3;
+  p.phase_inductance = CONFIG_TUUSHIN_PHASE_INDUCTANCE_UH * 1e-6;
+  p.pwm_period = 1.0 / 20000.0;  // the board's PWM's default
   p.step = CONFIG_TUUSHIN_EMULATED_STEP_US * 1e-6;
   p.float_forces = true;  // the chip's FPU is single precision
   return p;

@@ -1501,14 +1501,17 @@ What the host takes from the device:
   for the simulated knob (2.5 N s/m at the rim, 2.39 ms), where a slave on
   a simulated device couples with 2000.
 - **The energy books**, from the work the device measures. The firmware
-  sums the commanded torque times the displacement over its ticks, and
-  each State carries the total. The controllers' own estimate, which
-  splits a sample's displacement by a model when the force changes within
-  it, missed by hundreds of micrometres on a slave pressed into the
-  object. With the device's damping off, the books matched the simulated
-  motor's true work: −9.51 against −9.5 mJ at the master, +7.81 against
-  +7.6 mJ at the slave; with damping, they differ by what the damping
-  dissipates, outside the books.
+  sums the torque times the displacement over its ticks, and each State
+  carries the total. The torque is the one the windings' current makes,
+  which follows the voltage over their L / R from where the PWM's next
+  period starts: the firmware keeps it as an interval and books its
+  middle (A device's books take the current's lag as configured, below).
+  The controllers' own estimate, which splits a sample's displacement by
+  a model when the force changes within it, missed by hundreds of
+  micrometres on a slave pressed into the object. With the device's
+  damping off, the books matched the simulated motor's true work: −9.51
+  against −9.5 mJ at the master, +7.81 against +7.6 mJ at the slave; with
+  damping, they differ by what the damping dissipates, outside the books.
 - **The actuation delay**, measured command by command. Each State
   carries the sequence number of the command in effect and how long it
   has been (`cmd_seq`, `cmd_age_us`); the host knows when it sent that
@@ -1732,12 +1735,30 @@ few milliseconds, and the device held each rise back.
   chips do in software: with one logarithm and one square root a change
   and some forty other operations, about 5000 cycles on an ESP32-S3 by
   Espressif's figures (1619 for a double `cos`, 70 for an addition),
-  some 20 µs of the 200 µs tick, also unmeasured. And the books put each
-  change where the duties are set, while the current follows them over
-  the windings' L / R, some 0.2 ms on a gimbal motor: a spring rendered
-  by the device lags by that much, which makes energy the books do not
-  see, about k ω² (L / R), 0.25 mW for 1 N m/rad at 1 rad/s, as much in
-  a tenth of a second as the noise tax charges in a run.
+  some 20 µs of the 200 µs tick, also unmeasured.
+- **A device's books take the current's lag as configured.** The
+  current follows the voltage over the windings' L / R, some 0.3 ms on a
+  gimbal motor, from where the PWM's next period starts: a spring the
+  device renders lags by that much, which makes energy the torque set
+  does not, about k ω² (L / R), 0.3 mW for 1 N m/rad at 1 rad/s. The
+  firmware keeps the current's torque as an interval, for an L / R
+  within 20 % of the one configured and any delay within the PWM's
+  period, books its middle, taxes half its width on the travel either
+  way (`fw::CurrentLag`), and keeps room under the work cap for what the
+  current flowing will still do. On the simulated motor at 1.5 mH, two
+  seconds of a hand pushing into a host's wall at 2 N m/rad made 1.68 mJ
+  that books taking the torque set at once missed, ten times their noise
+  tax of 0.18 mJ; the interval's books came 0.13 to 0.34 mJ above the
+  true work, and its tax took 0.50 to 1.16 mJ besides, with the PWM's
+  period at 0 and 50 µs and the tick at 200 µs and 1 ms. The tax is the
+  width of what the device does not know, L / R's spread and where in
+  the PWM's period a change lands, and measuring both at calibration
+  would narrow it; neither is measured yet. Under a cap of 100 µJ a knob
+  leaving a stop did 37 to 60 µJ of true work, against 48 to 73 µJ
+  without the inductance, and the device overran the cap by at most
+  0.001 µJ. What the model leaves out is not bounded: an L / R outside
+  the spread, the bridge's dead time, the back-EMF's coupling of the
+  axes through the electrical speed times L.
 - **A device keeps to its work cap closely, not exactly.** What its
   readings cannot foresee, a count's step and the velocity estimate's
   lag behind a stiff contact's push, overruns the cap by up to 70 µJ at

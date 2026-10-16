@@ -24,8 +24,9 @@ class BoardHal final : public fw::Hal {
   // Another transfer, if the menuconfig takes one (TUUSHIN_ENC_REREAD).
   // The new duties are out but take effect with the PWM's next period, up
   // to 50 us on at 20 kHz, and the current follows them over the windings'
-  // L / R: no reading is at the change, and the one at once is as near it
-  // as the core assumes (see "Reading again" in firmware/core/src/core.cpp).
+  // L / R: no reading is at the change, and the core books the travel
+  // between the two readings by the current's interval over it (see
+  // "Reading again" in firmware/core/src/core.cpp).
   // A transfer that fails twice leaves that change booked by the tick's
   // reading, and counts in bad_frames().
   bool reread_encoder(std::uint32_t* raw) override {

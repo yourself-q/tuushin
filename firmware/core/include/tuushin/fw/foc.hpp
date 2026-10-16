@@ -15,8 +15,10 @@
 //   u_beta  = u_d sin(theta_e) + u_q cos(theta_e)
 // and a phase-to-neutral flux linkage of amplitude lambda gives
 //   torque = 1.5 * pole_pairs * lambda * i_q = kt * i_q,
-//   u_q = R i_q + lambda * pole_pairs * omega_m (inductance neglected),
-// along the motor's positive electrical direction.
+//   u_q = R i_q + L di_q/dt + lambda * pole_pairs * omega_m,
+// along the motor's positive electrical direction. The voltage is set for
+// the steady state, R i_q, and the current reaches it over L / R, some 0.3
+// ms for a gimbal motor (CurrentLag).
 
 namespace tuushin::fw {
 
@@ -130,6 +132,64 @@ class VelocityObserver {
   float acc_ = 0.0f;  // rad/s^2
   // The torque's part, for the rotor alone, as if every reading were 0.
   float rt_ = 0.0f, wt_ = 0.0f, acct_ = 0.0f;
+};
+
+// The torque the windings' current makes, which follows the torque set
+// (through the q voltage) over L / R, from where the PWM's next period
+// takes the new duty, and with the bridge open runs down through its
+// diodes faster than that. The device knows neither exactly: L / R moves
+// with the windings' temperature (the copper's resistance by 0.4 % a
+// kelvin), and where in the PWM's period a change lands depends on the
+// tick. So it keeps the torque the current may be making as an interval:
+// each end follows the torque set at whichever rate takes it furthest its
+// way, as fast as L / R allows towards it and as slowly as it allows
+// away from it, waiting out the PWM's period where the torque before was
+// further its way. A current that follows dy/dt = (u - y) / tau for some
+// tau within the bounds, after some delay within them, and the ends are
+// such currents with the worst choice at every instant, so it stays
+// between them (the equation is monotone in u and y), and so does its
+// average over a tick between theirs.
+class CurrentLag {
+ public:
+  // L / R at the least and the most (s), and the longest a new duty waits
+  // (s). Both 0: the torque follows at once.
+  CurrentLag(float lo, float hi, float delay) : lo_(lo), hi_(hi), delay_(delay) {}
+  bool on() const { return hi_ > 0.0f || delay_ > 0.0f; }
+  // The torque set from now (N m): driving the windings, or with the
+  // bridge open (0), where the current is gone at once at the fastest and
+  // runs down over L / R at the slowest.
+  void set(float torque, bool driving);
+  struct Span {
+    float lo, hi;
+  };
+  // The torque set since the last set() held for dt (s): the interval of
+  // the current's torque averaged over it, whose ends go on from where
+  // they reach.
+  Span advance(float dt);
+  // The interval of the current's torque now.
+  Span now() const { return {ylo_, yhi_}; }
+  // The interval of the current's torque averaged over the next s (s),
+  // with `torque` set (driving or not) at some instant within it that is
+  // not known: each end as if set at the start, or not within s,
+  // whichever takes it furthest its way. s = 0: now().
+  Span over(float torque, bool driving, float s) const;
+  // The integral (N m s) of an end of it (sign +1: the upper, -1: the
+  // lower) over all that is to come, with `torque` set now for `hold` (s)
+  // and 0 after, the windings driven throughout.
+  float ahead(float sign, float torque, float hold) const;
+  // Whether the current's torque is the torque set, as far as it tells.
+  bool settled() const { return !fresh_ && ylo_ == u_ && yhi_ == u_; }
+  void reset() {
+    ylo_ = yhi_ = u_ = u_old_ = 0.0f;
+    fresh_ = false;
+  }
+
+ private:
+  float lo_, hi_, delay_;
+  float ylo_ = 0.0f, yhi_ = 0.0f;
+  float u_ = 0.0f, u_old_ = 0.0f;  // the torque set, and before the last set()
+  bool driving_ = false;
+  bool fresh_ = false;  // set() since the last advance()
 };
 
 // Accumulates a single-turn encoder (raw counts in [0, cpr)) into a count

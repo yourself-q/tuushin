@@ -18,11 +18,13 @@
 //
 // Electrically: the bridge voltages, referred to the windings' neutral,
 // pass through the motor's true Clarke and Park transforms at its true
-// electrical angle; the q current is (u_q - back-EMF) / R and makes the
-// torque (inductance neglected: gimbal motors' L/R is a fraction of a
-// millisecond). Mechanically: a rotor and knob with viscous and Coulomb
-// friction, cogging, and the hand, integrated with RK4 under the held
-// voltages, the torque recomputed at each stage as the rotor turns.
+// electrical angle; the q current makes the torque. Without an inductance
+// it is (u_q - back-EMF) / R at once; with one, the windings' currents
+// follow the voltages over L / R, and with the driver off they run down
+// through the bridge's diodes against the supply. Mechanically: a rotor
+// and knob with viscous and Coulomb friction, cogging, and the hand,
+// integrated with RK4 under the held voltages, the torque recomputed at
+// each stage as the rotor turns.
 
 namespace tuushin::fw {
 
@@ -42,6 +44,14 @@ struct PlantParams {
   int direction = 1;
   double electrical_offset = 1.0;  // rad
   double supply = 12.0;  // V
+  // The windings' inductance, phase to neutral (H; 0: neglected). A
+  // gimbal motor's L / R is some 0.3 ms: a GBM2804-100T was measured at
+  // 2.0 mH (q axis) against 6.3 ohm.
+  double phase_inductance = 0.0;
+  // The PWM's period (s; 0: none): new duties take effect where the next
+  // period starts, as a bridge's compare registers update at the counter's
+  // zero.
+  double pwm_period = 0.0;
   double start_angle = 0.3;  // rad, in the encoder's frame
   // The longest integration step (s). The knob against the stop rings at
   // some 85 Hz, so a coarse step still integrates it closely: driven into
@@ -50,6 +60,8 @@ struct PlantParams {
   // one, about as a 100 us step does, where a 500 us step strays 4 mrad
   // rms (14 at worst). The emulated board (firmware/esp32), which has to
   // keep up in real time without a double-precision FPU, takes 250 us.
+  // With an inductance the step is at most half of L / R, which the
+  // currents settle over, while they flow.
   double step = 20e-6;
   // Computes the forces in single precision, keeping the state, the clock
   // and the work in double. Where doubles are done in software (the
@@ -82,10 +94,11 @@ struct HandParams {
 class Plant {
  public:
   explicit Plant(const PlantParams& p, std::uint64_t seed = 1);
-  // Bridge duty cycles, held until the next call; with the driver off the
-  // windings float and carry no current.
+  // Bridge duty cycles, held until the next call, from where the PWM's
+  // next period starts (PlantParams::pwm_period). With the driver off the
+  // windings float; a current still in them runs down through the diodes.
   void set_duties(double a, double b, double c);
-  void enable(bool on) { enabled_ = on; }
+  void enable(bool on);
   // Advances to `t` (s).
   void advance(double t);
   // The encoder's reading now, with its noise.
@@ -101,6 +114,9 @@ class Plant {
   double velocity() const { return omega_; }
   // The motor's electromagnetic torque at the present state (N m).
   double motor_torque() const;
+  // The q current at the present state (A, along the motor's electrical
+  // direction).
+  double q_current() const;
   // Work done on the shaft by the motor so far (J).
   double motor_work() const { return work_; }
   double hand_torque() const;
@@ -108,9 +124,27 @@ class Plant {
   const PlantParams& params() const { return p_; }
 
  private:
+  // The windings' currents (A, alpha and beta) at `t` since the driver
+  // went off, with an inductance: running down through the bridge's
+  // diodes, which put the supply against them, and through the windings'
+  // resistance. The supply is taken at the hexagon's inner circle, the
+  // slowest the diodes ever take it, and the back-EMF is neglected (at
+  // 10 rad/s a tenth of it), so the current is gone sooner than over L / R
+  // alone, the slowest a driver that holds zero volts lets it go.
+  void off_currents(double t, double* ia, double* ib) const;
+  // When they are gone (s).
+  double off_end() const;
   // The forces at a state, computed in F (PlantParams::float_forces).
+  // The voltage on the windings, alpha and beta, referred to their neutral.
   template <class F>
-  F torque_at(double theta, double omega) const;
+  void voltage_ab(F* alpha, F* beta) const;
+  // The q current at a state: (u_q - back-EMF) / R without an inductance,
+  // the windings' currents ia, ib along q with one. Given `dia`, with an
+  // inductance, also the currents' rates under the driver, from the same
+  // sine and cosine.
+  template <class F>
+  F q_current_at(double theta, double omega, double ia, double ib, double* dia = nullptr,
+                 double* dib = nullptr) const;
   template <class F>
   F hand_at(double t, double theta, double omega) const;
   template <class F>
@@ -125,7 +159,15 @@ class Plant {
   double load_ = 0.0;
   bool enabled_ = false;
   double va_ = 0.0, vb_ = 0.0, vc_ = 0.0;
+  // Duties set, and where they take effect (PlantParams::pwm_period).
+  bool pending_ = false;
+  double pending_at_ = 0.0;
+  double pa_ = 0.0, pb_ = 0.0, pc_ = 0.0;
   double t_ = 0.0, theta_, omega_ = 0.0;
+  double ia_ = 0.0, ib_ = 0.0;  // the windings' currents (A), with an inductance
+  // Where the driver went off, and the currents then: magnitude and
+  // direction.
+  double off_t_ = 0.0, off_s_ = 0.0, off_a_ = 0.0, off_b_ = 0.0;
   double work_ = 0.0;
   std::uint64_t rng_;
   double spare_ = 0.0;

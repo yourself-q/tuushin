@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 
@@ -71,7 +72,8 @@ DeviceCore::DeviceCore(Hal& hal, const DeviceConfig& cfg)
       link_timeout_us_(cfg.link_timeout_us),
       torque_limit_(cfg.max_torque),
       velocity_limit_(cfg.velocity_limit),
-      damping_(cfg.damping) {
+      damping_(cfg.damping),
+      lag_(cfg.current_lag_lo, cfg.current_lag_hi, cfg.duty_delay) {
   const float lo = cfg.reading_noise_lo, hi = cfg.reading_noise_hi;
   noisy_ = hi > 0.0f && lo >= 0.0f && lo <= hi && cfg.noise_tax_delta > 0.0f &&
            cfg.noise_tax_delta < 1.0f && cfg.noise_tax_torque > 0.0f;
@@ -123,6 +125,11 @@ void DeviceCore::tick() {
   last_us_ = now;
   const float count_to_rad = kTwoPi / static_cast<float>(cfg_.counts_per_rev);
   const float was = applied_;  // the torque held since the last tick
+  // What the current made of it: the interval of its average, booked at
+  // the middle and taxed half its width on the shaft's travel either way.
+  const CurrentLag::Span made = lag_.advance(dt);
+  const float acted = lag_.on() ? 0.5f * (made.lo + made.hi) : was;
+  const float spread = lag_.on() ? 0.5f * (made.hi - made.lo) : 0.0f;
 
   // The encoder, and the work the torque held since the last tick did:
   // from the count its books start at to this reading.
@@ -136,11 +143,14 @@ void DeviceCore::tick() {
     const float most = 2.0f * velocity_limit_ * dt / count_to_rad + 16.0f;
     if (std::fabs(static_cast<float>(step)) > most) latch(Fault::kEncoderJump);
     const float dtheta = static_cast<float>(step) * count_to_rad;
-    work_ += static_cast<double>(was) * static_cast<double>(turns_.count() - bound_) *
+    const std::int32_t moved = turns_.count() - bound_;
+    work_ += static_cast<double>(acted) * static_cast<double>(moved) *
              static_cast<double>(count_to_rad);
+    tax_ += static_cast<double>(spread) * static_cast<double>(std::abs(moved)) *
+            static_cast<double>(count_to_rad);
     bound_ = turns_.count();
     vel_.update(dtheta, dt);
-    obs_.update(dtheta, dt, motor_torque_);
+    obs_.update(dtheta, dt, motor_torque_ - was + acted);
     // The second difference of the readings, weighted by the ticks'
     // times, step dt' - step' dt: of their errors, dt'^2 + (dt + dt')^2 +
     // dt^2 times their variance (6 dt^2 with even ticks), of a shaft
@@ -209,10 +219,15 @@ void DeviceCore::tick() {
       booked_ = work_ + tax_;
     }
     if (host != 0.0f && capped) host = keep_to_cap(host, dt, was);
-    if (host == 0.0f && damping_ == 0.0f) {
+    const CurrentLag::Span current = lag_.now();
+    if (host == 0.0f && damping_ == 0.0f && current.lo == 0.0f && current.hi == 0.0f) {
       // No torque to make: open the windings, which then carry no current
       // at all, instead of driving against an estimate of the back-EMF,
-      // whose error (the velocity estimate's lag) would make some.
+      // whose error (the velocity estimate's lag) would make some. Not
+      // before the current is gone: open, the bridge's diodes take it
+      // down at a rate the device does not know, from the supply's against
+      // it, faster than L / R, to L / R's itself, which then leaves the
+      // books the whole of it to tax.
       drive(false);
     } else {
       drive(true);
@@ -221,11 +236,18 @@ void DeviceCore::tick() {
   }
   // Every change of the torque applied, the host's, the cap's, the
   // voltage's, a cut's: the books' boundary moves to the second reading,
-  // and the change is taxed.
-  if (applied_ != was) {
+  // and the change is taxed. And so it does while the current follows
+  // one, whose torque the books take changes every tick. Between the
+  // readings the current goes on from where it was at the first towards
+  // the torque held, or, the new duties out, towards the torque applied
+  // (CurrentLag::over).
+  const CurrentLag::Span at = lag_.now();
+  const bool following = lag_.on() && (at.lo != was || at.hi != was);
+  if (applied_ != was || following) {
     if (read) reread(was, omega, now);
-    tax_ += charge_change(was, applied_);
   }
+  if (applied_ != was) tax_ += charge_change(was, applied_);
+  lag_.set(applied_, driving_);
 
   // States go out on a lattice of the period, not a period after the last
   // one went: a tick that came a little early would otherwise wait a whole
@@ -562,19 +584,51 @@ void DeviceCore::foc(float host, float omega, float vbus) {
 // let it back on at every count, at the tax each time.
 float DeviceCore::keep_to_cap(float tau, float dt, float before) {
   const float left = static_cast<float>(cmd_.work_cap - (work_ + tax_));
-  const float room = left > 0.0f ? left : 0.0f;
   const float q = kTwoPi / static_cast<float>(cfg_.counts_per_rev);
   const float mag = std::fabs(tau);
   const float inertia = cfg_.inertia;
+  // What the torque does is its torque-time, F = l tau dt at once. Under
+  // the current's lag (CurrentLag) the books take each end of the
+  // current's interval, whichever books more, over the tick and after
+  // it: of the torques set before, a part f0 the torque set now does not
+  // change, and of l tau, a part l f1, the chord of a function convex in
+  // l at the end the books take where the shaft turns steadily, which
+  // bounds it from above. The work is then w = omega F + F^2 / (2 J) for
+  // F = f0 + l f1, plus the other torque's: f0's part comes first, out of
+  // the room, and l f1's is as at once.
+  float f0[2] = {0.0f, 0.0f}, f1[2] = {tau * dt, tau * dt};
+  // When the torque-time comes, after the tick's start: half the tick at
+  // once, and the current's lag besides.
+  float late = 0.5f * dt;
+  if (lag_.on()) {
+    for (int k = 0; k < 2; ++k) {
+      const float sign = k == 0 ? -1.0f : 1.0f;
+      f0[k] = lag_.ahead(sign, 0.0f, dt);
+      f1[k] = lag_.ahead(sign, tau, dt) - f0[k];
+    }
+    late += cfg_.current_lag_hi + cfg_.duty_delay;
+  }
   // The shaft as the rotor alone (share 1) and as held by a hand heavier
   // than any (share 0); the work is convex in the share, so the worse of
   // the two, term by term, bounds it for every hand in between.
-  const float a = dt * std::max(tau * obs_.velocity(1.0f), tau * obs_.velocity(0.0f));
-  const float b = inertia > 0.0f ? tau * tau * dt * dt / (2.0f * inertia) : 0.0f;
+  const float w1 = obs_.velocity(1.0f), w0 = obs_.velocity(0.0f);
+  const float g1 = obs_.acceleration(1.0f), g0 = obs_.acceleration(0.0f);
+  const float jinv = inertia > 0.0f ? 1.0f / inertia : 0.0f;
+  float committed = 0.0f, a = -1e30f, b = 0.0f, push = -1e30f, f1_most = 0.0f;
+  for (int k = 0; k < 2; ++k) {
+    const float c0 = f0[k] * w1 + 0.5f * jinv * f0[k] * f0[k], c1 = f0[k] * w0;
+    // The other torque's part of the torques set before, where it pushes.
+    const float cp = std::max(f0[k] * g1, f0[k] * g0);
+    committed = std::max(committed, std::max(c0, c1) + std::max(cp, 0.0f) * late);
+    a = std::max(a, std::max(f1[k] * w1 + jinv * f0[k] * f1[k], f1[k] * w0));
+    b = std::max(b, 0.5f * jinv * f1[k] * f1[k]);
+    push = std::max(push, std::max(f1[k] * g1, f1[k] * g0));
+    f1_most = std::max(f1_most, std::fabs(f1[k]));
+  }
+  const float room = left - committed > 0.0f ? left - committed : 0.0f;
   // The other torque where it turns the shaft the torque's way; not where
   // it holds the shaft back, which a hand may stop doing.
-  const float push = std::max(tau * obs_.acceleration(1.0f), tau * obs_.acceleration(0.0f));
-  const float e = push > 0.0f ? 0.5f * push * dt * dt : 0.0f;
+  const float e = push > 0.0f ? push * late : 0.0f;
   const float free = before * tau > 0.0f ? std::fabs(before) : 0.0f;
   const float l0 = free / mag;  // where the tax starts
   const float horizon = std::max(1.0f, kTaxHorizonUs * 1e-6f / dt);  // ticks
@@ -602,7 +656,7 @@ float DeviceCore::keep_to_cap(float tau, float dt, float before) {
   // the torque's way. The readings' errors are rounding, at least, and
   // independent from one reading to the next.
   const float reading_sd = std::sqrt(std::max(reading_var_, 1.0f / 12.0f)) * q;
-  const float sure = a + mag * kRiseConfidence * obs_.spread(reading_sd, dt) * dt;
+  const float sure = a + kRiseConfidence * obs_.spread(reading_sd, dt) * f1_most;
   auto due = [&](float l) {
     float n = 1.0f;
     if (sure < 0.0f) {
@@ -685,12 +739,17 @@ float DeviceCore::keep_to_cap(float tau, float dt, float before) {
 // same error again (reread_independence(), told in a log after
 // kRereadWindow of them). What it leaves uncovered: the motion between the
 // change and the instant the encoder samples, booked with the old torque;
-// and the current, which follows the voltage over the windings' L / R,
-// about 0.2 ms for a gimbal motor, so that the torque changes over that
-// time and not at the instant the books put the change at. The latter is
-// the error of every change's timing, taxed or not: at 1 rad/s, 0.01 N m
-// changed over 0.2 ms is off by up to 2 uJ, as much as the noise tax of a
-// small change.
+// and, where the device does not know the current's lag
+// (DeviceConfig::current_lag_hi = 0), the current, which follows the
+// voltage over the windings' L / R, about 0.3 ms for a gimbal motor, so
+// that the torque changes over that time and not at the instant the books
+// put the change at. Where it knows the lag, the books take the current's
+// torque as its interval, at the middle, and tax half its width on the
+// travel either way (CurrentLag), the travel between the readings too:
+// a spring the device renders without that lags it by L / R and makes
+// energy the books do not see, 1.7 mJ over two seconds of a hand pushing
+// into a host's wall at 2 N m/rad, ten times the noise tax, which the
+// interval covers (tests/test_fw_core.cpp).
 double DeviceCore::charge_change(float before, float to) {
   if (noise_) return noise_->charge(before, to);
   const float q = kTwoPi / static_cast<float>(cfg_.counts_per_rev);
@@ -705,16 +764,23 @@ control::ChangeTax DeviceCore::change_line(float before, float target) const {
 void DeviceCore::reread(float was, float omega, std::uint32_t now) {
   std::uint32_t again;
   if (!hal_.reread_encoder(&again)) return;
+  const float elapsed = static_cast<float>(static_cast<std::uint32_t>(hal_.micros() - now)) * 1e-6f;
+  float acted = was, spread = 0.0f;
+  if (lag_.on()) {
+    const CurrentLag::Span made = lag_.over(applied_, driving_, elapsed);
+    acted = 0.5f * (made.lo + made.hi);
+    spread = 0.5f * (made.hi - made.lo);
+  }
   const std::int32_t cpr = static_cast<std::int32_t>(cfg_.counts_per_rev);
   std::int32_t d = static_cast<std::int32_t>(again) - static_cast<std::int32_t>(raw_);
   if (d > cpr / 2) d -= cpr;
   if (d < -cpr / 2) d += cpr;
   const float q = kTwoPi / static_cast<float>(cfg_.counts_per_rev);
-  work_ += static_cast<double>(was) * static_cast<double>(d) * static_cast<double>(q);
+  work_ += static_cast<double>(acted) * static_cast<double>(d) * static_cast<double>(q);
+  tax_ += static_cast<double>(spread) * static_cast<double>(std::abs(d)) * static_cast<double>(q);
   bound_ = turns_.count() + d;
 
   // The check of the second reading's independence.
-  const float elapsed = static_cast<float>(static_cast<std::uint32_t>(hal_.micros() - now)) * 1e-6f;
   const float r = static_cast<float>(d) - omega * elapsed / q;
   ++rereads_;
   const float n = static_cast<float>(rereads_ < kRereadWindow ? rereads_ : kRereadWindow);

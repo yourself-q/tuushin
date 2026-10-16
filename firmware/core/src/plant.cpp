@@ -17,9 +17,48 @@ Plant::Plant(const PlantParams& p, std::uint64_t seed)
 
 void Plant::set_duties(double a, double b, double c) {
   auto clamp = [](double d) { return d < 0.0 ? 0.0 : (d > 1.0 ? 1.0 : d); };
-  va_ = clamp(a) * p_.supply;
-  vb_ = clamp(b) * p_.supply;
-  vc_ = clamp(c) * p_.supply;
+  pa_ = clamp(a) * p_.supply;
+  pb_ = clamp(b) * p_.supply;
+  pc_ = clamp(c) * p_.supply;
+  if (p_.pwm_period > 0.0) {
+    // A write a hair before a period's start, by the clock's rounding,
+    // waits for the next one, as a write at it does.
+    pending_at_ = (std::floor(t_ / p_.pwm_period + 1e-6) + 1.0) * p_.pwm_period;
+    pending_ = true;
+  } else {
+    va_ = pa_;
+    vb_ = pb_;
+    vc_ = pc_;
+  }
+}
+
+void Plant::enable(bool on) {
+  if (p_.phase_inductance > 0.0) {
+    if (enabled_ && !on) {
+      off_t_ = t_;
+      off_s_ = std::hypot(ia_, ib_);
+      off_a_ = off_s_ > 0.0 ? ia_ / off_s_ : 0.0;
+      off_b_ = off_s_ > 0.0 ? ib_ / off_s_ : 0.0;
+    } else if (!enabled_ && on) {
+      off_currents(t_, &ia_, &ib_);
+    }
+  }
+  enabled_ = on;
+}
+
+void Plant::off_currents(double t, double* ia, double* ib) const {
+  // L ds/dt = -(V / sqrt 3 + R s) for the magnitude s, until it is zero.
+  const double r = p_.phase_resistance, tau = p_.phase_inductance / r;
+  const double c = std::max(p_.supply / std::sqrt(3.0) / r, 1e-9);
+  const double s = std::max(0.0, (off_s_ + c) * std::exp(-(t - off_t_) / tau) - c);
+  *ia = s * off_a_;
+  *ib = s * off_b_;
+}
+
+double Plant::off_end() const {
+  const double r = p_.phase_resistance, tau = p_.phase_inductance / r;
+  const double c = std::max(p_.supply / std::sqrt(3.0) / r, 1e-9);
+  return off_t_ + tau * std::log((off_s_ + c) / c);
 }
 
 void Plant::set_hand(const HandParams& h, double t0) {
@@ -28,19 +67,34 @@ void Plant::set_hand(const HandParams& h, double t0) {
 }
 
 template <class F>
-F Plant::torque_at(double theta, double omega) const {
-  if (!enabled_) return F(0);
+void Plant::voltage_ab(F* alpha, F* beta) const {
   const F va = F(va_), vb = F(vb_), vc = F(vc_);
   const F mean = (va + vb + vc) / F(3);
   const F a = va - mean, b = vb - mean, c = vc - mean;
-  const F alpha = a;
-  const F beta = (b - c) / std::sqrt(F(3));
+  *alpha = a;
+  *beta = (b - c) / std::sqrt(F(3));
+}
+
+template <class F>
+F Plant::q_current_at(double theta, double omega, double ia, double ib, double* dia,
+                      double* dib) const {
+  const bool rl = p_.phase_inductance > 0.0;
+  if (!rl && !enabled_) return F(0);
   const F dir = p_.direction >= 0 ? F(1) : F(-1);
   const F te = dir * F(p_.pole_pairs) * F(theta) - F(p_.electrical_offset);
-  const F vq = -alpha * std::sin(te) + beta * std::cos(te);
+  const F sin_te = std::sin(te), cos_te = std::cos(te);
+  const F iq = -F(ia) * sin_te + F(ib) * cos_te;
+  if (rl && !dia) return iq;
+  F alpha, beta;
+  voltage_ab(&alpha, &beta);
+  // The back-EMF lies along q: (-sin, cos) of the electrical angle.
   const F emf = F(p_.kt) / F(1.5) * dir * F(omega);
-  const F iq = (vq - emf) / F(p_.phase_resistance);
-  return dir * F(p_.kt) * iq;
+  const F r = F(p_.phase_resistance);
+  if (!rl) return (-alpha * sin_te + beta * cos_te - emf) / r;
+  const F l = F(p_.phase_inductance);
+  *dia = static_cast<double>((alpha - r * F(ia) + emf * sin_te) / l);
+  *dib = static_cast<double>((beta - r * F(ib) - emf * cos_te) / l);
+  return iq;
 }
 
 template <class F>
@@ -54,8 +108,12 @@ F Plant::hand_at(double t, double theta, double omega) const {
   return F(hand_.k) * (ref - F(theta)) + F(hand_.b) * (vref - F(omega));
 }
 
+double Plant::q_current() const {
+  return q_current_at<double>(theta_, omega_, ia_, ib_);
+}
+
 double Plant::motor_torque() const {
-  return torque_at<double>(theta_, omega_);
+  return (p_.direction >= 0 ? 1.0 : -1.0) * p_.kt * q_current();
 }
 
 DeviceConfig device_config_for(const PlantParams& p, const char* name) {
@@ -72,6 +130,12 @@ DeviceConfig device_config_for(const PlantParams& p, const char* name) {
     c.reading_noise_lo = static_cast<float>(p.encoder_noise / 1.1);
     c.reading_noise_hi = static_cast<float>(p.encoder_noise * 1.1);
   }
+  if (p.phase_inductance > 0.0) {
+    const double lag = p.phase_inductance / p.phase_resistance;
+    c.current_lag_lo = static_cast<float>(lag / 1.2);
+    c.current_lag_hi = static_cast<float>(lag * 1.2);
+  }
+  c.duty_delay = static_cast<float>(p.pwm_period);
   c.kind = device::DeviceKind::kSimulated;
   std::snprintf(c.name, sizeof c.name, "%s", name);
   return c;
@@ -93,36 +157,69 @@ double Plant::stop_torque() const {
 }
 
 void Plant::advance(double t) {
-  if (p_.float_forces) integrate<float>(t);
-  else integrate<double>(t);
+  for (;;) {
+    if (pending_ && pending_at_ <= t_) {
+      va_ = pa_;
+      vb_ = pb_;
+      vc_ = pc_;
+      pending_ = false;
+    }
+    if (t_ >= t) return;
+    const double until = pending_ ? std::min(t, pending_at_) : t;
+    if (p_.float_forces) integrate<float>(until);
+    else integrate<double>(until);
+  }
 }
 
 template <class F>
 void Plant::integrate(double t) {
   const F inertia = F(p_.inertia + (hand_.present ? hand_.inertia : 0.0));
-  auto accel = [&](double ti, double th, double om, double* motor) {
-    const F m = torque_at<F>(th, om);
-    *motor = static_cast<double>(m);
+  const F dir = p_.direction >= 0 ? F(1) : F(-1);
+  const bool rl = p_.phase_inductance > 0.0;
+  const bool decaying = rl && !enabled_;
+  // When the currents are gone, with the driver off (s).
+  const double end = decaying ? off_end() : 0.0;
+  struct Rate {
+    double w, a, ia, ib, motor;
+  };
+  auto rate = [&](double ti, double th, double om, double ia, double ib) {
+    Rate r{om, 0.0, 0.0, 0.0, 0.0};
+    F m = F(0);
+    if (!decaying) {
+      m = dir * F(p_.kt) * q_current_at<F>(th, om, ia, ib, rl ? &r.ia : nullptr, &r.ib);
+    } else if (ti < end) {
+      off_currents(ti, &ia, &ib);
+      m = dir * F(p_.kt) * q_current_at<F>(th, om, ia, ib);
+    }
+    r.motor = static_cast<double>(m);
     const F cog = -F(p_.cogging) * std::sin(F(p_.cogging_per_rev) * F(th));
     const F fric = -F(p_.viscous) * F(om) - F(p_.coulomb) * std::tanh(F(om) / F(0.02));
     const F sum = m + cog + fric + hand_at<F>(ti, th, om) + stop_at<F>(th, om) + F(load_);
-    return static_cast<double>(sum / inertia);
+    r.a = static_cast<double>(sum / inertia);
+    return r;
   };
+  // The currents settle over L / R: half of it keeps RK4 close. Once they
+  // are gone, with the driver off, the step is the mechanics' again.
+  const double settle = rl ? 0.5 * p_.phase_inductance / p_.phase_resistance : p_.step;
   while (t_ < t) {
-    const double h = std::min(p_.step, t - t_);
-    double m1, m2, m3, m4;
-    const double a1 = accel(t_, theta_, omega_, &m1);
-    const double w1 = omega_;
-    const double a2 = accel(t_ + h / 2, theta_ + h / 2 * w1, omega_ + h / 2 * a1, &m2);
-    const double w2 = omega_ + h / 2 * a1;
-    const double a3 = accel(t_ + h / 2, theta_ + h / 2 * w2, omega_ + h / 2 * a2, &m3);
-    const double w3 = omega_ + h / 2 * a2;
-    const double a4 = accel(t_ + h, theta_ + h * w3, omega_ + h * a3, &m4);
-    const double w4 = omega_ + h * a3;
-    work_ += h / 6.0 * (m1 * w1 + 2 * m2 * w2 + 2 * m3 * w3 + m4 * w4);
-    theta_ += h / 6.0 * (w1 + 2 * w2 + 2 * w3 + w4);
-    omega_ += h / 6.0 * (a1 + 2 * a2 + 2 * a3 + a4);
-    t_ += h;
+    const bool live = rl && (!decaying || t_ < end);
+    double h = std::min(live ? std::min(p_.step, settle) : p_.step, t - t_);
+    if (decaying && end > t_ && end < t_ + h) h = end - t_;
+    const Rate k1 = rate(t_, theta_, omega_, ia_, ib_);
+    const Rate k2 = rate(t_ + h / 2, theta_ + h / 2 * k1.w, omega_ + h / 2 * k1.a,
+                         ia_ + h / 2 * k1.ia, ib_ + h / 2 * k1.ib);
+    const Rate k3 = rate(t_ + h / 2, theta_ + h / 2 * k2.w, omega_ + h / 2 * k2.a,
+                         ia_ + h / 2 * k2.ia, ib_ + h / 2 * k2.ib);
+    const Rate k4 =
+        rate(t_ + h, theta_ + h * k3.w, omega_ + h * k3.a, ia_ + h * k3.ia, ib_ + h * k3.ib);
+    work_ += h / 6.0 *
+             (k1.motor * k1.w + 2 * k2.motor * k2.w + 2 * k3.motor * k3.w + k4.motor * k4.w);
+    theta_ += h / 6.0 * (k1.w + 2 * k2.w + 2 * k3.w + k4.w);
+    omega_ += h / 6.0 * (k1.a + 2 * k2.a + 2 * k3.a + k4.a);
+    ia_ += h / 6.0 * (k1.ia + 2 * k2.ia + 2 * k3.ia + k4.ia);
+    ib_ += h / 6.0 * (k1.ib + 2 * k2.ib + 2 * k3.ib + k4.ib);
+    t_ = h == t - t_ ? t : t_ + h;
+    if (decaying) off_currents(t_, &ia_, &ib_);
   }
 }
 

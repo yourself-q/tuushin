@@ -1,6 +1,7 @@
 #include "tuushin/fw/foc.hpp"
 
 #include <cmath>
+#include <utility>
 
 namespace tuushin::fw {
 
@@ -121,6 +122,94 @@ void VelocityObserver::update(float dtheta, float dt, float torque) {
   };
   step(r_, w_, acc_, 0.0f, dtheta);
   step(rt_, wt_, acct_, inertia_ > 0.0f ? torque / inertia_ : 0.0f, 0.0f);
+}
+
+namespace {
+
+// y going from y0 towards v over s (s) with time constant tau (0: at
+// once), adding its integral over s to *area.
+float toward(float y0, float v, float s, float tau, float* area) {
+  if (s <= 0.0f) return y0;
+  if (tau <= 0.0f) {
+    *area += v * s;
+    return v;
+  }
+  const float gone = -std::expm1(-s / tau);
+  *area += v * s + (y0 - v) * tau * gone;
+  return y0 + (v - y0) * gone;
+}
+
+}  // namespace
+
+void CurrentLag::set(float torque, bool driving) {
+  if (!on()) return;
+  u_old_ = u_;
+  u_ = driving ? torque : 0.0f;
+  driving_ = driving;
+  fresh_ = u_ != u_old_ || fresh_;
+}
+
+CurrentLag::Span CurrentLag::advance(float dt) {
+  if (!on() || dt <= 0.0f) return {ylo_, yhi_};
+  // The fastest towards the torque with the bridge open is at once.
+  const float fast = driving_ ? lo_ : 0.0f;
+  auto end = [&](float y, float sign) {
+    // sign +1 for the upper end, which goes up as fast as it can and down
+    // as slowly; -1 for the lower.
+    float area = 0.0f, s = dt;
+    auto tau = [&](float from, float v) { return sign * (v - from) >= 0.0f ? fast : hi_; };
+    if (fresh_ && driving_ && sign * (u_old_ - u_) > 0.0f) {
+      // A tick shorter than the delay has the rest of it go uncounted: the
+      // ticks are some ten times longer.
+      const float d = std::fmin(delay_, dt);
+      y = toward(y, u_old_, d, tau(y, u_old_), &area);
+      s -= d;
+    }
+    y = toward(y, u_, s, tau(y, u_), &area);
+    return std::make_pair(y, area / dt);
+  };
+  const auto hi = end(yhi_, 1.0f), lo = end(ylo_, -1.0f);
+  yhi_ = hi.first;
+  ylo_ = lo.first;
+  fresh_ = false;
+  // Settled to the float's resolution: the books then take the torque set.
+  const float tiny = 1e-6f * std::fmax(std::fabs(u_), 1e-3f);
+  if (std::fabs(yhi_ - u_) <= tiny && std::fabs(ylo_ - u_) <= tiny) ylo_ = yhi_ = u_;
+  return {lo.second, hi.second};
+}
+
+CurrentLag::Span CurrentLag::over(float torque, bool driving, float s) const {
+  if (s <= 0.0f) return now();
+  const float to = driving ? torque : 0.0f;
+  // An end's average with the torque set taking effect at the start, or
+  // not within s. A switch between does no more: taking it later changes
+  // the average by the rate under the old torque less that under the new,
+  // where the end then is, which keeps its sign along the way or turns
+  // from the new's favour to the old's (an open bridge's current gone at
+  // once towards 0, until the end passes 0), and never back from where
+  // advance() leaves the ends; so the most is at a switch at either end.
+  auto mean = [&](float y, float sign, float v, bool drv) {
+    const float fast = drv ? lo_ : 0.0f;
+    float area = 0.0f;
+    toward(y, v, s, sign * (v - y) >= 0.0f ? fast : hi_, &area);
+    return area / s;
+  };
+  return {std::fmin(mean(ylo_, -1.0f, u_, driving_), mean(ylo_, -1.0f, to, driving)),
+          std::fmax(mean(yhi_, 1.0f, u_, driving_), mean(yhi_, 1.0f, to, driving))};
+}
+
+float CurrentLag::ahead(float sign, float torque, float hold) const {
+  if (!on()) return torque * hold;
+  float y = sign > 0.0f ? yhi_ : ylo_, area = 0.0f, s = hold;
+  auto tau = [&](float from, float v) { return sign * (v - from) >= 0.0f ? lo_ : hi_; };
+  if (sign * (u_ - torque) > 0.0f) {
+    const float d = std::fmin(delay_, hold);
+    y = toward(y, u_, d, tau(y, u_), &area);
+    s -= d;
+  }
+  y = toward(y, torque, s, tau(y, torque), &area);
+  if (sign * torque > 0.0f) y = toward(y, torque, delay_, tau(y, torque), &area);
+  return area + y * tau(y, 0.0f);
 }
 
 std::int32_t TurnCounter::update(std::uint32_t raw) {

@@ -80,6 +80,31 @@ menu "tuushin device"
                 Half of what an ohmmeter reads between two of the motor's
                 terminals.
 
+        config TUUSHIN_PHASE_INDUCTANCE_UH
+            int "Phase inductance, phase to neutral, q axis (uH; 0: none)"
+            default 1500
+            help
+                Half of what an LCR meter reads between two of the
+                motor's terminals at the rotor's q axis. The current
+                follows the voltage over L / R, some 0.3 ms for a gimbal
+                motor (a GBM2804-100T: 2.0 mH against 6.3 ohm), and the
+                device books the work of the current, not of the torque
+                it sets: a spring it renders lags by L / R, which makes
+                energy the torque set does not. 0 books the torque set at
+                once, which is right only for a motor whose L / R is
+                short against the tick.
+
+        config TUUSHIN_CURRENT_LAG_SPREAD_PCT
+            int "How far L / R may lie from the configured one (%)"
+            range 0 100
+            default 20
+            help
+                The device takes L / R as anywhere between the configured
+                one divided and multiplied by 1 plus this, and taxes the
+                work that leaves uncertain. The copper's resistance rises
+                by 0.4 % a kelvin, so 20 % is the windings 50 K from
+                where R was measured.
+
         config TUUSHIN_TORQUE_CONSTANT_UNM_PER_A
             int "Torque constant (uN m/A, amplitude-invariant; 0: from KV)"
             default 80000
@@ -331,7 +356,8 @@ menu "tuushin device"
             help
                 250 us integrates the knob about as closely as 100 us does,
                 where 500 us strays (fw/plant.hpp). Under QEMU a step costs
-                some 35 us, 60 us with the driver on.
+                some 35 us, 60 us with the driver on. With an inductance
+                the step is at most half of L / R while the current flows.
 
         config TUUSHIN_EMULATED_NOISE_MILLICOUNTS
             int "Encoder noise (thousandths of a count)"
