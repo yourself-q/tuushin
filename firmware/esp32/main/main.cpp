@@ -66,7 +66,7 @@ bool IRAM_ATTR on_alarm(gptimer_handle_t, const gptimer_alarm_event_data_t*, voi
 
 // The simulated motor as the servo task last saw it, ten times a second.
 struct Snapshot {
-  double t, angle, torque, work;
+  double t, angle, torque, work, overrun;
   bool driving, calibrating, fault;
   std::uint32_t worst_integration_us;
   std::int64_t busy_us, covered_us, lost_us;
@@ -82,6 +82,7 @@ void take_snapshot() {
   s.angle = p.angle();
   s.torque = p.motor_torque();
   s.work = p.motor_work();
+  s.overrun = g_core->worst_overrun();
   s.driving = g_core->enabled();
   s.calibrating = (g_core->last_state().flags & device::kStateCalibrating) != 0;
   s.fault = g_core->fault() != device::Fault::kNone;
@@ -192,10 +193,10 @@ void report() {
     const int load = covered > 0 ? static_cast<int>(100 * (s.busy_us - last_busy) / covered) : 0;
     last_busy = s.busy_us;
     last_covered = s.covered_us;
-    std::printf("emu: t %.1f s  angle %+.3f rad  %+.4f N m  work %.4f J%s%s%s  ticks %" PRIu32
-                "  missed %" PRIu32 "  worst tick %" PRIu32 " us (integration %" PRIu32
+    std::printf("emu: t %.1f s  angle %+.3f rad  %+.4f N m  work %.4f J (cap overrun %.1f uJ at most)%s%s%s"
+                "  ticks %" PRIu32 "  missed %" PRIu32 "  worst tick %" PRIu32 " us (integration %" PRIu32
                 " us, load %d%%, lost %lld ms)  timer restarts %" PRIu32 "\n",
-                s.t, s.angle, s.torque, s.work, s.driving ? "  driving" : "",
+                s.t, s.angle, s.torque, s.work, s.overrun * 1e6, s.driving ? "  driving" : "",
                 s.calibrating ? "  calibrating" : "", s.fault ? "  FAULT" : "", c.ticks, c.missed,
                 c.worst_tick_us, s.worst_integration_us, load, static_cast<long long>(s.lost_us / 1000),
                 c.rearmed);

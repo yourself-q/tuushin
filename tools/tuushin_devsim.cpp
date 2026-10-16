@@ -68,6 +68,8 @@ void usage() {
                "  --counts N            encoder counts a turn (16384)\n"
                "  --noise COUNTS        encoder noise, standard deviation (0.5)\n"
                "  --seed N              of the encoder noise (1)\n"
+               "  --tick-us US          the servo loop's tick (200; the emulated board's is\n"
+               "                        1000)\n"
                "  --duration S          exit after S seconds\n"
                "  --quiet               no status line every second\n");
 }
@@ -268,6 +270,7 @@ int main(int argc, char** argv) {
   int tcp_port = 0;
   std::string bind = "127.0.0.1", path_file;
   double latency_ms = 0.5, duration = 0.0;
+  std::uint32_t tick_us = 0;
   std::uint64_t seed = 1;
   fw::PlantParams pp;
   fw::HandParams hand;
@@ -299,6 +302,7 @@ int main(int argc, char** argv) {
       else if (a == "--counts") pp.counts_per_rev = static_cast<std::uint32_t>(parse_double(next(), "counts"));
       else if (a == "--noise") pp.encoder_noise = parse_double(next(), "noise");
       else if (a == "--seed") seed = static_cast<std::uint64_t>(parse_double(next(), "seed"));
+      else if (a == "--tick-us") tick_us = static_cast<std::uint32_t>(parse_double(next(), "tick-us"));
       else if (a == "--duration") duration = parse_double(next(), "duration");
       else if (a == "--quiet") quiet = true;
       else if (a == "-h" || a == "--help") { usage(); return 0; }
@@ -325,7 +329,8 @@ int main(int argc, char** argv) {
 
     fw::Plant plant(pp, seed);
     fw::SimHal hal(plant, latency_ms * 1e-3);
-    const fw::DeviceConfig dc = fw::device_config_for(pp, "devsim");
+    fw::DeviceConfig dc = fw::device_config_for(pp, "devsim");
+    if (tick_us > 0) dc.tick_us = tick_us;
     if (calibrated) {
       hal.stored.valid = true;
       hal.stored.direction = static_cast<std::int8_t>(pp.direction);
@@ -401,8 +406,9 @@ int main(int argc, char** argv) {
         port->write(buf, n);
       }
       if (was_connected && !port->connected()) {
-        std::fprintf(stderr, "devsim: %.4f J of motor work by %.3f s\n", plant.motor_work(),
-                     sim_time(now));
+        std::fprintf(stderr,
+                     "devsim: %.4f J of motor work by %.3f s; a work cap overrun by %.1f uJ at most\n",
+                     plant.motor_work(), sim_time(now), core.worst_overrun() * 1e6);
       }
       was_connected = port->connected();
       if (!quiet && now >= next_status) {
@@ -418,9 +424,11 @@ int main(int argc, char** argv) {
         worst = 0;
       }
     }
-    std::fprintf(stderr, "devsim: %llu ticks, %llu late; %.4f J of motor work\n",
+    std::fprintf(stderr,
+                 "devsim: %llu ticks, %llu late; %.4f J of motor work; a work cap overrun by %.1f uJ "
+                 "at most\n",
                  static_cast<unsigned long long>(ticks), static_cast<unsigned long long>(late),
-                 plant.motor_work());
+                 plant.motor_work(), core.worst_overrun() * 1e6);
     return 0;
   } catch (const std::exception& e) {
     std::fprintf(stderr, "tuushin-devsim: %s\n", e.what());

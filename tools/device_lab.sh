@@ -6,8 +6,9 @@
 #
 #   tools/device_lab.sh [BUILD_DIR] [SECONDS] [-- extra tuushin-teleop options for both ends]
 #
-# DEVICE_OPTS is appended to both --device specs (",damping=0"), and
-# SLAVE_ARGS goes to the slave alone ("--kp 300").
+# DEVICE_OPTS is appended to both --device specs (",damping=0"),
+# SLAVE_ARGS goes to the slave alone ("--kp 300"), and DEVSIM_ARGS to both
+# simulated knobs ("--tick-us 1000", the emulated board's tick).
 #
 # Prints both ends' reports; exits non-zero if either end did.
 set -eu
@@ -25,9 +26,9 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 life=$((seconds + 40))
-"$build/tools/tuushin-devsim" --tcp 47300 --hand --duration "$life" --quiet 2>"$out/devsim-master.txt" &
+"$build/tools/tuushin-devsim" --tcp 47300 --hand --duration "$life" --quiet ${DEVSIM_ARGS:-} 2>"$out/devsim-master.txt" &
 pids="$pids $!"
-"$build/tools/tuushin-devsim" --tcp 47301 --stop 0.5 --duration "$life" --quiet 2>"$out/devsim-slave.txt" &
+"$build/tools/tuushin-devsim" --tcp 47301 --stop 0.5 --duration "$life" --quiet ${DEVSIM_ARGS:-} 2>"$out/devsim-slave.txt" &
 pids="$pids $!"
 # Each device prints its banner once it listens.
 i=0

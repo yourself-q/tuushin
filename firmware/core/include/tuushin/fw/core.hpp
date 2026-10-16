@@ -24,7 +24,8 @@
 //  - the torque never exceeds the configured ceiling, whatever the host
 //    asks, nor the voltage limit;
 //  - with a work cap in the command, the torque does no more work on the
-//    shaft than the cap allows, give or take the work of a count's step;
+//    shaft than the cap allows, give or take what a tick's step does that
+//    the readings could not foresee (keep_to_cap);
 //  - an encoder that stops answering, a reading that jumps further than
 //    the shaft can move in a tick, or a speed over the limit latches a
 //    fault, which only a command without kCmdEnable can clear.
@@ -84,7 +85,11 @@ struct DeviceConfig {
   float damping = 0.0f;           // N m s/rad
   float velocity_cutoff_hz = 300.0f;
   // The poles of the velocity observer the work cap predicts with.
-  float observer_hz = 200.0f;
+  // Faster ones spread more with the readings' errors, slower ones lag a
+  // stiff contact's push further: at a 1 ms tick, 300 Hz rather than 200
+  // cut the slave's median overrun in device_lab.sh from 120 to about 30
+  // uJ, and at 200 us neither showed (keep_to_cap).
+  float observer_hz = 300.0f;
   device::DeviceKind kind = device::DeviceKind::kTorqueMotor;
   std::uint32_t firmware = 0x000200;
   char name[16] = "tuushin";
@@ -110,6 +115,9 @@ class DeviceCore {
   float applied_torque() const { return applied_; }
   std::int32_t count() const { return turns_.count() - zero_; }
   std::uint32_t dropped_bytes() const { return dropped_; }
+  // The most a tick's torque and tax have run past the work cap it kept
+  // to (J): what keep_to_cap did not foresee.
+  double worst_overrun() const { return worst_overrun_; }
 
  private:
   enum class CalPhase { kNone, kSettle0, kSweepUp, kSettle1, kSweepDown, kSettle2 };
@@ -162,6 +170,11 @@ class DeviceCore {
   bool capped_ = false;  // in some tick since the last State
   double work_ = 0.0;
   double tax_ = 0.0;  // State::tax
+  // The work cap the last tick kept to, and work_ + tax_ as it decided.
+  bool cap_held_ = false;
+  double cap_used_ = 0.0;
+  double booked_ = 0.0;
+  double worst_overrun_ = 0.0;
   std::int32_t step_ = 0;  // the shaft's last step (counts)
   // The variance of the encoder's reading errors (counts^2), measured
   // (keep_to_cap); a cautious count until it is.

@@ -1141,7 +1141,7 @@ emulator).
 | part | what it is |
 |---|---|
 | `include/tuushin/device/proto.hpp` | The link, compiled by both sides: messages in COBS frames with a CRC-16. The device streams a State every millisecond on its own clock (the encoder count, the speed, the torque applied, the work it booked, and which command was in effect since when); the host sends a torque whenever it has one, which the device applies on its next tick. |
-| `firmware/core` | `fw::DeviceCore`, the servo loop in portable C++ that does not allocate: field-oriented control by voltage, the calibration of the motor's electrical zero, and the safety rules (the driver is off until the host enables it, the torque is cut 2 ms after the last command and the driver switched off after 500 ms, a failing encoder or a runaway latches a fault). `fw::Plant` is a simulated gimbal motor (back-EMF, cogging, friction, a hand that turns it, an object it runs into) for the core to drive. |
+| `firmware/core` | `fw::DeviceCore`, the servo loop in portable C++ that does not allocate: field-oriented control by voltage, the calibration of the motor's electrical zero, the safety rules (the driver is off until the host enables it, the torque is cut 2 ms after the last command and the driver switched off after 500 ms, a failing encoder or a runaway latches a fault), and the work cap below. `fw::Plant` is a simulated gimbal motor (back-EMF, cogging, friction, a hand that turns it, an object it runs into) for the core to drive. |
 | `firmware/esp32` | The core on an ESP32, ESP32-S3 or ESP32-C3 under ESP-IDF, with the parts, the wiring and the bring-up: [firmware/esp32/README.md](firmware/esp32/README.md). Built, and run end to end under QEMU; not yet run on a chip. |
 | `tuushin-devsim` | The core driving the plant in real time behind a pseudo-terminal or a TCP port: a device to develop against with no hardware. |
 | `tuushin-device` | One device on its own, for bringing it up: its Info, its encoder, its calibration, a steady torque to weigh on a scale, a spring to feel. |
@@ -1186,27 +1186,64 @@ What the host takes from the device:
 - **The actuation delay**: half the least round trip and one tick, as the
   first guess of the online estimate (Actuation delay above).
 
+What the host gives the device besides the torque is **a cap on its
+work**. The books learn of the work a State and a link's latency after
+the device did it, and a light knob can turn round within that (below).
+So each command carries the most work the host's torque may have done by
+then, counted as the books count it: at the master, the work booked plus
+the port's balance, which puts the cap below the work while the port is
+in debt; at the slave, the work plus the store's grant less the
+quantization tax and a share of what the store holds beyond, or less its
+deficit. The firmware keeps to the cap tick by tick
+(`DeviceCore::keep_to_cap`). It predicts the coming tick's work from a
+velocity observer that feeds the motor's torque forward (Lorenz and Van
+Patten 1991), taking the worse of a rotor alone and of one held by a hand
+of any inertia, and lowers the torque until the work fits what is left.
+Once the cap is spent it holds the torque while the torque does no work,
+and lets it rise again only where the work the rise takes out repays the
+quantization tax it costs. What it cannot foresee, the books then owe. A
+shaft at a count's edge steps the torque's way unannounced, the torque
+times a count: 38 µJ at the ceiling. And the velocity estimate lags a
+stiff contact's push as it changes, which the torque turns into work at
+τ·dt for each rad/s it misses: where the cap is spent, a knob thrown off
+the object meets a torque the prediction lets turn it round within the
+tick for no work, and it comes back faster by what the estimate missed.
+Each device reports the most it overran its cap
+(`DeviceCore::worst_overrun`, in `tuushin-devsim`'s last lines and the
+ESP32's report): in 16 runs of the lab below, 7 to 34 µJ at the master
+and 7 to 70 µJ at the slave; with the emulated board's 1 ms tick and the
+coupling it gets under QEMU (`DEVSIM_ARGS="--tick-us 1000 --latency 0.1"
+SLAVE_ARGS="--kp 700"`), up to 115 µJ at the slave in 12 runs, half of
+them under 33 µJ. A margin for the estimate's spread does not pay: it
+cut a torque braking a hand's slow turn and let it back on at every
+count, at the tax each time.
+
 Ten seconds of `device_lab.sh` on an Apple M4 Mac, a hand at the master,
 an object half a radian on at the slave:
 
 | | master | slave |
 |---|---|---|
-| States, lost | 10032, 0 | 13217, 0 |
-| device round trip p50 (a command to the State applying it) | 1.26 ms | 1.34 ms |
-| coupling | | 524 N/m |
-| largest force | 3.46 N displayed | 11.9 N |
-| energy | 0.0346 J | −0.0337 J |
-| margin at the end, and at its lowest | +0.95 mJ, −2.5 mJ | |
+| States, lost | 10032, 0 | 13176, 0 |
+| device round trip p50 (a command to the State applying it) | 1.26 ms | 1.38 ms |
+| coupling | | 525 N/m |
+| largest force | 3.60 N displayed | 11.3 N |
+| energy | 0.0313 J | −0.0302 J |
+| work cap overrun at most | 34 µJ | 37 µJ |
+| margin at the end, and at its lowest | +1.10 mJ, −0.047 mJ | |
 
-The dip is the teleoperator's, not the books'. In a run followed sample
-by sample (no damping on the devices, a coupling of 300 N/m, a dip of
-1.57 mJ), the slave's passivity controller switched the force between
-nothing and 3 to 4 N from one sample to the next as the slave left the
-object, and the 17.5 g knob bounced off it: with States 0.8 to 1.8 ms old
-and a command acting 0.9 ms after it is sent, the speed reversed within a
-sample, and that one sample did 0.7 mJ of work; the master made the
-other 0.6 mJ. Under QEMU, the ESP32 firmware at the slave dipped 0.35, 1.27
-and 2.1 mJ in three runs.
+The dip is the teleoperator's, not the books'. Before the work cap, in a
+run followed sample by sample (no damping on the devices, a coupling of
+300 N/m, a dip of 1.57 mJ), the slave's passivity controller switched the
+force between nothing and 3 to 4 N from one sample to the next as the
+slave left the object, and the 17.5 g knob bounced off it: with States
+0.8 to 1.8 ms old and a command acting 0.9 ms after it is sent, the speed
+reversed within a sample, and that one sample did 0.7 mJ of work; the
+master made the other 0.6 mJ. Under QEMU, the ESP32 firmware at the slave
+dipped 0.35, 1.27 and 2.1 mJ in three runs. With the cap, that set-up
+(`DEVICE_OPTS=",damping=0" SLAVE_ARGS="--kp 300"`) dipped 0.012 to 0.019
+mJ in three runs, the table's 0.041 to 0.060 mJ in five, and at a 1 ms
+tick 0.016 to 0.067 mJ in three: of the order of the devices'
+overruns.
 
 ## Known issues
 
@@ -1263,9 +1300,13 @@ and 2.1 mJ in three runs.
   without current sensing, so the energy books are as right as the
   motor's resistance and torque constant, and the resistance drifts with
   the windings' temperature.
-- **A light knob bouncing off an object generates energy.** With the
-  firmware's devices the teleoperator's margin dips by 0.35 to 2.5 mJ as
-  the slave leaves the object (A device in the loop, above).
+- **A device keeps to its work cap closely, not exactly.** What its
+  readings cannot foresee, a count's step and the velocity estimate's lag
+  behind a stiff contact's push, overruns the cap by up to 70 µJ at a
+  5 kHz tick and 115 µJ at 1 kHz in the lab, and the teleoperator's
+  margin still dips as the slave leaves the object, by 0.012 to 0.067 mJ
+  (A device in the loop, above). The prediction assumes a rigid shaft; a
+  compliant coupling between the motor and the knob is not modelled.
 - **Only the slave takes a relay, over UDP.** One relay is enough to cross
   both NATs, but a slave without one cannot be reached through a symmetric
   NAT, and a master cannot offer a relay of its own. There is no TURN over
@@ -1316,8 +1357,8 @@ and 2.1 mJ in three runs.
   Starlink one above.
 - A relayed session that moves to a direct path once one opens; then QUIC
   datagrams as a transport.
-- The firmware on a chip and a real knob, measured; then the overshoot
-  where a light knob leaves an object.
+- The firmware on a chip and a real knob, measured: its timing, its
+  encoder's noise, and the work cap under a real hand.
 - Deadbands that adapt to the measured delay; more degrees of freedom.
 
 ## References
@@ -1344,6 +1385,10 @@ The code cites its sources where it uses them. The main ones:
   systems: application to haptic interfaces", Journal of Robotic Systems
   14(1), 1997, for the damping a sampled spring needs, which sets the
   coupling a device can take.
+- R. D. Lorenz and K. W. Van Patten, "High-resolution velocity estimation
+  for all-digital, AC servo drives", IEEE T-IA 27(4), 1991, for the
+  velocity observer with the torque fed forward that the work cap
+  predicts with.
 - P. Hinterseer, S. Hirche, S. Chaudhuri, E. Steinbach and M. Buss,
   "Perception-based data reduction and transmission of haptic data in
   telepresence and teleaction systems", IEEE Trans. Signal Processing 56(2), 2008.

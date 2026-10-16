@@ -125,6 +125,13 @@ void DeviceCore::tick() {
     step_ = step;
     reading_var_ += std::min(1.0f, dt * 1e6f / kReadingNoiseUs) * (d2 * d2 / 6.0f - reading_var_);
   }
+  // What the last tick's torque and tax took past the cap it kept to: past
+  // the work booked then, if the host had already lowered the cap below it.
+  if (cap_held_) {
+    cap_held_ = false;
+    const double over = work_ + tax_ - std::max(cap_used_, booked_);
+    if (over > worst_overrun_) worst_overrun_ = over;
+  }
 
   // The host's messages: a new command takes effect in this tick.
   std::uint8_t buf[64];
@@ -171,6 +178,11 @@ void DeviceCore::tick() {
     float host = cut_ ? 0.0f : clampf(cmd_.torque, -torque_limit_, torque_limit_);
     saturated_ = !cut_ && host != cmd_.torque;
     const bool capped = (cmd_.flags & kCmdWorkCap) != 0;
+    if (capped) {
+      cap_held_ = true;
+      cap_used_ = cmd_.work_cap;
+      booked_ = work_ + tax_;
+    }
     // The rise of the torque the host's books taxed: the command's over
     // the one before, in the tick it takes effect.
     const float taxed =
@@ -512,11 +524,19 @@ void DeviceCore::foc(float host, float omega, float vbus) {
 //    grows with the bridge's.
 // The hold is on the estimate itself: a stray cuts a held torque, which
 // then stays off, rather than letting it do work.
-// What is left is the count: a shaft at a count's edge steps the
-// torque's way with nothing in the readings to foresee it, so the cap
-// can be overrun by up to the torque times a count. In device_lab.sh the
-// worst were 10 to 23 uJ at the master, whose count is worth 24 uJ at
-// its torque, and 21 to 32 uJ at the slave, 38 uJ at its ceiling.
+// What is left is what the readings cannot tell. A shaft at a count's
+// edge steps the torque's way unannounced: the torque times a count, 38
+// uJ at the ceiling. And the velocity estimate lags a stiff contact's
+// push as it changes, which the torque turns into work at tau dt for
+// each rad/s: 20 uJ at the ceiling and 200 us, 0.1 mJ at the emulated
+// board's 1 ms. It shows where the cap is spent and a knob thrown off a
+// stop meets a torque the prediction lets turn it round within the tick
+// for no work: the knob comes back faster by what the estimate missed.
+// In 16 runs of device_lab.sh at 200 us the worst were 7 to 34 uJ at
+// the master and 7 to 70 uJ at the slave; in 12 at 1 ms, 0.7 to 115 uJ
+// at the slave, half of them below 33 uJ. A margin for the estimate's
+// spread does not pay: it cut a torque braking a hand's slow turn and
+// let it back on at every count, at the tax each time.
 float DeviceCore::keep_to_cap(float tau, float dt, float before, float taxed) {
   const float left = static_cast<float>(cmd_.work_cap - (work_ + tax_));
   const float room = left > 0.0f ? left : 0.0f;

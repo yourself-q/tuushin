@@ -429,6 +429,8 @@ TEST_CASE(fw_work_cap_holds_the_work_on_a_hand) {
       CHECK(most <= cap + 2e-5);
       CHECK(most >= cap - 2e-5);
       CHECK(flagged);
+      // And no tick ran past it by more than a count.
+      CHECK(rig.core.worst_overrun() < 7.7e-6);
       // The torque did 0.3 mJ of work against the spring: at most 15 mrad.
       CHECK(turned < 0.02);
       // The motor's own work agrees with the device's books, which hold
@@ -468,6 +470,7 @@ TEST_CASE(fw_work_cap_far_off_changes_nothing) {
     CHECK(st.tax == 0.0);
     CHECK(!(st.flags & kStateCapped));
   }
+  CHECK(rig.core.worst_overrun() == 0.0);
 }
 
 TEST_CASE(fw_work_cap_lets_a_torque_take_energy_out) {
@@ -492,6 +495,8 @@ TEST_CASE(fw_work_cap_lets_a_torque_take_energy_out) {
   REQUIRE(!rig.states.empty());
   for (const State& st : rig.states) CHECK_NEAR(st.torque, 0.02, 1e-6);
   CHECK(rig.states.back().work < w0 - 1e-3);
+  // Work below a cap the host set below it already is no overrun.
+  CHECK(rig.core.worst_overrun() == 0.0);
 }
 
 TEST_CASE(fw_work_cap_on_a_knob_leaving_a_stop) {
@@ -527,6 +532,7 @@ TEST_CASE(fw_work_cap_on_a_knob_leaving_a_stop) {
       CHECK(most < 1e-4 + 1e-5);
       CHECK(most > 1e-4 - 1e-5);
       CHECK(rig.plant.motor_work() - m0 < 1e-4 + 2e-5);
+      CHECK(rig.core.worst_overrun() < 3.8e-6);  // a count at 0.01 N m
     } else {
       CHECK(most > 1e-3);
     }
