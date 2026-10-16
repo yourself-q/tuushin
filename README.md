@@ -26,13 +26,13 @@ GCC 13.3). MIT licensed.
 | `control/` | Time Domain Passivity Approach (TDPA): passivity observers and controllers in the conventional two-channel form, and the variant that books energy reflection at a slave-side position coupling in one store (Panzirsch, Ryu and Ferre 2019, "Approach 3"). The passivity controllers predict the work a zero-order-held force will do on a light device instead of assuming constant velocity. |
 | `codec/` | Perceptual deadband data reduction (Weber's law, Hinterseer et al. 2008). |
 | `teleop/` | Master and slave controllers, the device interface (`Device1D`) with simulated devices, `HapticLink` (one end of a session over UDP), and real-time master and slave nodes. |
-| `net/` | UDP sockets with kernel receive timestamps and hop-limited sends, clock-skew estimation from four-timestamp exchanges, channel models (fixed delay, jitter, Gilbert-Elliott loss, bottleneck queue, recorded traces), path measurement with probes and a reflector, a rendezvous server and client for ends behind NATs, a measurement of how many hops an end's own NATs reach, and STUN messages and a TURN client (RFC 8656) for a relayed path where no direct one opens (see NAT traversal below). |
+| `net/` | UDP sockets with kernel receive timestamps and hop-limited sends, clock-skew estimation from four-timestamp exchanges, channel models (fixed delay, jitter, Gilbert-Elliott loss, bottleneck queue, recorded traces), path measurement with probes and a reflector, a rendezvous server and client for ends behind NATs, a measurement of how many hops an end's own NATs reach, and STUN messages and a TURN client (RFC 8656) for a relayed path where no direct one opens, reached over UDP, TCP or TLS (see NAT traversal below). |
 | `wire/` | The datagram format: a 32-byte header whose echo fields let each end measure the round trip from ordinary traffic, as RTCP does. |
 | `crypto/` | A Noise_NNpsk0 handshake and ChaCha20-Poly1305 on libsodium: a pre-shared key becomes fresh keys for every session, and every datagram is authenticated and encrypted (see Authentication below). SHA-1, HMAC-SHA1 and MD5, only because STUN and TURN require them. |
 | `device/` | `RemoteDevice`: a device running tuushin's firmware, over a serial port or TCP, as a `Device1D`, and the link's protocol, which the firmware compiles too (see A device in the loop below). |
 | `firmware/` | The device's servo loop (`firmware/core`: field-oriented control of a gimbal motor, calibration, a watchdog and faults, and a simulated motor to test it on) and its port to the ESP32 family under ESP-IDF (`firmware/esp32`). |
 | `sim/` | A deterministic 1-DoF teleoperation simulator built on the same controllers and devices. |
-| `tools/` | `tuushin-sim`, `tuushin-teleop` (master, slave and rendezvous server as separate processes), `tuushin-probe` (measure a path, write replayable traces; `pair` measures between two networks of one host on one clock), `tuushin-netreplay` (Linux: replay a trace on an interface, datagram by datagram, for network namespaces, Mininet and testbeds built on them), `nat_lab.sh` (master and slave behind Linux NATs in network namespaces, with coturn as a relay), `netreplay_lab.sh` (checks the replay against its traces), `pair_lab.sh` (checks `pair` behind two NATs, with coturn as the STUN server), `fetch_starlink.sh` (public Starlink one-way delays as traces), `tuushin-devsim` (the firmware on a simulated motor, behind a pty or a TCP port), `tuushin-device` (bring up one device on its own), `device_lab.sh` and `emu_lab.sh` (the teleoperator end to end with devices running the firmware, simulated or under QEMU). `tests/sim_nat.hpp` and `tests/sim_turn.hpp` are a NAT and a TURN server in user space for tests on any system. |
+| `tools/` | `tuushin-sim`, `tuushin-teleop` (master, slave and rendezvous server as separate processes), `tuushin-probe` (measure a path, write replayable traces; `pair` measures between two networks of one host on one clock), `tuushin-netreplay` (Linux: replay a trace on an interface, datagram by datagram, for network namespaces, Mininet and testbeds built on them), `nat_lab.sh` (master and slave behind Linux NATs in network namespaces, with coturn as a relay over UDP, TCP or TLS), `netreplay_lab.sh` (checks the replay against its traces), `pair_lab.sh` (checks `pair` behind two NATs, with coturn as the STUN server), `fetch_starlink.sh` (public Starlink one-way delays as traces), `tuushin-devsim` (the firmware on a simulated motor, behind a pty or a TCP port), `tuushin-device` (bring up one device on its own), `device_lab.sh` and `emu_lab.sh` (the teleoperator end to end with devices running the firmware, simulated or under QEMU). `tests/sim_nat.hpp`, `tests/sim_turn.hpp` and `tests/sim_tls.hpp` are a NAT, a TURN server and a TLS front for it in user space for tests on any system. |
 
 ## Build and test
 
@@ -46,6 +46,10 @@ Needs a C++17 compiler, CMake and libsodium (ISC licence):
 `brew install libsodium`, or `apt install libsodium-dev pkg-config`.
 `tuushin-netreplay` is built on Linux where clang and libbpf (used under
 its BSD-2-Clause licence) are found: `apt install clang libbpf-dev`.
+TURN over TLS uses OpenSSL 3 (Apache License 2.0) where it is found:
+`brew install openssl@3`, or `apt install libssl-dev`. Without it, or with
+`-DTUUSHIN_TLS=OFF`, everything else builds, and a relay is reached over
+UDP or TCP only.
 
 ## Quick start
 
@@ -102,6 +106,21 @@ that it does not show in `ps`:
 
 The master needs nothing more: the rendezvous server tells it of the
 relay, and it tries the relay when its direct hellos go unanswered.
+
+Where the slave's network lets out TCP, or only TLS, but no UDP beyond
+the rendezvous server, reach the TURN server over TCP or TLS; the relay
+still talks to the master over UDP (Through a relay over TCP or TLS,
+below):
+
+```sh
+./build/tools/tuushin-teleop slave --key-file haptic.key --rendezvous SERVER \
+    --turn 'turn:TURNSERVER?transport=tcp' --turn-user NAME --turn-pass-file turn.pass
+./build/tools/tuushin-teleop slave --key-file haptic.key --rendezvous SERVER \
+    --turn turns:TURNSERVER --turn-user NAME --turn-pass-file turn.pass  # TLS, port 5349
+```
+
+Over TLS the server's certificate is checked against the CAs OpenSSL
+trusts by default, or against those in `--turn-ca FILE`.
 
 Measure a real path and replay it:
 
@@ -843,6 +862,86 @@ with NATs that hold 25 ms each way and a relay 10 ms, so that the direct
 round trip is 100 ms and the relay saves 20, each end moves once; without
 `stay_off`, 11 and 9 times, and the session settles half a second later.
 
+### Through a relay over TCP or TLS
+
+Some networks let no UDP out, only TCP, or only what looks like HTTPS.
+With `--turn turn:HOST?transport=tcp` the slave reaches the TURN server
+over TCP (port 3478 unless one is given), and with `--turn turns:HOST`
+over TLS (5349), as RFC 8656 allows. The relay still talks to the master
+over UDP: only the slave's leg changes (`net/tcp.hpp`, `net/tls.hpp`,
+`net/paths.hpp`).
+
+- **A connection is an allocation.** The server knows the allocation by
+  the connection (RFC 8656, 3.2). When the connection drops, the slave
+  connects again at once, allocates anew and announces the new relayed
+  address, as when an allocation is lost over UDP. A connection that does
+  not open within 5 s, fails before it is allocated, or drops twice
+  within 10 s is tried again after 10 s (`TurnClient::kRetryDelay`).
+- **Messages follow each other on the connection.** STUN messages and
+  ChannelData (padded to 4 bytes on a stream, RFC 8656, 12.5) are cut
+  apart by the lengths in their headers. A request goes once, and a
+  connection on which one is unanswered for 5 s is given up
+  (`kStreamTimeout`), since TCP would go on resending for minutes. Bytes
+  that are not TURN, such as a TLS alert from a TLS port reached with
+  `turn:`, close the connection at once.
+- **Nothing old is queued.** Nagle's algorithm is off, so a datagram
+  leaves when it is written. What the kernel does not take yet waits in
+  the stream, up to 64 KiB (`Stream::kMaxBacklog`); a datagram that would
+  pass that is dropped whole, as a full UDP socket would drop it, since on
+  a connection backed up that far it would be stale before it left.
+- **TLS checks the server.** Its certificate must chain to a CA that
+  OpenSSL trusts by default (`openssl version -d` names the directory),
+  or to one in `--turn-ca FILE` (PEM), and name the host in the URI: a DNS
+  name, which is also sent by SNI, or an IP address. TLS 1.2 or later,
+  offering `stun.turn` by ALPN (RFC 7443). A certificate that does not
+  check out is reported with OpenSSL's reason ("hostname mismatch",
+  "self-signed certificate") and tried again after 10 s.
+
+In the lab, `nat_lab.sh --turn --turn-over tcp` (or `tls`) runs coturn
+4.6.1 on that transport only, over TLS with a certificate for its
+address made for the run and given to the slave with `--turn-ca`; and
+`--block-udp` makes the slave's NAT drop every UDP datagram it would send
+on, but those to the rendezvous server. In 2 s sessions, or 6 s with the
+direct path opened 3 s after the master starts (`--open-at 3`, above):
+
+| scenario | relay | result | round trip, p50 |
+|---|---|---|---|
+| both NATs symmetric | UDP | relayed | 40.4 ms |
+| both NATs symmetric | TCP | relayed | 40.5 ms |
+| both NATs symmetric | TLS | relayed | 40.5 ms |
+| UDP blocked at the slave's NAT (cone NATs) | none | fails | — |
+| the same | UDP | fails | — |
+| the same | TCP | relayed | 40.5 ms |
+| the same | TLS | relayed | 40.5 ms |
+| UDP blocked, both NATs symmetric | TCP | relayed | 40.5 ms |
+| UDP blocked, a carrier-grade NAT behind the slave's NAT | TLS | relayed | 50.4 ms |
+| UDP blocked, carrier-grade NATs behind both, the slave's NAT symmetric | TLS | relayed | 60.6 ms |
+| cone NATs, the direct path opened 3 s in | TCP | left the relay 2.023 s in | 20.2 ms |
+| the same | TLS | left it 2.021 s in | 20.2 ms |
+| UDP blocked, the direct path opened 3 s in | TCP | stayed on the relay | 40.4 ms |
+| the same | TLS | stayed on the relay | 40.5 ms |
+
+No sample was lost in any of them. A session relayed over TCP or TLS
+starts when one over UDP does, 3.18 to 3.26 s after the master: the
+connection and the handshake fit within `relay_delay`. Leaving the relay
+went as over UDP, each end moving once.
+
+The lab loses nothing, so its tails are what the transports add on their
+own. In four more runs of each of the first three rows, the round trip's
+p99 was 40.7 to 40.9 ms over UDP, 40.9 to 41.5 over TCP and 41.0 to 42.3
+over TLS, and the largest single one 41.5, 43.5 and 46.6 ms. Larger ones,
+up to 67 ms in some runs, came with both processes stalled 13 to 24 ms at
+the same moment (their `tick late`): the lab's virtual machine, not the
+relay.
+
+On a path that loses packets, TCP costs more than UDP. A lost segment
+holds back every datagram behind it until it is sent again: about a round
+trip of the slave's leg later when the segments after it bring duplicate
+acknowledgements, as they do at 1 kHz, and after a retransmission
+timeout, 200 ms or more on Linux, when the retransmission is lost too.
+The datagrams then arrive late and together rather than not at all. This
+has not been measured on a lossy path yet.
+
 ### When an end moves
 
 A session can lose its path without either end doing anything: a NAT
@@ -1454,12 +1553,24 @@ few milliseconds, and the device held each rise back.
   host's books until the device gives it back, a round trip later (A
   device in the loop, above). The prediction assumes a rigid shaft; a
   compliant coupling between the motor and the knob is not modelled.
-- **Only the slave takes a relay, over UDP.** One relay is enough to cross
-  both NATs, but a slave without one cannot be reached through a symmetric
-  NAT, and a master cannot offer a relay of its own. There is no TURN over
-  TCP or TLS for networks that block UDP. The credentials are long-term
-  ones; for coturn's time-limited credentials (its `use-auth-secret`),
-  compute the user name and password outside and pass them in.
+- **Only the slave takes a relay.** One relay is enough to cross both
+  NATs, but a slave without one cannot be reached through a symmetric
+  NAT, and a master cannot offer a relay of its own: a master on a network
+  that lets no UDP out cannot be reached at all. The credentials are
+  long-term ones; for coturn's time-limited credentials (its
+  `use-auth-secret`), compute the user name and password outside and pass
+  them in.
+- **Over TCP or TLS, only the slave's leg to the relay changes.** The
+  rendezvous server is reached over UDP, so a network that lets no UDP out
+  at all, not even to it, keeps the session from starting. There is no
+  DTLS (`turns:` with `?transport=udp`) and no way through an HTTP proxy:
+  the slave connects to the TURN server itself. A lost segment holds back
+  what follows it (Through a relay over TCP or TLS, above), and a relayed
+  datagram's arrival time is when it was read from the connection, not
+  when the kernel took it, so the one-way delays and the clock skew
+  measured through such a relay include the time each waited to be read.
+  A reply that begins like ChannelData, as an HTTP response does, is taken
+  for one until the connection closes or 5 s pass.
 - **A relayed session checks for a direct path once a second.** A path
   open one way only costs a detour at every check: the end that hears it
   follows it for half a second, the other end hearing from it only
@@ -1509,8 +1620,9 @@ few milliseconds, and the device held each rise back.
   `tuushin-probe`, published so that any simulator or testbed can replay
   them (`tuushin-netreplay` on Linux), alongside public sets such as the
   Starlink one above.
-- TURN over TCP and TLS for networks that block UDP; host candidates taken
-  again when an end moves; then QUIC datagrams as a transport.
+- Host candidates taken again when an end moves; the rendezvous server
+  over TCP or TLS, and a relay for the master, for networks that let no
+  UDP out; then QUIC datagrams as a transport.
 - The firmware on a chip and a real knob, measured: its timing, its
   encoder's noise, and the work cap under a real hand.
 - Deadbands that adapt to the measured delay; more degrees of freedom.
@@ -1565,7 +1677,9 @@ The code cites its sources where it uses them. The main ones:
 - T. Reddy, A. Johnston, P. Matthews and J. Rosenberg, RFC 8656 (TURN), and
   M. Petit-Huguenin, G. Salgueiro, J. Rosenberg, D. Wing, R. Mahy and
   P. Matthews, RFC 8489 (STUN), for the relay and its long-term
-  credentials; R. Denis-Courmont, RFC 5769, for STUN's test vectors.
+  credentials; R. Denis-Courmont, RFC 5769, for STUN's test vectors;
+  P. Patil, T. Reddy, G. Salgueiro and M. Petit-Huguenin, RFC 7443, for
+  the ALPN label of TURN over TLS.
 - S. Becker, T. Pfandzelter, N. Japke, D. Bermbach and O. Kao, "Network
   emulation in large-scale virtual edge testbeds: a note of caution and
   the way forward", TDIS 2022, arXiv:2208.05862, and W. Tian, Y. Li,
