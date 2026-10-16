@@ -288,6 +288,14 @@ What it took, and what differs from a chip:
 - **The link's chardev runs with `nodelay`.** QEMU's TCP chardev has
   Nagle's algorithm on; with Linux's delayed acknowledgements, the round
   trip was 40 ms and the slave's coupling fell to 30 N/m.
+- **The reread check reads low at the slave** ("reread: indep 0.42,
+  error 1.30 rms" in a run, for an emulated error of 0.58). The device
+  measures the readings' error from their second differences, which take
+  the shaft's acceleration for error times the tick's square: the knob
+  rings against its object, on ticks of 1 ms that QEMU stretches to
+  several. The simulated hand's device, at 200 us, logged 1.03 and 0.57
+  in the same run; at 1 ms against the object `tuushin-devsim` logs 0.57
+  to 0.65 and 0.73 to 0.77, at 200 us 0.99 to 1.05 and 0.58.
 - The watchdogs are off, and `qemu.sh` writes the eFuses of a chip of
   revision 3.
 - The worst tick, 32 ms, comes right after the calibration. Writing the
