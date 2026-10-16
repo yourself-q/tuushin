@@ -683,28 +683,32 @@ with its surface 0.7 mm towards the master to make up the force. The fit
 now takes the error's spread out of the positions' (the method of
 moments for a known error variance, W. A. Fuller, *Measurement Error
 Models*, 1987), with the slave's own estimate of its reading noise
-(31.7 µm for half a count and the rounding, 31.8 µm in theory). The same
+(31.7 µm for half a count and the rounding, 31.8 µm in theory). And a
+reading's error, rendered, is the stiffness times it, 0.16 N on every
+reading for 31.7 µm at 5000 N/m: the displayed force varied by 79 N/s
+against 23 N/s with exact readings. A master with an encoder resolution
+now renders at its Kalman filter's position instead (32 N/s; the books
+still go by the readings, and `--render-readings` turns it off). The same
 twelve motions, medians with the 10th to 90th percentiles:
 
 | one-way delay | readings | contacts | stiffness felt | surface felt, beyond the wall |
 |---|---|---|---|---|
 | 10 ms | exact | 114 | 5056 N/m (5008 to 5080) | 0.012 mm (0.002 to 0.020) |
-| 10 ms | half a count | 117 | 4963 N/m (4500 to 5341) | 0.17 mm (0.03 to 0.38) |
+| 10 ms | half a count | 120 | 4978 N/m (4599 to 5325) | 0.087 mm (0.00 to 0.36) |
 | 100 ms | exact | 114 | 5308 N/m (4916 to 5453) | 0.09 mm (0.03 to 0.13) |
-| 100 ms | half a count | 117 | 4896 N/m (4431 to 5381) | 0.23 mm (0.11 to 0.53) |
-| 100 ms | half a count, `--no-yield` | 284 | 5229 N/m (2623 to 10518) | 0.49 mm (0.04 to 4.09) |
+| 100 ms | half a count | 120 | 4953 N/m (4574 to 5272) | 0.16 mm (0.07 to 0.56) |
+| 100 ms | half a count, `--no-yield` | 244 | 5207 N/m (2435 to 10631) | 0.38 mm (0.04 to 3.50) |
 
 The motions make 113 presses after their first; with the surface
-yielding the hand meets the wall once per press, and the PC acts in
-0.9 % of the samples rather than 24 %. The force error against the
-contact is 0.53 N at 10 ms and 1.10 N at 100 ms, against 0.45 and 1.05 N
+yielding the hand meets the wall 1.06 times per press, and the PC acts
+in 2 % of the samples rather than 22 %. The force error against the
+contact is 0.51 N at 10 ms and 1.09 N at 100 ms, against 0.45 and 1.05 N
 with exact readings, and the master's true margin stays at 0 J. What the
-noise still costs is a surface felt 0.1 to 0.2 mm deeper, where the PC's
-cuts left it, a stiffness that varies by about a tenth from contact to
-contact, near the Weber fraction the model's updates are held to, and a
-displayed force that varies by 79 N/s against 23 N/s: most of that is
-the noise itself, rendered, 5000 N/m times 31.7 µm being 0.16 N on every
-reading.
+noise still costs is a surface felt 0.07 mm deeper than with exact
+readings, where the PC's cuts left it, a stiffness that varies by about
+a tenth from contact to contact, near the Weber fraction the model's
+updates are held to, and a displayed force that varies by 32 N/s against
+12 to 23 N/s.
 
 On the reflective scheme the second reading does not help: at 100 ms its
 PC acts in 91 % of the samples with exact readings too, and with the
@@ -1669,8 +1673,8 @@ few milliseconds, and the device held each rise back.
   model-mediated scheme with the noise tax, a second reading, a surface
   that yields where the PC cuts and a fit corrected for the noise meets
   the wall once per press, at a stiffness felt within a tenth of the
-  wall's, but 0.1 to 0.2 mm deeper than with exact readings, and with
-  the noise rendered as 0.16 N of force on every reading
+  wall's, but about 0.07 mm deeper than with exact readings, and with
+  a displayed force that varies by 32 N/s against 12 to 23 N/s
   (Model-mediated teleoperation, above).
 - **Exact readings of a misdescribed device are covered nearly, not
   entirely.** The model error margin covers misses like those already

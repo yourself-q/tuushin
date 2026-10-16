@@ -58,6 +58,8 @@ void usage() {
                "  --active-relax-rate R model: the same towards the master (0.02)\n"
                "  --no-yield            model: a force the master's PC cuts leaves the\n"
                "                        rendered surface where it was\n"
+               "  --render-readings     model: the master renders at its encoder's\n"
+               "                        reading rather than its filter's position\n"
                "  --estimate-damping    model: the slave estimates the wall's damping too\n"
                "  --no-tdpa             same as --passivity none\n"
                "  --constant-velocity-pc  PCs assume constant velocity over a sample\n"
@@ -257,6 +259,7 @@ Options parse(int argc, char** argv) {
     else if (a == "--relax-rate") o.cfg.wall_renderer.relax_rate = std::stod(next());
     else if (a == "--active-relax-rate") o.cfg.wall_renderer.active_relax_rate = std::stod(next());
     else if (a == "--no-yield") o.cfg.wall_renderer.yield_to_display = false;
+    else if (a == "--render-readings") o.cfg.wall_renderer.filtered_position = false;
     else if (a == "--estimate-damping") o.cfg.wall_estimator.estimate_damping = true;
     else if (a == "--contact-force") o.cfg.slave.report_contact_force = true;
     else if (a == "--drift-gain") o.cfg.slave.drift_gain = std::stod(next());

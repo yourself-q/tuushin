@@ -188,6 +188,16 @@ class WallEstimator {
 // it at once moving the surface back out. In simulation, 1.04 contacts per
 // press, with the controller active in 0.9 % of samples rather than 21.5 %.
 //
+// A reading's error, rendered, is the stiffness times it: 0.16 N on every
+// reading for 31.7 um at 5000 N/m, and the displayed force varied by
+// 79 N/s against 23 N/s with exact readings. A master with an encoder
+// resolution therefore renders at its Kalman filter's position
+// (`filtered_position`): 32 N/s, and at 100 ms each way the surface felt
+// 0.16 mm deeper than the wall rather than 0.23. The passivity controller
+// books by the readings whatever position the rendering takes. The
+// position sent to the slave stays the reading's: the filter's did no
+// better there.
+//
 // offset() is how far the rendered surface lies beyond the model's: the
 // master's position less the offset is where the slave should be for the
 // force the master displays (Mitra and Niemeyer's commands consistent with
@@ -198,6 +208,9 @@ struct WallRendererParams {
   // Whether the master calls yield() when its passivity controller cuts the
   // force.
   bool yield_to_display = true;
+  // Whether a master with an encoder resolution renders at its filter's
+  // position rather than at the reading.
+  bool filtered_position = true;
 };
 
 class WallRenderer {

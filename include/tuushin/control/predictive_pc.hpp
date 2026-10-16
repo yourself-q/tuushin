@@ -538,6 +538,9 @@ class DevicePredictor {
   // the last sample times dt.
   double external_force() const;
   double velocity_dt() const;
+  // With a resolution, the Kalman filter's position at the last reading
+  // less that reading (m); 0 without.
+  double position_offset() const { return e_; }
 
  private:
   // A sample's port force by what a mass feels of it, as two held forces:

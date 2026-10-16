@@ -632,3 +632,28 @@ TEST_CASE(teleop_model_mediated_moves_the_surface_where_the_pc_cuts) {
   CHECK(moved.force_rmse < kept.force_rmse);
   CHECK(moved.conveyed_force > 0.9);
 }
+
+TEST_CASE(teleop_model_mediated_renders_at_the_filtered_position) {
+  // The same dither, delay and second reading, the surface yielding. A
+  // reading's error rendered is the stiffness times it, 0.16 N on every
+  // reading; at the filter's position the display varies by 26 N/s rather
+  // than 73, at the same force error.
+  sim::Teleop1DConfig cfg;
+  cfg.passivity = Passivity::kModelMediated;
+  cfg.duration = from_seconds(20.0);
+  cfg.op.ref_freq = 0.45;
+  cfg.op.ref_amplitude = 0.04;
+  cfg.master_encoder_resolution = cfg.slave_encoder_resolution = 55e-6;
+  cfg.master_encoder_noise = cfg.slave_encoder_noise = 0.5;
+  cfg.encoder_noise_known = true;
+  cfg.reread = true;
+  cfg.wall_renderer.filtered_position = false;
+  const auto read = run(cfg, from_millis(100));
+  cfg.wall_renderer.filtered_position = true;
+  const auto filtered = run(cfg, from_millis(100));
+  CHECK(!filtered.diverged);
+  CHECK(filtered.min_master_true_margin >= 0.0);
+  CHECK(filtered.display_force_variation < 0.5 * read.display_force_variation);
+  CHECK(filtered.force_rmse < 1.05 * read.force_rmse);
+  CHECK(filtered.master_pc_active < 0.05);
+}

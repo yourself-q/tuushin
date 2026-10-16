@@ -453,6 +453,7 @@ class MasterController {
   control::EnergyPort port_;
   DeviceModel model_;
   control::WallRenderer renderer_;
+  double render_at_ = 0.0;  // the position the renderer took last
   std::optional<control::WallModel> received_model_;  // not yet rendered
   double x_command_ = 0.0;
   codec::DeadbandEncoder<1> enc_;

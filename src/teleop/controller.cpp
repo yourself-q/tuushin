@@ -453,7 +453,11 @@ MasterController::Step MasterController::step(Nanos now, Nanos sampled, double p
       renderer_.update(*received_model_, position);
       received_model_.reset();
     }
-    f_reflected_ = renderer_.force(position, v_sent_, dt_);
+    render_at_ = cfg_.wall_renderer.filtered_position && cfg_.encoder_resolution > 0.0 &&
+                         dev.ready()
+                     ? position + dev.position_offset()
+                     : position;
+    f_reflected_ = renderer_.force(render_at_, v_sent_, dt_);
   }
   const double f_reflected = has_value_ ? f_reflected_ : 0.0;
   if (cfg_.passivity != Passivity::kNone) {
@@ -471,7 +475,7 @@ MasterController::Step MasterController::step(Nanos now, Nanos sampled, double p
     out.pc_active = pc.active;
     if (cfg_.passivity == Passivity::kModelMediated && cfg_.wall_renderer.yield_to_display &&
         pc.value < f_reflected) {
-      renderer_.yield(position, v_sent_, pc.value);
+      renderer_.yield(render_at_, v_sent_, pc.value);
     }
   } else {
     out.display_force = f_reflected;
