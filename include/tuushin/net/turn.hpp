@@ -13,8 +13,9 @@
 
 namespace tuushin::net {
 
-// A TURN client (RFC 8656) over UDP: an address on a relay server that
-// forwards datagrams between this end and its peers.
+// A TURN client (RFC 8656) over UDP, or over a TCP or TLS connection to the
+// server: an address on a relay server that forwards datagrams between this
+// end and its peers.
 //
 // Hole punching (rendezvous.hpp) fails where both ends sit behind NATs that
 // pick a new outside port for every destination (endpoint-dependent
@@ -43,6 +44,21 @@ namespace tuushin::net {
 // with wrap(). The socket must be used for nothing else: the relay knows
 // the allocation by the socket's address as the server sees it.
 //
+// Over a stream (Transport::kStream) the caller keeps a TCP or TLS
+// connection to the server instead, for networks that let no UDP out, or
+// nothing but TLS on 443 (RFC 8656, 3.1). The relay still sends to peers
+// in UDP; only the leg to the server changes. The caller opens a
+// connection when wants_connection() and tells the client connecting(),
+// connected() and disconnected(); writes what poll() and wrap() return to
+// it; and cuts what arrives into messages (a STUN message is 20 bytes and
+// its length, ChannelData 4 and its length padded to a multiple of 4, RFC
+// 8656 12.5) for on_datagram(), each as from server(). The server knows
+// the allocation by the connection (RFC 8656, 3.2), so a new connection is
+// a new allocation, with its permissions and channels asked for again. A
+// connection that stops answering (a request without a response for
+// kStreamTimeout) is given up, since TCP itself would go on trying for
+// minutes; the caller closes it once !needs_connection().
+//
 // Authentication is the long-term credential mechanism (RFC 8489, 9.2)
 // with MESSAGE-INTEGRITY (HMAC-SHA1), which is what coturn accepts: the
 // first Allocate goes without credentials, the server answers 401 with a
@@ -56,7 +72,9 @@ namespace tuushin::net {
 //
 // Timers:
 //  * Requests are repeated after 0.5, 1, 2, 4, 8 and 16 s and given up 8 s
-//    after the seventh (RFC 8489, 6.2.1).
+//    after the seventh (RFC 8489, 6.2.1). Over a stream they are sent once
+//    and given up after kStreamTimeout (RFC 8489, 6.2.2, which leaves the
+//    timeout to the client), and the connection with them.
 //  * A Refresh every kKeepalive, much more often than the allocation's
 //    lifetime (10 minutes by default) requires, because the NAT in front
 //    of this end may forget the mapping to the server within 30 s of
@@ -68,9 +86,17 @@ namespace tuushin::net {
 //    allocations, so that the caller sees the relayed address change.
 //  * Permissions last 5 minutes and channels 10 (RFC 8656, 9 and 12); the
 //    client refreshes them after 4 and 5.
+//  * Over a stream, a connection that had an allocation is opened again at
+//    once when it drops, but not twice within kRetryDelay; one that did not
+//    get as far, or did not open within kConnectTimeout, after kRetryDelay.
 class TurnClient {
  public:
-  TurnClient(const Endpoint& server, std::string username, std::string password);
+  enum class Transport {
+    kUdp,     // datagrams, from a socket of the caller's
+    kStream,  // a TCP or TLS connection of the caller's
+  };
+  TurnClient(const Endpoint& server, std::string username, std::string password,
+             Transport transport = Transport::kUdp);
 
   static constexpr Nanos kInitialRto = 500 * kNanosPerMilli;
   static constexpr int kMaxTransmissions = 7;
@@ -80,6 +106,26 @@ class TurnClient {
   // After an Allocate that got no answer, or one the server could not
   // serve for now (437, 486, 508).
   static constexpr Nanos kRetryDelay = 10 * kNanosPerSecond;
+  // Over a stream: how long a request waits for its response, and a new
+  // connection to open (with its TLS handshake).
+  static constexpr Nanos kStreamTimeout = 5 * kNanosPerSecond;
+  static constexpr Nanos kConnectTimeout = 5 * kNanosPerSecond;
+
+  Transport transport() const { return transport_; }
+  // Over a stream: true when the caller should open a connection to
+  // server() (there is none, and it is time to try one), and tell
+  // connecting(). Never over UDP.
+  bool wants_connection(Nanos now) const;
+  // True while the client uses, or waits for, the connection the caller
+  // opened; once false the caller closes it. Always true over UDP.
+  bool needs_connection() const;
+  // The caller started a connection at `now`, which has kConnectTimeout to
+  // open; on connected() poll() starts the allocation.
+  void connecting(Nanos now);
+  void connected(Nanos now);
+  // The connection closed, or did not open, for `why`. The allocation goes
+  // with it.
+  void disconnected(const std::string& why, Nanos now);
 
   // The next message to send to server() at `now`, if one is due; call it
   // until it returns nullopt. Also due after on_datagram() and wrap().
@@ -98,7 +144,8 @@ class TurnClient {
                  Endpoint* peer, std::size_t* offset, std::size_t* length);
 
   // Wraps a datagram for `peer` into what to send to server(): ChannelData
-  // once a channel to the peer is bound, a Send indication before. Asks for
+  // once a channel to the peer is bound (padded to a multiple of 4 bytes
+  // over a stream), a Send indication before. Asks for
   // a permission and a channel for the peer if it has none (permit(),
   // bind_channel()); the relay drops what is sent before the permission is
   // in place. Returns false, leaving `out` empty, if there is no allocation
@@ -145,7 +192,17 @@ class TurnClient {
   bool channel_bound(const Endpoint& peer) const;
 
  private:
-  enum class State { kStart, kAllocating, kAllocated, kWaiting, kReleasing, kReleased, kFailed };
+  enum class State {
+    kDisconnected,  // over a stream, until connect_at_
+    kConnecting,    // over a stream, until connect_by_
+    kStart,
+    kAllocating,
+    kAllocated,
+    kWaiting,
+    kReleasing,
+    kReleased,
+    kFailed
+  };
   enum class Kind { kAllocate, kRefresh, kCreatePermission, kChannelBind };
 
   struct Transaction {
@@ -195,6 +252,7 @@ class TurnClient {
   const Channel* find_channel(const Endpoint& peer) const;
 
   Endpoint server_;  // canonical
+  Transport transport_;
   std::string username_;
   std::string password_;
   std::string realm_;
@@ -203,6 +261,10 @@ class TurnClient {
   bool have_credentials_ = false;  // realm_ and nonce_ known
 
   State state_ = State::kStart;
+  Nanos connect_at_ = 0;
+  Nanos connect_by_ = 0;
+  bool reconnected_ = false;  // at once, at reconnected_at_
+  Nanos reconnected_at_ = 0;
   Nanos retry_at_ = 0;
   Nanos refresh_at_ = 0;
   Nanos refresh_interval_ = kKeepalive;

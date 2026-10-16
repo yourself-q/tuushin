@@ -41,8 +41,61 @@ std::string error_text(const stun::Message& m) {
 
 }  // namespace
 
-TurnClient::TurnClient(const Endpoint& server, std::string username, std::string password)
-    : server_(server.canonical()), username_(std::move(username)), password_(std::move(password)) {}
+TurnClient::TurnClient(const Endpoint& server, std::string username, std::string password,
+                       Transport transport)
+    : server_(server.canonical()),
+      transport_(transport),
+      username_(std::move(username)),
+      password_(std::move(password)),
+      state_(transport == Transport::kStream ? State::kDisconnected : State::kStart) {}
+
+bool TurnClient::wants_connection(Nanos now) const {
+  return state_ == State::kDisconnected && now >= connect_at_;
+}
+
+bool TurnClient::needs_connection() const {
+  return transport_ == Transport::kUdp ||
+         !(state_ == State::kDisconnected || state_ == State::kFailed ||
+           state_ == State::kReleased);
+}
+
+void TurnClient::connecting(Nanos now) {
+  if (state_ != State::kDisconnected) return;
+  state_ = State::kConnecting;
+  connect_by_ = now + kConnectTimeout;
+}
+
+void TurnClient::connected(Nanos) {
+  if (state_ == State::kConnecting) state_ = State::kStart;
+}
+
+void TurnClient::disconnected(const std::string& why, Nanos now) {
+  if (transport_ != Transport::kStream) return;
+  switch (state_) {
+    case State::kDisconnected:
+    case State::kFailed:
+    case State::kReleased:
+      return;
+    case State::kReleasing:
+      transactions_.clear();
+      state_ = State::kReleased;
+      return;
+    default:
+      break;
+  }
+  // A connection that had its allocation is opened again at once, but not
+  // twice within kRetryDelay: a server that drops every connection soon
+  // after the allocation is not hammered.
+  const bool at_once = state_ == State::kAllocated &&
+                       (!reconnected_ || now - reconnected_at_ >= kRetryDelay);
+  lose(why);
+  state_ = State::kDisconnected;
+  connect_at_ = now + (at_once ? 0 : kRetryDelay);
+  if (at_once) {
+    reconnected_ = true;
+    reconnected_at_ = now;
+  }
+}
 
 bool TurnClient::has(Kind kind) const {
   return std::any_of(transactions_.begin(), transactions_.end(),
@@ -142,6 +195,12 @@ void TurnClient::restart(Transaction t) {
 }
 
 std::vector<std::uint8_t> TurnClient::transmit(Transaction& t, Nanos now) {
+  if (transport_ == Transport::kStream) {
+    // Once: the connection delivers it, or fails (RFC 8489, 6.2.2).
+    t.sent = kMaxTransmissions;
+    t.due = now + kStreamTimeout;
+    return t.bytes;
+  }
   ++t.sent;
   // 0.5, 1, 2, 4, 8, 16 s between transmissions, then 16 times the first
   // before giving up (RFC 8489, 6.2.1: Rc = 7, Rm = 16).
@@ -150,7 +209,13 @@ std::vector<std::uint8_t> TurnClient::transmit(Transaction& t, Nanos now) {
 }
 
 std::optional<std::vector<std::uint8_t>> TurnClient::poll(Nanos now) {
-  if (state_ == State::kFailed || state_ == State::kReleased) return std::nullopt;
+  if (state_ == State::kFailed || state_ == State::kReleased || state_ == State::kDisconnected) {
+    return std::nullopt;
+  }
+  if (state_ == State::kConnecting) {
+    if (now >= connect_by_) disconnected("the connection did not open in time", now);
+    return std::nullopt;
+  }
 
   // Transactions that ran out of transmissions.
   for (std::size_t i = 0; i < transactions_.size();) {
@@ -163,7 +228,9 @@ std::optional<std::vector<std::uint8_t>> TurnClient::poll(Nanos now) {
       ++i;
     }
   }
-  if (state_ == State::kFailed || state_ == State::kReleased) return std::nullopt;
+  if (state_ == State::kFailed || state_ == State::kReleased || state_ == State::kDisconnected) {
+    return std::nullopt;
+  }
 
   // New transactions.
   if (state_ == State::kStart || (state_ == State::kWaiting && now >= retry_at_)) {
@@ -195,6 +262,8 @@ std::optional<std::vector<std::uint8_t>> TurnClient::poll(Nanos now) {
 Nanos TurnClient::next_due() const {
   constexpr Nanos kNever = std::numeric_limits<Nanos>::max();
   if (state_ == State::kFailed || state_ == State::kReleased) return kNever;
+  if (state_ == State::kDisconnected) return connect_at_;
+  if (state_ == State::kConnecting) return connect_by_;
   if (state_ == State::kStart) return 0;
   Nanos due = kNever;
   for (const auto& t : transactions_) due = std::min(due, t.due);
@@ -403,6 +472,12 @@ void TurnClient::on_error(Transaction t, const stun::Message& m, Nanos now) {
 }
 
 void TurnClient::on_timeout(const Transaction& t, Nanos now) {
+  if (transport_ == Transport::kStream && state_ != State::kReleasing) {
+    // The connection delivered nothing back: it is dead or stalled, and
+    // takes the allocation with it either way.
+    disconnected("no answer from the server over the connection", now);
+    return;
+  }
   switch (t.kind) {
     case Kind::kAllocate:
       last_error_ = "no answer from the server";
@@ -496,8 +571,11 @@ bool TurnClient::wrap(const Endpoint& peer, const std::uint8_t* data, std::size_
   if (!perm || perm->refused) return false;
   const Channel* c = find_channel(p);
   if (c && c->confirmed && !c->refused) {
-    // No padding: over UDP it is optional (RFC 8656, 12.5).
-    out.resize(4 + size);
+    // Padded to a multiple of 4 bytes over a stream, where the length that
+    // follows the padding is how the server finds the next message; over
+    // UDP padding is optional and left out (RFC 8656, 12.5).
+    const std::size_t padded = transport_ == Transport::kStream ? (size + 3) & ~std::size_t{3} : size;
+    out.assign(4 + padded, 0);
     put16(out.data(), c->number);
     put16(out.data() + 2, size);
     if (size > 0) std::memcpy(out.data() + 4, data, size);

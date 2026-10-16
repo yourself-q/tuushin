@@ -2,10 +2,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
+#include "tuushin/net/tcp.hpp"
 #include "tuushin/net/turn.hpp"
 #include "tuushin/net/udp.hpp"
 #include "tuushin/time.hpp"
@@ -30,10 +33,17 @@ struct Route {
   std::string to_string() const;
 };
 
+// How this end reaches its TURN server: in datagrams, or over a TCP
+// connection where UDP does not get out.
+enum class RelayTransport { kUdp, kTcp };
+
 // This end's ways to its peers: its socket, and optionally a relay on a
 // TURN server (turn.hpp), allocated from a second socket of its own, since
 // the server knows an allocation by the address it sees the client at and
-// takes every datagram from there for TURN's.
+// takes every datagram from there for TURN's; or over a TCP connection of
+// its own, which the server knows the allocation by. The connection is
+// opened again when it drops (TurnClient's timers), and what arrives on it
+// is cut into TURN messages here.
 //
 // What arrives either way is handed out with the Route it came by; what the
 // TURN client receives for itself (its responses) it keeps. A datagram for
@@ -44,7 +54,10 @@ struct Route {
 //
 // A relay costs one hop through the server and 4 bytes per datagram, and is
 // for where a direct path cannot be opened: both ends behind NATs that
-// pick a new outside port for every destination (rendezvous.hpp).
+// pick a new outside port for every destination (rendezvous.hpp). Over
+// TCP a lost segment holds back what follows it until it is sent again
+// (a retransmission timeout of 200 ms or more), and the arrival time of a
+// datagram is when it was read, not when the kernel took it.
 class Paths {
  public:
   explicit Paths(UdpSocket& direct);
@@ -53,10 +66,12 @@ class Paths {
 
   // Allocates a relay on `server` with long-term credentials, from a new
   // socket bound to the direct socket's address with an ephemeral port and
-  // marked with its DSCP, since it carries the same datagrams. Throws if
-  // that socket cannot be bound or cannot send to the server.
+  // marked with its DSCP, since it carries the same datagrams; over TCP the
+  // connections are made from such sockets. Throws if that socket cannot
+  // be bound or cannot send to the server.
   void enable_relay(const Endpoint& server, const std::string& username,
-                    const std::string& password);
+                    const std::string& password,
+                    RelayTransport transport = RelayTransport::kUdp);
 
   UdpSocket& direct() { return direct_; }
   // The TURN client, if a relay is enabled.
@@ -75,10 +90,13 @@ class Paths {
   std::optional<std::size_t> recv(std::uint8_t* buffer, std::size_t capacity, Route* from,
                                    Nanos* rx_time = nullptr);
 
-  // Waits until either socket has a datagram queued or `timeout` passes.
+  // Waits until either socket has a datagram queued, the connection to the
+  // TURN server has bytes or takes the ones waiting, or `timeout` passes.
   bool wait_readable(Nanos timeout);
 
-  // Sends what the TURN client has due at `now`; call it by next_due().
+  // Sends what the TURN client has due at `now`, and over TCP opens,
+  // closes and writes the connection; call it by next_due() and after
+  // every wait.
   void service(Nanos now);
   // When service() next has something to send; far in the future without
   // a relay.
@@ -89,13 +107,33 @@ class Paths {
   // Does nothing without a relay.
   void permit(const std::vector<Endpoint>& peers);
 
+  // The connection to the TURN server, while one is open or opening.
+  Stream* stream() { return stream_.get(); }
+
  private:
+  bool streamed() const { return turn_ && turn_->transport() == TurnClient::Transport::kStream; }
+  void tend_stream(Nanos now);
+  void close_stream();
+  // The length of the TURN message at the front of in_: 0 while it has not
+  // all arrived, nullopt if what is there is not one (a TLS alert from a
+  // TLS port, say). Not all that is not TURN shows: an HTTP answer reads as
+  // ChannelData of 20 KiB or so, and the requests that get no answer give
+  // the connection up instead.
+  std::optional<std::size_t> next_message() const;
+  std::optional<std::size_t> recv_stream(std::uint8_t* buffer, std::size_t capacity, Route* from,
+                                         Nanos* rx_time);
+
   UdpSocket& direct_;
   std::optional<UdpSocket> relay_socket_;
   std::optional<TurnClient> turn_;
-  Endpoint server_;  // in the form relay_socket_ sends to
+  Endpoint server_;  // in the form relay_socket_ or a stream sends to
   std::vector<std::uint8_t> wrapped_;
   std::vector<std::uint8_t> rx_;
+  std::function<std::unique_ptr<Stream>()> open_stream_;
+  std::unique_ptr<Stream> stream_;
+  bool stream_open_ = false;           // told the TURN client
+  std::size_t in_begin_ = 0, in_end_ = 0;  // what was read and not handled, in rx_
+  Nanos in_time_ = 0;                  // when it was read
 };
 
 }  // namespace tuushin::net

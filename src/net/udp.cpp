@@ -458,6 +458,16 @@ bool UdpSocket::wait_readable(Nanos timeout) {
 }
 
 bool wait_any_readable(UdpSocket* const* sockets, std::size_t count, Nanos timeout) {
+  constexpr std::size_t kMax = 8;
+  WaitFor fds[kMax];
+  std::size_t n = 0;
+  for (std::size_t i = 0; i < count && n < kMax; ++i) {
+    if (sockets[i] != nullptr) fds[n++].fd = sockets[i]->native_handle();
+  }
+  return wait_any(fds, n, timeout);
+}
+
+bool wait_any(const WaitFor* waits, std::size_t count, Nanos timeout) {
   if (timeout < 0) timeout = 0;
   // An interrupted wait returns false like a timeout; callers loop on the
   // clock anyway, and retrying with the full timeout would overshoot.
@@ -466,9 +476,9 @@ bool wait_any_readable(UdpSocket* const* sockets, std::size_t count, Nanos timeo
   nfds_t n = 0;
   int highest = -1;
   for (std::size_t i = 0; i < count && n < kMax; ++i) {
-    if (sockets[i] == nullptr) continue;
-    fds[n].fd = sockets[i]->native_handle();
-    fds[n].events = POLLIN;
+    if (waits[i].fd < 0) continue;
+    fds[n].fd = waits[i].fd;
+    fds[n].events = static_cast<short>(POLLIN | (waits[i].write ? POLLOUT : 0));
     fds[n].revents = 0;
     highest = std::max(highest, fds[n].fd);
     ++n;
@@ -481,20 +491,30 @@ bool wait_any_readable(UdpSocket* const* sockets, std::size_t count, Nanos timeo
   if (::ppoll(fds, n, &ts, nullptr) <= 0) return false;
 #else
   if (highest < FD_SETSIZE) {
-    fd_set set;
-    FD_ZERO(&set);
-    for (nfds_t i = 0; i < n; ++i) FD_SET(fds[i].fd, &set);
+    // select() for its microsecond timeout; poll() has milliseconds.
+    fd_set readable, writable;
+    FD_ZERO(&readable);
+    FD_ZERO(&writable);
+    for (nfds_t i = 0; i < n; ++i) {
+      FD_SET(fds[i].fd, &readable);
+      if (fds[i].events & POLLOUT) FD_SET(fds[i].fd, &writable);
+    }
     const Nanos us = (timeout + 999) / 1000;
     timeval tv{};
     tv.tv_sec = static_cast<time_t>(us / 1'000'000);
     tv.tv_usec = static_cast<suseconds_t>(us % 1'000'000);
-    return ::select(highest + 1, &set, nullptr, nullptr, &tv) > 0;
+    return ::select(highest + 1, &readable, &writable, nullptr, &tv) > 0;
   }
   const int ms = static_cast<int>((timeout + kNanosPerMilli - 1) / kNanosPerMilli);
   if (::poll(fds, n, ms) <= 0) return false;
 #endif
+  // An error alone wakes only a wait for writing (a connect that failed):
+  // a UDP socket's queued ICMP errors are not datagrams.
   for (nfds_t i = 0; i < n; ++i) {
     if ((fds[i].revents & POLLIN) != 0) return true;
+    if ((fds[i].events & POLLOUT) != 0 && (fds[i].revents & (POLLOUT | POLLERR | POLLHUP)) != 0) {
+      return true;
+    }
   }
   return false;
 }

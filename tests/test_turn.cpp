@@ -1,3 +1,8 @@
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <algorithm>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -391,6 +396,133 @@ TEST_CASE(turn_release_deletes_the_allocation) {
   CHECK(!c.poll(TurnClient::kKeepalive));
 }
 
+TEST_CASE(turn_over_a_stream_waits_for_its_connection) {
+  using T = TurnClient;
+  T c(kServer, kUser, kPass, T::Transport::kStream);
+  CHECK(c.transport() == T::Transport::kStream);
+  CHECK(!c.needs_connection());
+  CHECK(c.wants_connection(0));
+  CHECK(!c.poll(0));
+
+  // A connection that does not open in time is tried again after the delay.
+  c.connecting(0);
+  CHECK(c.needs_connection());
+  CHECK(!c.wants_connection(0));
+  CHECK(c.next_due() == T::kConnectTimeout);
+  CHECK(!c.poll(T::kConnectTimeout - 1));
+  CHECK(!c.poll(T::kConnectTimeout));
+  CHECK(!c.needs_connection());
+  CHECK(c.last_error() == "the connection did not open in time");
+  const Nanos again = T::kConnectTimeout + T::kRetryDelay;
+  CHECK(c.next_due() == again);
+  CHECK(!c.wants_connection(again - 1));
+  CHECK(c.wants_connection(again));
+
+  // One that is refused, likewise.
+  c.connecting(again);
+  c.disconnected("connect: Connection refused", again);
+  CHECK(c.last_error() == "connect: Connection refused");
+  CHECK(!c.wants_connection(again + T::kRetryDelay - 1));
+
+  // Requests go once over a stream, and wait kStreamTimeout for an answer.
+  const Nanos t = again + T::kRetryDelay;
+  c.connecting(t);
+  c.connected(t);
+  CHECK(c.next_due() == 0);
+  const auto first = parse(*c.poll(t));
+  CHECK(first.method() == stun::method::kAllocate);
+  CHECK(first.u32(stun::attr::kRequestedTransport) == 17u << 24);  // UDP to peers
+  CHECK(c.next_due() == t + T::kStreamTimeout);
+  CHECK(!c.poll(t + T::kInitialRto));
+  feed(c, challenge(first, 401, "n1"), t);
+  feed(c, success(parse(*c.poll(t))), t);
+  CHECK(c.allocated());
+  CHECK(c.allocations() == 1);
+}
+
+TEST_CASE(turn_over_a_stream_pads_channel_data) {
+  TurnClient c(kServer, kUser, kPass, TurnClient::Transport::kStream);
+  c.connecting(0);
+  c.connected(0);
+  allocate(c, 0);
+  std::vector<std::uint8_t> out;
+  CHECK(c.wrap(kPeer, bytes("hello"), 5, out));  // a Send indication, aligned anyway
+  CHECK(out.size() % 4 == 0);
+  answer_all(c, 0, [](const stun::Message& m) { return success(m); });
+  CHECK(c.channel_bound(kPeer));
+  for (std::size_t n = 0; n <= 8; ++n) {
+    CHECK(c.wrap(kPeer, bytes("abcdefgh"), n, out));
+    CHECK(out.size() == 4 + (n + 3) / 4 * 4);
+    CHECK(out[2] == 0 && out[3] == n);  // the length leaves the padding out
+    CHECK(std::all_of(out.begin() + 4 + static_cast<std::ptrdiff_t>(n), out.end(),
+                      [](std::uint8_t b) { return b == 0; }));
+  }
+
+  // Padded ChannelData from the server reads as its length says.
+  std::vector<std::uint8_t> in = {0x40, 0x00, 0x00, 0x03, 'a', 'b', 'c', 0};
+  Endpoint peer;
+  std::size_t offset = 0, length = 0;
+  CHECK(feed(c, in, 0, &peer, &offset, &length) == TurnClient::Rx::kData);
+  CHECK(peer == kPeer && offset == 4 && length == 3);
+}
+
+TEST_CASE(turn_over_a_stream_gives_up_a_silent_connection) {
+  using T = TurnClient;
+  T c(kServer, kUser, kPass, T::Transport::kStream);
+  c.connecting(0);
+  c.connected(0);
+  allocate(c, 0);
+  c.permit(kPeer);
+  answer_all(c, 0, [](const stun::Message& m) { return success(m); });
+  CHECK(c.permitted(kPeer));
+
+  // A Refresh that gets no answer gives the connection up, and with it the
+  // allocation; one that had an allocation is opened again at once.
+  const Nanos t = 20 * kNanosPerSecond;
+  c.check(t);
+  CHECK(parse(*c.poll(t)).method() == stun::method::kRefresh);
+  CHECK(!c.poll(t + T::kStreamTimeout - 1));
+  CHECK(c.needs_connection());
+  CHECK(!c.poll(t + T::kStreamTimeout));
+  CHECK(!c.needs_connection());
+  CHECK(!c.allocated());
+  CHECK(!c.permitted(kPeer));
+  CHECK(c.last_error() == "no answer from the server over the connection");
+  const Nanos t2 = t + T::kStreamTimeout;
+  CHECK(c.wants_connection(t2));
+
+  // The new connection is a new allocation, with the permission asked for
+  // again.
+  c.connecting(t2);
+  c.connected(t2);
+  allocate(c, t2, ep("192.0.2.1", 50002));
+  CHECK(c.allocations() == 2);
+  CHECK(c.relayed() == ep("192.0.2.1", 50002));
+  const auto perm = parse(*c.poll(t2));
+  CHECK(perm.method() == stun::method::kCreatePermission);
+  feed(c, success(perm), t2);
+
+  // Dropped again soon after: the next try waits.
+  const Nanos t3 = t2 + kNanosPerSecond;
+  c.disconnected("closed by the other end", t3);
+  CHECK(!c.wants_connection(t3));
+  CHECK(c.wants_connection(t3 + T::kRetryDelay));
+
+  // Released while waiting for a connection: nothing more is wanted.
+  c.release();
+  CHECK(!c.wants_connection(t3 + T::kRetryDelay));
+  CHECK(!c.needs_connection());
+  CHECK(!c.poll(t3 + T::kRetryDelay));
+}
+
+TEST_CASE(turn_over_udp_wants_no_connection) {
+  TurnClient c(kServer, kUser, kPass);
+  CHECK(!c.wants_connection(0));
+  CHECK(c.needs_connection());
+  c.disconnected("ignored", 0);
+  CHECK(c.poll(0).has_value());
+}
+
 namespace {
 
 // A client on a loopback socket, against SimTurn, on a clock that tests may
@@ -591,4 +723,138 @@ TEST_CASE(paths_carry_datagrams_directly_and_through_the_relay) {
   other.send_to(relayed, bytes("f"), 1);
   REQUIRE(pump([&] { return received.size() == 5; }));
   CHECK(received[4].from == (Route{other.local_endpoint(), true}));
+}
+
+namespace {
+
+// Paths with a relay and a buffer for what arrives, pumped until a
+// condition holds.
+struct PathsUnderTest {
+  explicit PathsUnderTest(UdpSocket& direct) : paths(direct) {}
+
+  bool pump(const std::function<bool()>& done, Nanos timeout = 2 * kNanosPerSecond) {
+    const Nanos deadline = monotonic_now() + timeout;
+    while (!done() && monotonic_now() < deadline) {
+      paths.service(monotonic_now());
+      paths.wait_readable(kNanosPerMilli);
+      paths.service(monotonic_now());
+      std::uint8_t buf[256];
+      Route from;
+      while (const auto n = paths.recv(buf, sizeof buf, &from)) {
+        received.emplace_back(from, std::string(reinterpret_cast<char*>(buf), *n));
+      }
+    }
+    return done();
+  }
+
+  Paths paths;
+  std::vector<std::pair<Route, std::string>> received;
+};
+
+}  // namespace
+
+TEST_CASE(paths_reach_the_relay_over_tcp) {
+  UdpSocket direct(*Endpoint::resolve("127.0.0.1", 0));
+  UdpSocket peer(*Endpoint::resolve("127.0.0.1", 0));
+  const Endpoint peer_ep = peer.local_endpoint();
+  test::SimTurn server("alice", "secret");
+  server.start();
+  PathsUnderTest t(direct);
+  t.paths.enable_relay(server.endpoint(), "alice", "secret", RelayTransport::kTcp);
+  REQUIRE(t.paths.stream() != nullptr);  // opening at once
+  REQUIRE(t.pump([&] { return t.paths.turn()->allocated(); }));
+  CHECK(server.connections() == 1 && server.live_allocations() == 1);
+  // The server sees this end at the connection's address.
+  CHECK(t.paths.turn()->mapped() ==
+        static_cast<TcpStream*>(t.paths.stream())->local_endpoint().canonical());
+  CHECK(t.received.empty());
+  const Endpoint relayed = t.paths.turn()->relayed();
+
+  // Through the relay, both ways: a Send indication, then ChannelData.
+  Endpoint from;
+  CHECK(t.paths.send(Route{peer_ep, true}, bytes("c"), 1));
+  CHECK(receive(peer, &from) == "c");
+  CHECK(from == relayed);
+  REQUIRE(t.pump([&] { return t.paths.turn()->channel_bound(peer_ep); }));
+  CHECK(t.paths.send(Route{peer_ep, true}, bytes("eee"), 3));
+  CHECK(receive(peer, &from) == "eee");
+  CHECK(t.pump([&] { return server.sent_channel_data() == 1; }));
+
+  // A burst of odd sizes, padded on the connection: each arrives whole and
+  // in order, however the reads cut them.
+  for (std::size_t n = 1; n <= 9; ++n) {
+    const std::string s(n, static_cast<char>('0' + n));
+    peer.send_to(relayed, bytes(s.c_str()), s.size());
+  }
+  REQUIRE(t.pump([&] { return t.received.size() == 9; }));
+  for (std::size_t n = 1; n <= 9; ++n) {
+    CHECK(t.received[n - 1].first == (Route{peer_ep, true}));
+    CHECK(t.received[n - 1].second == std::string(n, static_cast<char>('0' + n)));
+  }
+  CHECK(server.channel_data() == 9);
+
+  // The connection drops: a new one at once, a new allocation, and the
+  // permission and channel asked for again on the next datagram.
+  server.drop_connections();
+  REQUIRE(t.pump([&] { return t.paths.turn()->allocations() == 2; }));
+  CHECK(t.paths.turn()->last_error() == "closed by the other end");
+  CHECK(server.connections() == 2 && server.live_allocations() == 1);
+  const Endpoint relayed2 = t.paths.turn()->relayed();
+  CHECK(relayed2 != relayed);
+  CHECK(t.paths.send(Route{peer_ep, true}, bytes("g"), 1));
+  CHECK(receive(peer, &from) == "g");
+  CHECK(from == relayed2);
+
+  // Released: the server deletes the allocation, and the connection is
+  // closed once the answer is in.
+  t.paths.turn()->release();
+  REQUIRE(t.pump([&] { return server.live_allocations() == 0; }));
+  REQUIRE(t.pump([&] { return t.paths.stream() == nullptr; }));
+  CHECK(t.pump([&] { return server.open_connections() == 0; }));
+}
+
+TEST_CASE(paths_over_tcp_retry_a_refused_or_garbled_connection) {
+  UdpSocket direct(*Endpoint::resolve("127.0.0.1", 0));
+
+  // Nothing listens: refused, and tried again after the delay.
+  Endpoint closed;
+  {
+    TcpStream probe(*Endpoint::resolve("127.0.0.1", 9), *Endpoint::resolve("127.0.0.1", 0));
+    closed = probe.local_endpoint();  // a port just in use, and free again
+  }
+  PathsUnderTest t(direct);
+  t.paths.enable_relay(closed, "alice", "secret", RelayTransport::kTcp);
+  REQUIRE(t.pump([&] { return t.paths.stream() == nullptr; }));
+  CHECK(t.paths.turn()->last_error().rfind("connect: ", 0) == 0);
+  CHECK(t.paths.next_due() > monotonic_now() + TurnClient::kRetryDelay / 2);
+  CHECK(!t.paths.send(Route{direct.local_endpoint(), true}, bytes("x"), 1));
+
+  // A server that answers with what is not TURN (here a TLS alert, as from
+  // a TLS port): the connection is closed.
+  const int listener = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  REQUIRE(listener >= 0);
+  const Endpoint any = *Endpoint::resolve("127.0.0.1", 0);
+  REQUIRE(::bind(listener, static_cast<const sockaddr*>(any.data()),
+                 static_cast<socklen_t>(any.size())) == 0);
+  REQUIRE(::listen(listener, 1) == 0);
+  Endpoint at;
+  socklen_t len = Endpoint::kCapacity;
+  ::getsockname(listener, static_cast<sockaddr*>(at.data()), &len);
+  at.set_size(static_cast<std::uint32_t>(len));
+  UdpSocket direct2(*Endpoint::resolve("127.0.0.1", 0));
+  PathsUnderTest g(direct2);
+  g.paths.enable_relay(at, "alice", "secret", RelayTransport::kTcp);
+  REQUIRE(g.pump([&] { return g.paths.stream() && g.paths.stream()->state() == Stream::State::kOpen; }));
+  const int conn = ::accept(listener, nullptr, nullptr);
+  REQUIRE(conn >= 0);
+  // The Allocate arrives; the answer is "decode_error", fatal.
+  std::uint8_t request[512];
+  CHECK(::recv(conn, request, sizeof request, 0) >= 20);
+  const std::uint8_t alert[] = {0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x32};
+  CHECK(::send(conn, alert, sizeof alert, 0) == sizeof alert);
+  REQUIRE(g.pump([&] { return g.paths.stream() == nullptr; }));
+  CHECK(g.paths.turn()->last_error() == "the server sent what is not TURN");
+  CHECK(!g.paths.turn()->wants_connection(monotonic_now()));
+  ::close(conn);
+  ::close(listener);
 }

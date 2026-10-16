@@ -200,6 +200,17 @@ class UdpSocket {
 // UdpSocket::wait_readable does for one.
 bool wait_any_readable(UdpSocket* const* sockets, std::size_t count, Nanos timeout);
 
+// A file descriptor to wait on: until it is readable, or also until it
+// takes more bytes.
+struct WaitFor {
+  int fd = -1;
+  bool write = false;
+};
+// Waits until one of the `count` descriptors (negative ones are skipped; at
+// most 8 are watched) is ready as asked, or `timeout` passes. True if one
+// is.
+bool wait_any(const WaitFor* fds, std::size_t count, Nanos timeout);
+
 // The addresses at which another host could reach `socket` without a NAT
 // in between: the bound address, or for a wildcard socket the addresses of
 // the host's interfaces that are up (of the socket's family; both for a

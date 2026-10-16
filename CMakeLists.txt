@@ -34,6 +34,7 @@ add_library(tuushin
   src/net/probe.cpp
   src/net/rendezvous.cpp
   src/net/stun.cpp
+  src/net/tcp.cpp
   src/net/trace.cpp
   src/net/turn.cpp
   src/net/udp.cpp
