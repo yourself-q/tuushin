@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <string>
 #include <thread>
@@ -58,6 +60,10 @@ class SimTurn {
   void refuse_peers(bool refuse) { refuse_.store(refuse); }
   // Drops everything that arrives, like a path that went down.
   void pause(bool paused) { paused_.store(paused); }
+  // Holds every datagram it relays, either way, for `delay` (to the
+  // millisecond or so), like a relay off the direct path. Before start()
+  // only.
+  void set_delay(std::chrono::microseconds delay) { delay_ = delay; }
 
   std::uint64_t allocations() const { return allocations_.load(); }
   std::uint64_t challenges() const { return challenges_.load(); }      // 401
@@ -215,7 +221,7 @@ class SimTurn {
       if (!a || len > size - 4) return;
       for (const auto& c : a->channels) {
         if (c.first == n && permitted(*a, c.second)) {
-          a->relay.send_to(c.second, data + 4, len);
+          relay(a->client, true, c.second, data + 4, len);
           sent_channel_data_.fetch_add(1);
         }
       }
@@ -230,7 +236,7 @@ class SimTurn {
       std::size_t n = 0;
       const std::uint8_t* payload = m->find(stun::attr::kData, &n);
       if (!a || !peer || !payload || !permitted(*a, *peer)) return;
-      a->relay.send_to(*peer, payload, n);
+      relay(a->client, true, *peer, payload, n);
       sent_indications_.fetch_add(1);
     }
   }
@@ -245,7 +251,7 @@ class SimTurn {
         out[2] = static_cast<std::uint8_t>(size >> 8);
         out[3] = static_cast<std::uint8_t>(size);
         std::copy(data, data + size, out.begin() + 4);
-        socket_.send_to(a.client, out.data(), out.size());
+        relay(a.client, false, a.client, out.data(), out.size());
         channel_data_.fetch_add(1);
         return;
       }
@@ -253,8 +259,44 @@ class SimTurn {
     stun::Builder b(stun::method::kData, stun::Class::kIndication, stun::random_transaction_id());
     b.add_address(stun::attr::kXorPeerAddress, peer);
     b.add(stun::attr::kData, data, size);
-    socket_.send_to(a.client, b.bytes().data(), b.bytes().size());
+    relay(a.client, false, a.client, b.bytes().data(), b.bytes().size());
     data_indications_.fetch_add(1);
+  }
+
+  struct Held {
+    std::chrono::steady_clock::time_point release;
+    net::Endpoint client;  // whose allocation
+    bool to_peer;          // from its relayed address, else from the server's
+    net::Endpoint to;
+    std::vector<std::uint8_t> bytes;
+  };
+
+  // Sends what the allocation of `client` relays, now or after the delay.
+  void relay(const net::Endpoint& client, bool to_peer, const net::Endpoint& to,
+             const std::uint8_t* data, std::size_t size) {
+    if (delay_.count() > 0) {
+      held_.push_back(Held{std::chrono::steady_clock::now() + delay_, client, to_peer, to,
+                           std::vector<std::uint8_t>(data, data + size)});
+      return;
+    }
+    send_relayed(client, to_peer, to, data, size);
+  }
+  void send_relayed(const net::Endpoint& client, bool to_peer, const net::Endpoint& to,
+                    const std::uint8_t* data, std::size_t size) {
+    if (!to_peer) {
+      socket_.send_to(to, data, size);
+      return;
+    }
+    // The allocation may be gone by now.
+    if (Allocation* a = find(client)) a->relay.send_to(to, data, size);
+  }
+  void release_held() {
+    const auto now = std::chrono::steady_clock::now();
+    while (!held_.empty() && held_.front().release <= now) {
+      const Held& h = held_.front();
+      send_relayed(h.client, h.to_peer, h.to, h.bytes.data(), h.bytes.size());
+      held_.pop_front();
+    }
   }
 
   void run() {
@@ -270,7 +312,9 @@ class SimTurn {
       for (const auto& a : allocations_list_) {
         fds.push_back(pollfd{a->relay.native_handle(), POLLIN, 0});
       }
-      if (::poll(fds.data(), static_cast<nfds_t>(fds.size()), 1) <= 0) continue;
+      const int ready = ::poll(fds.data(), static_cast<nfds_t>(fds.size()), 1);
+      release_held();
+      if (ready <= 0) continue;
       net::Endpoint from;
       // Peers first: a Refresh with lifetime 0 below may remove allocations.
       const std::size_t count = allocations_list_.size();
@@ -294,6 +338,8 @@ class SimTurn {
   net::UdpSocket socket_;
   const net::Endpoint endpoint_;
   std::vector<std::unique_ptr<Allocation>> allocations_list_;
+  std::chrono::microseconds delay_{0};
+  std::deque<Held> held_;
   std::atomic<bool> stop_{false}, drop_{false}, refuse_{false}, paused_{false};
   std::atomic<std::uint64_t> nonce_generation_{1};
   std::atomic<std::uint64_t> allocations_{0}, challenges_{0}, stale_nonces_{0}, refreshes_{0},

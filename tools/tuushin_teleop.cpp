@@ -343,6 +343,17 @@ void print_stats(const char* name, const net::DelayStats& s, double unit, const 
   std::printf("\n");
 }
 
+// Where a session that ran through the slave's relay at some point went
+// (RendezvousConfig::direct_check_interval).
+void print_route_change(bool started_relayed, bool relayed_at_end, Nanos direct_after) {
+  if (direct_after >= 0) {
+    std::printf("left the relay for a direct path %.3f s into the session\n",
+                static_cast<double>(direct_after) / 1e9);
+  } else if (relayed_at_end && !started_relayed) {
+    std::printf("ended on the relay\n");
+  }
+}
+
 void print_link(const teleop::HapticLink::Counters& c, const char* rx_dir) {
   const double lost = c.received + c.missing > 0
                           ? 100.0 * static_cast<double>(c.missing) /
@@ -687,6 +698,7 @@ int run_master(const Options& o) {
     std::printf("rendezvous: the slave announced anew %llu times during the session\n",
                 static_cast<unsigned long long>(rep.rejoins));
   }
+  print_route_change(rep.relayed, rep.relayed_at_end, rep.direct_after);
   print_stats("tick late", rep.lateness, 1e3, "us");
   print_link(rep.link, "from the slave");
   if (!rep.slave_answered) {
@@ -803,6 +815,7 @@ int run_slave(const Options& o) {
       std::printf("rendezvous: the master announced anew %llu times during the session\n",
                   static_cast<unsigned long long>(r.rejoins));
     }
+    print_route_change(r.relayed, r.relayed_at_end, r.direct_after);
     print_stats("tick late", r.lateness, 1e3, "us");
     print_link(r.link, "from the master");
     std::printf("max position %.4f m, max force %.3f N, slave energy %.6g J\n", r.max_position,

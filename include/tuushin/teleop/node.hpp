@@ -117,8 +117,26 @@ struct RendezvousConfig {
   // it also sends hellos to the slave's relayed address (SlaveNodeConfig::
   // relay). A direct path that opens answers within a round trip or two of
   // the hellos, before the relay is tried; the master takes the first
-  // reply that authenticates, and the session stays on its path.
+  // reply that authenticates, and the session starts on its path.
   Nanos relay_delay = kNanosPerSecond;
+  // Both, while a session runs through the slave's relay: how often to
+  // check whether a direct path has opened since (0 never). Right after
+  // its link sends, each end sends copies of that datagram to the other
+  // end's own candidates (HapticLink::race_copy). Where a copy arrives
+  // before the original that took the relay, it is the newest datagram
+  // there and the other end's link follows it (HapticLink); the other
+  // end's samples then come the direct way too, and this end's link
+  // follows them. So a direct path that is open both ways and faster than
+  // the relay takes the session over, and one that is slower, or shut,
+  // leaves it where it is. For one interval after its link has left the
+  // relay, an end also sends a copy of every datagram along the relay
+  // (make before break): an end that followed a path open one way only
+  // still reaches the other end, whose next sample through the relay
+  // brings it back, and so does an end that followed a copy which won a
+  // race the relay usually wins. A WebRTC agent likewise keeps checking
+  // the candidate pairs it does not use, and may switch to a better one;
+  // the copies also keep this end's NAT open towards the other end.
+  Nanos direct_check_interval = kNanosPerSecond;
 };
 
 // A relay on a TURN server (net/turn.hpp), with long-term credentials.
@@ -160,7 +178,12 @@ struct MasterNodeReport {
   std::vector<net::Endpoint> relays;      // the slave's relayed addresses, likewise
   int prime_hops = 0;      // the hop limit of the priming (RendezvousConfig::measure_hops)
   std::string prime_how;   // how it was found: measured (the routers), or why not
-  bool relayed = false;  // the session ran to one of the relays
+  bool relayed = false;  // the session started on one of the relays
+  bool relayed_at_end = false;  // and still did when it ended
+  // When the session left the relay for the direct path it ended on, from
+  // its start (RendezvousConfig::direct_check_interval); -1 if it ended on
+  // the relay or never ran through it.
+  Nanos direct_after = -1;
   std::uint64_t rejoins = 0;  // the slave announced anew during the session
   std::uint64_t ticks = 0, skipped = 0;
   net::DelayStats lateness;  // ns
@@ -250,6 +273,8 @@ struct SlaveSessionReport {
   std::uint32_t session = 0;
   net::Endpoint master;
   bool relayed = false;  // the session started through this end's relay
+  bool relayed_at_end = false;  // and still ran through it when it ended
+  Nanos direct_after = -1;      // as in MasterNodeReport
   Passivity scheme = Passivity::kNone;
   bool authenticated = false;
   std::uint64_t ticks = 0, skipped = 0;

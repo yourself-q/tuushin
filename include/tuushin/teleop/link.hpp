@@ -103,6 +103,10 @@ class HapticLink {
   // peer a period or more earlier, so where that datagram arrived the copy
   // is a duplicate and moves nothing: the old path, while it works, wins.
   bool send_copy(const net::Route& to);
+  // As send_copy, sent at `now` through the emulation, if any, as the
+  // original was: a copy that is to race the original along another path
+  // must cross the same emulated channel, or it would win every race.
+  void race_copy(Nanos now, const net::Route& to);
 
   // Releases emulated datagrams that are due at `now`.
   void pump(Nanos now);
@@ -159,7 +163,7 @@ class HapticLink {
   void set_exchange_limit(std::size_t n) { exchange_limit_ = n; }
 
  private:
-  void transmit(const std::vector<std::uint8_t>& datagram);
+  void transmit(const std::vector<std::uint8_t>& datagram, const net::Route& to);
 
   std::unique_ptr<net::Paths> own_paths_;  // for the socket-only form
   net::Paths* paths_;
@@ -191,6 +195,7 @@ class HapticLink {
     Nanos release;
     std::uint64_t order;
     std::vector<std::uint8_t> bytes;
+    std::optional<net::Route> to;  // the peer's route at release, if not given
   };
   struct LaterRelease {
     bool operator()(const Pending& a, const Pending& b) const {

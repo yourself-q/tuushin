@@ -330,6 +330,45 @@ class SessionRejoin {
     }
   }
 
+  // Right after the link sent at `now`: while the session runs through the
+  // slave's relay, copies of that datagram to the other end's own
+  // candidates every direct_check_interval (RendezvousConfig). Sent right
+  // after the original, a copy is the newest datagram where it arrives
+  // first. For as long again after the link has left the relay, copies of
+  // every datagram along the relay too, so that the other end, which may
+  // not hear the direct path, misses nothing (make before break). No
+  // checks once the session is ending (`final`): the other end might stop
+  // before its next sample through the relay brings this end's link back
+  // from a path open one way only.
+  void sent(Nanos now, HapticLink& link, bool final) {
+    const bool on_relay = relayed(link);
+    if (on_relay) {
+      relay_route_ = link.route();
+    } else if (was_relayed_) {
+      direct_at_ = now;
+    }
+    was_relayed_ = on_relay;
+    const Nanos every = cfg_.direct_check_interval;
+    if (every <= 0) return;
+    if (!on_relay) {
+      if (direct_at_ >= 0 && now - direct_at_ < every) link.race_copy(now, relay_route_);
+      return;
+    }
+    if (final || now < next_check_) return;
+    for (const auto& t : net::sendable(rv_.peer(), socket_)) link.race_copy(now, net::Route{t, false});
+    next_check_ = now + every;
+  }
+
+  // Whether the link runs through the slave's relay: this end's, or, at the
+  // master, which has none, the slave's relayed address.
+  bool relayed(const HapticLink& link) const {
+    if (link.route().relayed) return true;
+    const auto relays = net::sendable(rv_.peer_relays(), socket_);
+    return std::find(relays.begin(), relays.end(), link.peer()) != relays.end();
+  }
+  // When the link last left the relay for a direct path, or -1.
+  Nanos direct_at() const { return direct_at_; }
+
   std::uint64_t rejoins() const { return rejoins_; }
 
  private:
@@ -343,6 +382,9 @@ class SessionRejoin {
   std::vector<net::Endpoint> to_;
   Nanos punch_until_ = -1, next_punch_ = 0, next_rejoin_ = 0;
   std::vector<std::uint8_t> punch_;
+  Nanos next_check_ = 0, direct_at_ = -1;
+  bool was_relayed_ = false;
+  net::Route relay_route_;
 };
 
 // The master's side of the handshake: resends its hello every
@@ -646,6 +688,7 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
       const Sample s =
           st.send ? st.sample : Sample{ctl.velocity(), x, ctl.reported_energy()};
       link.send(now, s, net, final);
+      if (rejoin) rejoin->sent(now, link, final);
     }
 
     if (own.size() < kSeriesLimit) own.emplace_back(now, net);
@@ -671,7 +714,13 @@ MasterNodeReport run_master_node(net::UdpSocket& socket, const net::Endpoint& sl
   rep.skipped = ticker.skipped();
   rep.lateness = net::delay_stats(ticker.lateness());
   rep.link = link.counters();
-  if (rejoin) rep.rejoins = rejoin->rejoins();
+  if (rejoin) {
+    rep.rejoins = rejoin->rejoins();
+    rep.relayed_at_end = rejoin->relayed(link);
+    if (!rep.relayed_at_end && rejoin->direct_at() >= 0) {
+      rep.direct_after = rejoin->direct_at() - start;
+    }
+  }
   rep.master_pc_active =
       rep.ticks ? static_cast<double>(pc_count) / static_cast<double>(rep.ticks) : 0.0;
   rep.actuation_delay = ctl.actuation_delay();
@@ -1078,6 +1127,7 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
                                     transmitted_energy(ctl, sc.passivity)};
         s.aux = x;  // for monitoring at the master
         link.send(now, s, ctl.terminal_net(), final);
+        if (rejoin) rejoin->sent(now, link, final);
       }
 
       if (st.pc_active) ++pc_count;
@@ -1106,7 +1156,13 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
     rep.skipped = ticker.skipped();
     rep.lateness = net::delay_stats(ticker.lateness());
     rep.link = link.counters();
-    if (rejoin) rep.rejoins = rejoin->rejoins();
+    rep.relayed_at_end = link.route().relayed;
+    if (rejoin) {
+      rep.rejoins = rejoin->rejoins();
+      if (!rep.relayed_at_end && rejoin->direct_at() >= 0) {
+        rep.direct_after = rejoin->direct_at() - start;
+      }
+    }
     rep.slave_net = ctl.terminal_net();
     rep.slave_pc_active =
         rep.ticks ? static_cast<double>(pc_count) / static_cast<double>(rep.ticks) : 0.0;

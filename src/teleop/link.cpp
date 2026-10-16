@@ -99,7 +99,7 @@ void HapticLink::send(Nanos now, const Sample& s, double monitor, bool final) {
   ++counters_.sent;
 
   if (!emulation_) {
-    transmit(buf_);
+    transmit(buf_, route_);
     return;
   }
   const auto transit = emulation_->transit(now, buf_.size());
@@ -107,7 +107,7 @@ void HapticLink::send(Nanos now, const Sample& s, double monitor, bool final) {
     ++counters_.emulated_lost;
     return;
   }
-  pending_.push(Pending{now + *transit, pending_order_++, buf_});
+  pending_.push(Pending{now + *transit, pending_order_++, buf_, std::nullopt});
 }
 
 bool HapticLink::send_copy(const net::Route& to) {
@@ -116,13 +116,30 @@ bool HapticLink::send_copy(const net::Route& to) {
   return paths_->send(to, buf_.data(), buf_.size());
 }
 
-void HapticLink::transmit(const std::vector<std::uint8_t>& datagram) {
-  if (!paths_->send(route_, datagram.data(), datagram.size())) ++counters_.send_failed;
+void HapticLink::race_copy(Nanos now, const net::Route& to) {
+  if (!sealed_ || counters_.sent == 0) return;
+  if (!emulation_) {
+    paths_->send(to, buf_.data(), buf_.size());
+    return;
+  }
+  // Lost copies are not counted: they were not samples.
+  if (const auto transit = emulation_->transit(now, buf_.size())) {
+    pending_.push(Pending{now + *transit, pending_order_++, buf_, to});
+  }
+}
+
+void HapticLink::transmit(const std::vector<std::uint8_t>& datagram, const net::Route& to) {
+  if (!paths_->send(to, datagram.data(), datagram.size())) ++counters_.send_failed;
 }
 
 void HapticLink::pump(Nanos now) {
   while (!pending_.empty() && pending_.top().release <= now) {
-    transmit(pending_.top().bytes);
+    const Pending& p = pending_.top();
+    if (p.to) {
+      paths_->send(*p.to, p.bytes.data(), p.bytes.size());
+    } else {
+      transmit(p.bytes, route_);
+    }
     pending_.pop();
   }
 }

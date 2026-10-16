@@ -988,3 +988,164 @@ TEST_CASE(relayed_session_survives_a_rebinding_nat_between_symmetric_nats) {
   CHECK(r.slave[0].link.moved == 1);
   CHECK(r.slave[0].link.foreign == 0 && r.master.link.foreign == 0);
 }
+
+namespace {
+
+// Two NATs that map independently of the destination and filter by
+// address and port, and a slave's NAT that at first lets in only the
+// rendezvous server and the TURN server, which holds what it relays for
+// 20 ms each way: the session starts on the slave's relay, whose round
+// trip is 40 ms longer than the direct path's. With `open_after`, the
+// slave's NAT lets peers in again once it has delivered that many of the
+// relay's datagrams (about one per millisecond of the session); the
+// direct path is then open both ways. Without, it stays open from the
+// slave to the master only: the master's NAT lets the slave in, for the
+// master has sent to it, and the slave's lets the master in through the
+// relay alone. Checks for a direct path every `check_interval` (0 never).
+Relayed opening_session(std::optional<std::uint64_t> open_after, Nanos check_interval) {
+  using test::SimNat;
+  UdpSocket server_sock(ep("127.0.0.1", 0));
+  const Endpoint server = ep("127.0.0.1", server_sock.local_endpoint().port());
+  std::atomic<bool> stop_server{false}, stop_slave{false};
+  std::thread srv([&] { run_rendezvous_server(server_sock, &stop_server); });
+  test::SimTurn turn_server("tuushin", "relay-secret");
+  turn_server.set_delay(std::chrono::milliseconds(20));
+  turn_server.start();
+
+  UdpSocket master_sock(ep("127.0.0.1", 0)), slave_sock(ep("127.0.0.1", 0));
+  SimNat master_nat(server, SimNat::Mapping::kEndpointIndependent,
+                    SimNat::Filtering::kAddressPortDependent);
+  SimNat slave_nat(server, SimNat::Mapping::kEndpointIndependent,
+                   SimNat::Filtering::kAddressPortDependent);
+  slave_nat.block_peers({turn_server.endpoint()});
+  const crypto::Key psk = crypto::random_key();
+  RendezvousConfig rc;
+  rc.id = crypto::rendezvous_id(psk);
+  rc.wait = 2 * kNanosPerSecond;
+  rc.ready_wait = 200 * kNanosPerMilli;
+  rc.relay_delay = 300 * kNanosPerMilli;
+  rc.direct_check_interval = check_interval;
+  RendezvousConfig master_rc = rc, slave_rc = rc;
+  master_rc.server = master_nat.proxy(server);
+  slave_rc.server = slave_nat.proxy(server);
+  const Endpoint turn_at = slave_nat.proxy(turn_server.endpoint());
+  master_nat.start();
+  slave_nat.start();
+
+  Relayed out;
+  std::mutex mu;
+  const Nanos period = kNanosPerMilli;
+  SimulatedSlave slave_dev(1.0, 2.0, WallParams{}, period, 10, monotonic_now(), 0.0);
+  slave_dev.set_watchdog(2 * period);
+  SlaveNodeConfig scfg;
+  scfg.control.dt = period;
+  scfg.control.hold_after = 150 * kNanosPerMilli;
+  scfg.once = true;
+  scfg.psk = psk;
+  scfg.rendezvous = slave_rc;
+  scfg.relay = RelayConfig{turn_at, "tuushin", "relay-secret"};
+  SlaveNodeHooks hooks;
+  hooks.on_rendezvous = [&](const std::string& what) {
+    std::lock_guard<std::mutex> lock(mu);
+    out.slave_events.push_back(what);
+  };
+  std::thread slave([&] { out.slave = run_slave_node(slave_sock, slave_dev, scfg, hooks, &stop_slave); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  std::atomic<bool> master_done{false};
+  std::thread opener([&] {
+    if (!open_after) return;
+    while (!master_done.load() && slave_nat.delivered() < *open_after) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    slave_nat.unblock_peers();
+  });
+
+  SimulatedMaster master_dev(0.2, 0.5, OperatorParams{}, period, 10, monotonic_now());
+  master_dev.set_watchdog(2 * period);
+  MasterNodeConfig mcfg;
+  mcfg.control.dt = period;
+  mcfg.control.model_mass = 0.2;
+  mcfg.duration = 1500 * kNanosPerMilli;
+  mcfg.psk = psk;
+  mcfg.hello_interval = 50 * kNanosPerMilli;
+  mcfg.handshake_timeout = 1500 * kNanosPerMilli;
+  mcfg.rendezvous = master_rc;
+  out.master = run_master_node(master_sock, Endpoint{}, master_dev, mcfg);
+  master_done.store(true);
+  opener.join();
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  stop_slave.store(true);
+  slave.join();
+  out.relayed_datagrams = turn_server.data_indications() + turn_server.channel_data();
+  out.allocations = turn_server.allocations();
+  stop_server.store(true);
+  srv.join();
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE(relayed_session_moves_to_a_direct_path_that_opens) {
+  // The session starts on the relay; about 300 ms in, the slave's NAT lets
+  // peers in. The next check's copies win their race against the relay
+  // both ways, and the session runs the direct way from then on, the
+  // relay's copies (make before break) arriving after the originals.
+  const auto r = opening_session(300, 100 * kNanosPerMilli);
+  REQUIRE(r.master.authenticated && !r.master.handshake_failed);
+  REQUIRE(r.slave.size() == 1);
+  CHECK(r.master.relayed && r.slave[0].relayed);
+  CHECK(!r.master.relayed_at_end && !r.slave[0].relayed_at_end);
+  // Opened about 300 ms after the session started on the relay, and found
+  // within a check or two of that.
+  CHECK(r.master.direct_after > 250 * kNanosPerMilli);
+  CHECK(r.master.direct_after < 800 * kNanosPerMilli);
+  CHECK(r.slave[0].direct_after > 250 * kNanosPerMilli);
+  CHECK(r.slave[0].direct_after < 800 * kNanosPerMilli);
+  // Until the slave's NAT opened, the path was open from the slave to the
+  // master only, and the master's link went there and back at each of the
+  // slave's checks (below); it then went there for good.
+  CHECK(r.master.link.moved % 2 == 1);
+  CHECK(r.slave[0].link.moved == 1);
+  // The round trip without the relay's 40 ms.
+  CHECK(r.master.rtt.min < 10e6);
+  CHECK(r.master.link.received > 0.95 * static_cast<double>(r.slave[0].link.sent));
+  CHECK(r.slave[0].link.received > 0.95 * static_cast<double>(r.master.link.sent));
+  // None of the master's samples went missing on the way, before the
+  // opening or at it (without the copies along the relay, about 20 at
+  // each of the slave's checks before it).
+  CHECK(r.slave[0].link.missing < 10);
+  CHECK(r.master.slave_final && r.slave[0].ended_by_final);
+  CHECK(r.slave[0].link.foreign == 0 && r.master.link.foreign == 0);
+}
+
+TEST_CASE(relayed_session_stays_on_the_relay_without_checks) {
+  // The control: the same opening, and no checks.
+  const auto r = opening_session(300, 0);
+  REQUIRE(r.master.authenticated && r.slave.size() == 1);
+  CHECK(r.master.relayed && r.master.relayed_at_end && r.slave[0].relayed_at_end);
+  CHECK(r.master.direct_after < 0 && r.slave[0].direct_after < 0);
+  CHECK(r.master.link.moved == 0 && r.slave[0].link.moved == 0);
+  CHECK(r.master.rtt.min > 35e6);
+  CHECK(r.slave[0].link.received > 0.95 * static_cast<double>(r.master.link.sent));
+}
+
+TEST_CASE(relayed_session_loses_nothing_to_a_path_open_one_way) {
+  // The direct path stays open from the slave to the master only. Each
+  // check moves the master's link to it, where its samples stop at the
+  // slave's NAT; their copies through the relay reach the slave, until
+  // the slave's next sample through the relay moves the master back.
+  // Without those copies, every check would lose the master's samples of
+  // a period and the relay's 20 ms.
+  const auto r = opening_session(std::nullopt, 100 * kNanosPerMilli);
+  REQUIRE(r.master.authenticated && r.slave.size() == 1);
+  CHECK(r.master.relayed && r.master.relayed_at_end && r.slave[0].relayed_at_end);
+  CHECK(r.master.direct_after < 0 && r.slave[0].direct_after < 0);
+  CHECK(r.master.link.moved >= 10);
+  CHECK(r.master.link.moved % 2 == 0);
+  CHECK(r.slave[0].link.moved == 0);
+  CHECK(r.slave[0].link.missing < 10);
+  CHECK(r.slave[0].link.received > 0.97 * static_cast<double>(r.master.link.sent));
+  CHECK(r.master.link.received > 0.97 * static_cast<double>(r.slave[0].link.sent));
+  CHECK(r.slave[0].link.foreign == 0 && r.master.link.foreign == 0);
+}

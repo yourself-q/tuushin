@@ -59,6 +59,16 @@ class SimNat {
   // the next datagram of an inside socket to any X leaves from a new
   // outside port.
   void rebind() { rebind_.store(true); }
+  // While on, drops what arrives from outside other than the server's and
+  // `allowed`'s (a TURN server, say), whatever the inside sent: a firewall
+  // that lets in only those. Turning it on is before start() only; it may
+  // be turned off at any time.
+  void block_peers(std::vector<net::Endpoint> allowed) {
+    allowed_.clear();
+    for (const auto& a : allowed) allowed_.push_back(a.canonical());
+    blocking_.store(true);
+  }
+  void unblock_peers() { blocking_.store(false); }
 
   // Datagrams from outside dropped by the filter.
   std::uint64_t filtered() const { return filtered_.load(); }
@@ -139,8 +149,10 @@ class SimNat {
         while (const auto n = outsides_[i]->socket.recv_from(buf.data(), buf.size(), &from)) {
           const net::Endpoint y = from.canonical();
           const auto& sent = outsides_[i]->sent;
-          if (filtering_ == Filtering::kAddressPortDependent &&
-              std::find(sent.begin(), sent.end(), y) == sent.end()) {
+          const bool blocked = blocking_.load() && y != server_ &&
+                               std::find(allowed_.begin(), allowed_.end(), y) == allowed_.end();
+          if (blocked || (filtering_ == Filtering::kAddressPortDependent &&
+                          std::find(sent.begin(), sent.end(), y) == sent.end())) {
             filtered_.fetch_add(1);
             continue;
           }
@@ -161,7 +173,8 @@ class SimNat {
   const Filtering filtering_;
   std::vector<std::unique_ptr<Proxy>> proxies_;
   std::vector<std::unique_ptr<Outside>> outsides_;
-  std::atomic<bool> stop_{false}, rebind_{false};
+  std::vector<net::Endpoint> allowed_;
+  std::atomic<bool> stop_{false}, rebind_{false}, blocking_{false};
   std::atomic<std::uint64_t> filtered_{0}, delivered_{0};
   std::thread thread_;
 };
