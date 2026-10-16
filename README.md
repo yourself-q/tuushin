@@ -1305,9 +1305,16 @@ measured and one after, and in one of two with the device's clock
 100 ppm off, each time at the same point of the hand's motion: the rise
 took out none of the 0.066 to 0.085 mJ of tax it cost, and pushed the
 knob back with 0.038 to 0.11 mJ; the master's balance covered all but
-0.031 to 0.094 mJ of the two. And the tax of a rise the device holds
-back stays in the books until the State that gives it back arrives, a
-round trip and a State's age after the command: 0.018 mJ at the start
+0.031 to 0.094 mJ of the two. The tax of a rise is in the books from
+the command on, the input that is to repay it only from the States that
+report it, within the four samples the rise was granted on (above): in
+a 10 s run the slave's store fell below zero this way 6 to 26 times, at
+the table's tick mostly for two samples and by up to 0.089 mJ, at 1 ms
+for four and by up to 0.131 mJ. The master's balance covered nearly all
+of it; it was 0.005 and 0.008 mJ of two runs' lowest margins, and all of
+one under QEMU, 0.025 mJ. And the tax of a rise the device holds back
+stays in the books until the State that gives it back arrives, a round
+trip and a State's age after the command: 0.018 mJ at the start
 of one run, whose slave's host raised the force on a knob at rest every
 few milliseconds, and the device held each rise back.
 
@@ -1379,11 +1386,12 @@ few milliseconds, and the device held each rise back.
   lag behind a stiff contact's push, overruns the cap by up to 70 µJ at
   a 5 kHz tick and 115 µJ at 1 kHz in the lab. The teleoperator's margin
   still dips, by 0.001 to 0.094 mJ in the lab and under QEMU (under 0.04
-  in all but one run), and the tax of a rise the device holds back is
-  spent in the host's books until the device gives it back, a round trip
-  later (A device in the loop, above). The prediction assumes a rigid
-  shaft; a compliant coupling between the motor and the knob is not
-  modelled.
+  in all but one run), from those overruns and from the books in flight:
+  the tax of a rise is booked up to four samples before the input that
+  repays it, and that of a rise the device holds back is spent in the
+  host's books until the device gives it back, a round trip later (A
+  device in the loop, above). The prediction assumes a rigid shaft; a
+  compliant coupling between the motor and the knob is not modelled.
 - **Only the slave takes a relay, over UDP.** One relay is enough to cross
   both NATs, but a slave without one cannot be reached through a symmetric
   NAT, and a master cannot offer a relay of its own. There is no TURN over
