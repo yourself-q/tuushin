@@ -59,8 +59,10 @@ enum class RelayTransport { kUdp, kTcp, kTls };
 // for where a direct path cannot be opened: both ends behind NATs that
 // pick a new outside port for every destination (rendezvous.hpp). Over
 // TCP a lost segment holds back what follows it until it is sent again
-// (a retransmission timeout of 200 ms or more), and the arrival time of a
-// datagram is when it was read, not when the kernel took it.
+// (about a round trip later, as the segments after it bring duplicate
+// acknowledgements; after a retransmission timeout of 200 ms or more if
+// the retransmission is lost too), and the arrival time of a datagram is
+// when it was read, not when the kernel took it.
 class Paths {
  public:
   explicit Paths(UdpSocket& direct);
