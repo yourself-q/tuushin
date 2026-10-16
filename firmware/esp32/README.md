@@ -36,20 +36,27 @@ temperature (copper, about 0.4 % a kelvin). The work each State reports is
 the torque times the displacement, which the host's energy books use: an
 error in `kt / R` is an error in them. See First power-on for measuring
 it. The torque booked is the one the windings' current makes, which
-follows the voltage over their `L / R` (`CONFIG_TUUSHIN_PHASE_INDUCTANCE_UH`)
-from where the PWM's next period starts: the core keeps it as an
-interval, for an `L / R` within 20 % of the one given and any instant in
-the period (`CONFIG_TUUSHIN_CURRENT_LAG_SPREAD_PCT`), books its middle
-and taxes half its width.
+follows the voltage over their `L / R` from where the PWM's next period
+starts: the core keeps it as an interval, for an `L / R` within 20 %
+(`CONFIG_TUUSHIN_CURRENT_LAG_SPREAD_PCT`) of the bounds the calibration
+measures, or of the one given (`CONFIG_TUUSHIN_PHASE_INDUCTANCE_UH`)
+where it does not, and any instant in the period, books its middle and
+taxes half its width.
 
 The calibration finds the motor's electrical zero: it holds the rotor on
 electrical angle 0 with `CONFIG_TUUSHIN_ALIGN_MV` on the d axis, turns the
 field one electrical revolution forward and back, and judges where the
 shaft settled. How far it turned checks the pole pairs (within 8 %, the
-tolerance SimpleFOC uses), and the direction it turned gives the sign. It
-takes 3.1 s, needs the shaft free, and is stored in NVS, so a board that
-has been calibrated starts calibrated. The host calibrates a device that
-is not when it connects (`calibrate=auto`, the default).
+tolerance SimpleFOC uses), and the direction it turned gives the sign.
+Then it measures the windings' `L / R` from the encoder alone
+(`CONFIG_TUUSHIN_IDENTIFY_WINDINGS`; "Measuring the windings" in the top
+README): a q voltage at six frequencies of a few hundred hertz hums the
+shaft by some 8 mrad, and a fit of its response gives `L / R`, within
+about 1 % in simulation. The two take 3.1 s and 4.1 s, need the shaft
+free, and are stored in NVS (version 2, which reads a version 1 record as
+without `L / R`), so a board that has been calibrated starts calibrated.
+The host calibrates a device that is not when it connects
+(`calibrate=auto`, the default).
 
 ## Hardware
 
@@ -131,7 +138,10 @@ parameters to set, from its data or a measurement:
   between two of its terminals;
 - phase inductance, phase to neutral: half of what an LCR meter reads
   between two of its terminals (a GBM2804-100T was measured at 2.0 mH
-  against 6.3 Ω, an `L / R` of 0.32 ms);
+  against 6.3 Ω, an `L / R` of 0.32 ms). The calibration measures `L / R`
+  and uses its own; the one given designs the measurement, which finds
+  the motor's from half or twice it, and stands where the measurement
+  fails;
 - the torque constant, amplitude-invariant (N m per ampere of q-axis
   current), or its KV (rpm per volt of line-to-line peak back-EMF) with
   the torque constant 0: `kt = 1.5 / (sqrt(3) KV 2 pi / 60)`. A listed no-load
@@ -178,8 +188,20 @@ Ctrl-C stops any command and switches the driver off.
    far one electrical turn missed a full one, in electrical radians (0.5
    at most). "calibration failed: pole pairs look like N" means the pole
    pairs are wrong, the align voltage (`CONFIG_TUUSHIN_ALIGN_MV`) is too
-   low to beat the cogging and the friction, or the encoder misreads. The
-   result is stored; later connects skip it.
+   low to beat the cogging and the friction, or the encoder misreads.
+   Then the motor hums for 4.1 s, and the device logs "windings: L/R T us
+   +- S %, delay D us, J I" and "current lag A to B us", the bounds the
+   energy books take. "L/R configured as T us: check L and R" means the
+   one in menuconfig lies outside the measurement's three standard
+   deviations: the inductance or the resistance given is off. "windings
+   not measured (friction too large)", "(shaft held or sprung)", "(inertia
+   not the shaft's alone)" or "(shaft damped: held?)" means the shaft was
+   not free, a hand on the knob or a motor whose friction is too much of
+   the torque at these frequencies; "(ticks missed)" or "(shaft wandered
+   off)" that the servo's ticks came late, the hum's voltage held; either
+   way the configured `L / R` stands and the calibration still succeeds.
+   The result
+   is stored; later connects skip it.
 
 3. **The torque's scale**, before trusting the energy books. First the
    resistance: half of what an ohmmeter reads between two of the motor's
@@ -319,6 +341,11 @@ What it took, and what differs from a chip:
 - Running on a chip: the tick's time at 5 kHz, the encoders' drivers
   (the MT6701's SSI frame and CRC, the AS5047P's parity, the AS5600's
   magnet status), the ADC, and the USB Serial/JTAG link's latency.
+- Measuring the windings on a real motor, against an LCR meter: checked
+  in simulation only, where the motor is the model the fit assumes. The
+  hum's tick costs two or three double sines and cosines (some 30 us of
+  the 200 us by Espressif's figures), and the fit some tens of milliseconds, in one
+  tick with the bridge open; neither is measured on a chip.
 - The encoders' noise, and whether a second transfer is a conversion of
   its own (step 5 above). The noise tax's cost in the tick: computed in
   double precision, in software on these chips, some 5000 cycles a

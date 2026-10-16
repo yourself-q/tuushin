@@ -1467,7 +1467,7 @@ emulator).
 | part | what it is |
 |---|---|
 | `include/tuushin/device/proto.hpp` | The link, compiled by both sides: messages in COBS frames with a CRC-16. The device streams a State every millisecond on its own clock (the encoder count, the speed, the torque applied, the work it booked, and which command was in effect since when); the host sends a torque whenever it has one, which the device applies on its next tick. |
-| `firmware/core` | `fw::DeviceCore`, the servo loop in portable C++ that does not allocate: field-oriented control by voltage, the calibration of the motor's electrical zero, the safety rules (the driver is off until the host enables it, the torque is cut 2 ms after the last command and the driver switched off after 500 ms, a failing encoder or a runaway latches a fault), and the work cap below. `fw::Plant` is a simulated gimbal motor (back-EMF, cogging, friction, a hand that turns it, an object it runs into) for the core to drive. |
+| `firmware/core` | `fw::DeviceCore`, the servo loop in portable C++ that does not allocate: field-oriented control by voltage, the calibration of the motor's electrical zero and of its windings' L / R, the safety rules (the driver is off until the host enables it, the torque is cut 2 ms after the last command and the driver switched off after 500 ms, a failing encoder or a runaway latches a fault), and the work cap below. `fw::Plant` is a simulated gimbal motor (back-EMF, cogging, friction, a hand that turns it, an object it runs into) for the core to drive. |
 | `firmware/esp32` | The core on an ESP32, ESP32-S3 or ESP32-C3 under ESP-IDF, with the parts, the wiring and the bring-up: [firmware/esp32/README.md](firmware/esp32/README.md). Built, and run end to end under QEMU; not yet run on a chip. |
 | `tuushin-devsim` | The core driving the plant in real time behind a pseudo-terminal or a TCP port: a device to develop against with no hardware. |
 | `tuushin-device` | One device on its own, for bringing it up: its Info, its encoder, its calibration, a steady torque to weigh on a scale, a spring to feel. |
@@ -1505,7 +1505,8 @@ What the host takes from the device:
   carries the total. The torque is the one the windings' current makes,
   which follows the voltage over their L / R from where the PWM's next
   period starts: the firmware keeps it as an interval and books its
-  middle (A device's books take the current's lag as configured, below).
+  middle, for an L / R it measures in calibration (Measuring the
+  windings, below).
   The controllers' own estimate, which splits a sample's displacement by
   a model when the force changes within it, missed by hundreds of
   micrometres on a slave pressed into the object. With the device's
@@ -1656,6 +1657,97 @@ trip and a State's age after the command: 0.018 mJ at the start
 of one run, whose slave's host raised the force on a knob at rest every
 few milliseconds, and the device held each rise back.
 
+### Measuring the windings
+
+The books take the torque of the windings' current, which lags the
+voltage by their L / R, and L / R is the number of a gimbal motor least
+known. The listings of the GM2804 give its resistance, 9 Ω at iFlight
+and 5.57 Ω at iPower, and no inductance; the one measurement found, a
+SimpleFOC user's of a GBM2804-100T, is 6.3 Ω and 2.0 mH on the q axis,
+1.5 on the d axis. ODrive's calibration finds gimbal motors' inductance
+outside the range it accepts. The ways to measure L and R at the drive,
+ODrive's and SimpleFOC's calibrations and TI's InstaSPIN motor
+identification, all measure the current, which the boards in mind have
+no sensor for; a search of the literature and of patents found none that
+does it from the shaft's angle alone. A device whose L / R lies outside its bounds
+books work the current did not do, unbounded (Known issues).
+
+So the calibration measures it from the encoder
+(`fw::WindingIdent`, `firmware/core/src/windings.cpp`). Once the
+electrical zero is found, it puts a sinusoidal q voltage on the windings
+at six frequencies, from 625 Hz, or a quarter of the tick's rate if that
+is less, down to a fifth of that, half a second each, sized to move the
+shaft 8 mrad within the 5 V limit and ramped up and down over five
+periods so that the shaft ends where it began (within 1 mrad, 9 on the
+way; it wandered 0.15 rad when the voltage stopped at once). A lock-in
+on the readings gives the angle per volt at each frequency, which the motor's
+equations make
+
+    G(s) = kt e^(−sD) / ((L s + R)(J s² + b s + k) + kt ke s)
+
+for a shaft of inertia J, damping b and a spring k (the cogging about
+its detent): the ratio of its cubic and quadratic coefficients is L / R,
+less b L / (R J), 1e−4 for a free knob. The fit weighs each point by the
+noise the lock-in left, takes in Coulomb friction by its describing
+function and the delay D, and takes out the tick's hold and the images
+it folds back. It rejects a shaft that is not free: friction or cogging
+too large against the inertia's torque, an inertia not within a factor 2
+of the one configured, or damping that would take more than 2 % off L /
+R, which is a hand on the knob.
+
+On the simulated motor of `tests/test_fw_windings.cpp` (1.5 mH, 5 Ω,
+7e−6 kg m², Coulomb friction of 1e−3 N m and cogging of 1.5e−3, the
+encoder's noise half a count, a 50 µs PWM period, a 200 µs tick; 4.1 s
+a run, 8 seeds each):
+
+| | L / R off, on average | spread | σ the fit gives |
+|---|---|---|---|
+| as above | −0.4 % | 1.1 % | 1.3 % |
+| friction 4e−3 N m | +0.9 % | | |
+| cogging 1.2e−2 N m | +0.4 % | | |
+| both at 4e−3 N m | +0.7 % | | |
+| the encoder's noise 2 counts | −1.3 % | 3.6 % | 4.4 % |
+| 0.5 mH (32 seeds) | −0.5 % | 5 % | 5.7 % |
+| 3 mH | +0.3 % | 0.7 % | |
+| PWM period 0, 100 µs | −0.3, 0.0 % | | |
+| a hand on the knob (1e−5 kg m², 2e−3 N m s/rad) | rejected 8 of 8 | | |
+| a 1 ms tick | rejected 8 of 8, friction | | |
+
+At a 1 ms tick, QEMU's, the frequencies come down to 50 to 250 Hz, where
+a gimbal motor's friction is 0.23 of the inertia's torque; L / R came
+out 1 to 5 % high and the fit's check rejects it.
+
+The device then takes L / R within three of the fit's standard
+deviations, with 1 % for what the model leaves out, and widens that by
+the configured spread for the windings' heating (20 %,
+`current_lag_spread`). The bounds are no narrower than the configured
+ones, which are the same spread about a configured L / R: wider, by the
+measurement's own spread (237 to 370 µs for 297, against 250 to 360 for
+300 configured). What the measurement buys is where they lie, about the
+motor's L / R rather than a listing's or an LCR meter's; narrowing them
+takes following the windings' temperature, which is not done. When the
+configured L / R lies outside the fit's three standard deviations, the
+device says so ("L/R configured as 600 us: check L and R"). The fit's D
+is logged but does not narrow the delay the books allow, any within the
+PWM's period: the tick and the PWM run on clocks of their own, so where
+a write lands in the period varies (on the simulated motor at a 200 µs
+tick every write lands on a period's edge, and D came out at the
+period). The bounds are stored with the calibration, and a device
+calibrated before keeps the configured ones until it is calibrated
+again; a fit that fails, or a hand that grips the knob during it, leaves
+the configured ones too, and the calibration succeeds.
+
+```sh
+./build/tools/tuushin-devsim --tcp 47311 --inductance 1.5 --pwm-us 50 --identify-windings &
+./build/tools/tuushin-device tcp:127.0.0.1:47311 calibrate
+```
+
+logged "windings: L/R 301 us +- 1.3 %, delay 46 us, J 7.00e-06" and
+"current lag 239 to 379 us", the calibration 6.9 s in all. The ESP32
+firmware measures by default (`CONFIG_TUUSHIN_IDENTIFY_WINDINGS`), except
+with the AS5600, whose filter lags the readings by more than the
+frequencies' periods. It has not been run on a chip.
+
 ## Known issues
 
 - **Devices need a watchdog.** The stall handling above relies on the
@@ -1736,29 +1828,38 @@ few milliseconds, and the device held each rise back.
   and some forty other operations, about 5000 cycles on an ESP32-S3 by
   Espressif's figures (1619 for a double `cos`, 70 for an addition),
   some 20 µs of the 200 µs tick, also unmeasured.
-- **A device's books take the current's lag as configured.** The
-  current follows the voltage over the windings' L / R, some 0.3 ms on a
-  gimbal motor, from where the PWM's next period starts: a spring the
-  device renders lags by that much, which makes energy the torque set
-  does not, about k ω² (L / R), 0.3 mW for 1 N m/rad at 1 rad/s. The
-  firmware keeps the current's torque as an interval, for an L / R
-  within 20 % of the one configured and any delay within the PWM's
-  period, books its middle, taxes half its width on the travel either
-  way (`fw::CurrentLag`), and keeps room under the work cap for what the
+- **A device's books bound the current's lag by a measurement checked in
+  simulation only.** The current follows the voltage over the windings'
+  L / R, some 0.3 ms on a gimbal motor, from where the PWM's next period
+  starts: a spring the device renders lags by that much, which makes
+  energy the torque set does not, about k ω² (L / R), 0.3 mW for
+  1 N m/rad at 1 rad/s. The firmware keeps the current's torque as an
+  interval, for an L / R within the bounds it measured in calibration
+  (Measuring the windings, above), or within 20 % of the one configured
+  where it did not measure, and any delay within the PWM's period, books
+  its middle, taxes half its width on the travel either way
+  (`fw::CurrentLag`), and keeps room under the work cap for what the
   current flowing will still do. On the simulated motor at 1.5 mH, two
   seconds of a hand pushing into a host's wall at 2 N m/rad made 1.68 mJ
   that books taking the torque set at once missed, ten times their noise
   tax of 0.18 mJ; the interval's books came 0.13 to 0.34 mJ above the
   true work, and its tax took 0.50 to 1.16 mJ besides, with the PWM's
-  period at 0 and 50 µs and the tick at 200 µs and 1 ms. The tax is the
-  width of what the device does not know, L / R's spread and where in
-  the PWM's period a change lands, and measuring both at calibration
-  would narrow it; neither is measured yet. Under a cap of 100 µJ a knob
-  leaving a stop did 37 to 60 µJ of true work, against 48 to 73 µJ
-  without the inductance, and the device overran the cap by at most
-  0.001 µJ. What the model leaves out is not bounded: an L / R outside
-  the spread, the bridge's dead time, the back-EMF's coupling of the
-  axes through the electrical speed times L.
+  period at 0 and 50 µs and the tick at 200 µs and 1 ms (with L / R as
+  configured). Under a cap of 100 µJ a knob leaving a stop did 37 to
+  60 µJ of true work, against 48 to 73 µJ without the inductance, and
+  the device overran the cap by at most 0.001 µJ. The tax is the width
+  of what the device does not know: L / R's spread, which the
+  measurement puts about the motor's L / R but does not narrow, since the
+  windings warm by an amount nobody measures; and where in the PWM's
+  period a change lands, which the tick's clock does not know. The
+  measurement's simulated motor is the model the fit assumes, with
+  friction and cogging, so a real motor's departures from it (the
+  iron's saturation, an inductance that varies with the angle, a
+  coupling between the motor and the knob) are untested, and at a 1 ms
+  tick the fit rejects even the simulated motor and the configured L / R
+  stands. What the model leaves out is not bounded: an L / R outside the
+  bounds, the bridge's dead time, the back-EMF's coupling of the axes
+  through the electrical speed times L.
 - **A device keeps to its work cap closely, not exactly.** What its
   readings cannot foresee, a count's step and the velocity estimate's
   lag behind a stiff contact's push, overruns the cap by up to 70 µJ at
@@ -1841,7 +1942,9 @@ few milliseconds, and the device held each rise back.
   over TCP or TLS, and a relay for the master, for networks that let no
   UDP out; then QUIC datagrams as a transport.
 - The firmware on a chip and a real knob, measured: its timing, its
-  encoder's noise, and the work cap under a real hand.
+  encoder's noise, its windings' L / R against an LCR meter, and the work
+  cap under a real hand; then the windings' temperature followed, to
+  narrow the current's lag.
 - Deadbands that adapt to the measured delay; more degrees of freedom.
 
 ## References
@@ -1868,6 +1971,13 @@ The code cites its sources where it uses them. The main ones:
   systems: application to haptic interfaces", Journal of Robotic Systems
   14(1), 1997, for the damping a sampled spring needs, which sets the
   coupling a device can take.
+- ODrive's motor calibration, SimpleFOC's `characteriseMotor`
+  (docs.simplefoc.com/motor_characterisation) and TI's InstaSPIN-FOC
+  and InstaSPIN-MOTION User's Guide (SPRUHJ1), for the ways of measuring
+  L and R that measure the current; the ODrive forum's "Gimbal motors:
+  inductance out of range" and the SimpleFOC forum's "Measuring gimbal
+  resistance, inductance, and KV using SimpleFOC", for what is known of
+  a gimbal motor's windings.
 - R. D. Lorenz and K. W. Van Patten, "High-resolution velocity estimation
   for all-digital, AC servo drives", IEEE T-IA 27(4), 1991, for the
   velocity observer with the torque fed forward that the work cap
