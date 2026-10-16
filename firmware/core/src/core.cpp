@@ -199,8 +199,11 @@ void DeviceCore::tick() {
       foc(host, omega, vbus);
     }
     if (capped) {
+      // The tax of the torques applied, not of the ones commanded: the
+      // rise beyond what the host taxed is the device's to tax, and what
+      // the host taxed beyond the rise made, the device's to give back.
       const float g = growth(before, host) - taxed;
-      if (g > 0.0f) tax_ += static_cast<double>(g) * static_cast<double>(count_to_rad);
+      tax_ += static_cast<double>(g) * static_cast<double>(count_to_rad);
     }
   }
 
@@ -499,7 +502,14 @@ void DeviceCore::foc(float host, float omega, float vbus) {
 // books a count's worth of work each time the device lets the torque back
 // on for the step that went the torque's way: 0.5 mJ in a second, held by
 // a hand, that the motor never did. So the device pays q times the rise
-// beyond what the last tick kept and the host taxed.
+// beyond what the last tick kept and the host taxed, and gives back q
+// times what the host taxed beyond the rise it made: a rise the cap held
+// back was never made, and its tax, booked anyway, stayed in the host's
+// books as energy spent. On the emulated board the host of a slave at
+// rest against a wall raised the force twice on the strength of a push
+// the wall had just stopped, and booked 0.09 mJ of tax for rises the
+// device never made; the store stayed that far down for as long as the
+// slave stayed there. Given back, the tax returns with the next State.
 //
 // It then keeps two limits, as the host's predictive PC does
 // (control/predictive_pc.hpp, "Repaying the tax"):

@@ -826,3 +826,52 @@ TEST_CASE(fw_work_cap_spent_keeps_the_torque_steady) {
     }
   }
 }
+
+TEST_CASE(fw_work_cap_taxes_the_torques_applied) {
+  // The host's books tax the rises it commands; the device taxes those it
+  // makes beyond them and gives back the tax of those it holds back, so
+  // that the two together tax the torques applied. A cap spent while the
+  // knob is at rest holds back every rise, whose tax comes back; a cap
+  // far off then lets the torque on, and the device taxes that rise.
+  PlantParams p = quiet_plant();
+  Rig rig(p, config_for(p));
+  REQUIRE(rig.calibrate());
+  const double q = kTwoPiD / p.counts_per_rev;
+  auto growth = [](double from, double to) {
+    const double kept = from * to > 0.0 ? std::fabs(from) : 0.0;
+    return std::max(0.0, std::fabs(to) - kept);
+  };
+  const double w0 = rig.core.last_state().work;
+  const double tax0 = rig.core.last_state().tax;
+  double host_tax = 0.0;
+  double sent = 0.0;
+  double most = 0.0;  // the largest torque applied
+  auto hold = [&](double dur, double torque, double cap) {
+    const double t = static_cast<float>(torque);
+    host_tax += q * growth(sent, t);
+    sent = t;
+    auto next = std::make_shared<double>(rig.t);
+    rig.run(dur, [&](double now) {
+      most = std::max(most, std::fabs(static_cast<double>(rig.core.applied_torque())));
+      if (now + 1e-12 < *next) return;
+      *next += 1e-3;
+      rig.command_capped(torque, cap);
+    });
+  };
+  const double spent = w0 - 1e-3;
+  hold(1e-3, 0.02, spent);
+  hold(1e-3, 0.03, spent);
+  hold(1e-3, 0.0, spent);
+  hold(5e-3, 0.01, spent);
+  CHECK(most < 1e-6);
+  const State s1 = rig.states.back();
+  CHECK(s1.work == w0);
+  CHECK_NEAR(s1.tax - tax0, -host_tax, 1e-10);
+  CHECK_NEAR(host_tax, q * 0.04, 1e-10);
+
+  hold(5e-3, 0.01, w0 + 1.0);
+  CHECK_NEAR(most, 0.01, 1e-4);
+  const State s2 = rig.states.back();
+  CHECK(s2.work > w0);
+  CHECK_NEAR(host_tax + (s2.tax - tax0), q * 0.01, 1e-10);
+}

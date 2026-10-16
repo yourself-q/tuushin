@@ -144,11 +144,14 @@ struct State {
   // (J): what the host's energy books try to know, from the device's side.
   double work = 0.0;
   // The quantization tax the device booked for raising the torque on its
-  // own, under a work cap, since it started (J). Work counted in encoder
-  // counts is off by up to half a count times each change of the torque
-  // (summed by parts), and a host that books it with its own changes'
-  // tax (control::quantization_tax) knows nothing of the device's. The
-  // cap holds work + tax. 0 from a device that does not send it.
+  // own, under a work cap, since it started, less the tax of the host's
+  // rises the cap kept it from making (J): with the host's, the tax of
+  // the torques applied. Work counted in encoder counts is off by up to
+  // half a count times each change of the torque (summed by parts), and
+  // a host that books it with its own changes' tax
+  // (control::quantization_tax) knows nothing of the device's. It falls
+  // as well as rises, below 0 too. The cap holds work + tax. 0 from a
+  // device that does not send it.
   double tax = 0.0;
 };
 

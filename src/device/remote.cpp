@@ -587,7 +587,8 @@ std::optional<double> RemoteDevice::port_work() const {
   if (!connected_) return std::nullopt;
   // The device sums the torque times the angle; with x = sign r theta and
   // the torque sign f r, that is f times x as the controllers see them.
-  // Its tax is work the books have to count as done.
+  // Its tax is work the books have to count as done, less the tax of the
+  // rises it held back, which the books took when they were commanded.
   return used_.work - work0_ + (used_.tax - tax0_);
 }
 
