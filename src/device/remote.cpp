@@ -413,7 +413,7 @@ void RemoteDevice::connect() {
     calibrated = (state_.flags & kStateCalibrated) != 0;
   }
   if (cfg_.calibrate == Calibrate::kAlways || (!calibrated && cfg_.calibrate == Calibrate::kIfNeeded)) {
-    say("calibrating: let go of the knob; it turns a little each way");
+    say("calibrating: let go of the knob; it turns a little each way, and may hum for a few seconds");
     {
       std::lock_guard<std::mutex> lk(mu_);
       acks_.clear();

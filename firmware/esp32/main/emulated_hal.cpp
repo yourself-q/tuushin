@@ -30,6 +30,10 @@ fw::DeviceConfig EmulatedHal::config() {
   c.voltage_limit = CONFIG_TUUSHIN_VOLTAGE_LIMIT_MV * 1e-3f;
   c.align_voltage = CONFIG_TUUSHIN_ALIGN_MV * 1e-3f;
   c.tick_us = CONFIG_TUUSHIN_TICK_US;
+  c.current_lag_spread = CONFIG_TUUSHIN_CURRENT_LAG_SPREAD_PCT * 0.01f;
+#if CONFIG_TUUSHIN_IDENTIFY_WINDINGS
+  c.identify_windings = true;
+#endif
   return c;
 }
 

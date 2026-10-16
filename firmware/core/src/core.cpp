@@ -16,7 +16,10 @@ using namespace tuushin::device;
 // electrical revolution forward, then back, settling at each end. Where the
 // shaft settles gives the electrical zero, which way it turned the
 // direction, and how far it turned checks the pole pairs (SimpleFOC's
-// initFOC does the same, forward only).
+// initFOC does the same, forward only). Then, with identify_windings, the
+// windings' L / R from the encoder alone (WindingIdent): a few seconds of
+// a hum at 125 to 625 Hz (at a 200 us tick) that turns the shaft by a few
+// milliradians.
 constexpr std::uint32_t kSettle0Us = 700000;  // the first 200 ms ramp the voltage up
 constexpr std::uint32_t kRampUs = 200000;
 constexpr std::uint32_t kSweepUs = 800000;
@@ -93,6 +96,7 @@ void DeviceCore::begin() {
   hal_.set_duties(0.0f, 0.0f, 0.0f);
   Calibration c;
   if (hal_.load_calibration(&c) && c.valid && (c.direction == 1 || c.direction == -1)) cal_ = c;
+  use_lag();
   std::uint32_t raw;
   if (hal_.read_encoder(&raw)) {
     turns_.reset(raw);
@@ -388,6 +392,10 @@ void DeviceCore::start_calibration(std::uint32_t now) {
 }
 
 void DeviceCore::run_calibration(std::uint32_t now) {
+  if (cal_phase_ == CalPhase::kIdentify) {
+    identify(now);
+    return;
+  }
   const std::uint32_t t = now - cal_start_us_;
   const float count_to_rad = kTwoPi / static_cast<float>(cfg_.counts_per_rev);
   auto record = [&](int i) {
@@ -429,6 +437,7 @@ void DeviceCore::run_calibration(std::uint32_t now) {
       }
       break;
     case CalPhase::kNone:
+    case CalPhase::kIdentify:
       break;
   }
   if (cal_phase_ != CalPhase::kNone) {
@@ -449,32 +458,122 @@ void DeviceCore::run_calibration(std::uint32_t now) {
   // cogging and friction, too little for a motor with other pole pairs
   // (7 against 6 or 8, 11 against 12).
   const float error = std::fabs(std::fabs(moved) * p - kTwoPi);
-  Ack a;
-  a.of = MsgType::kCalibrate;
   char text[kMaxLogText + 1];
   if (error > 0.5f || std::fabs(back) * p > 0.25f * kPi) {
     const float seen = std::fabs(moved) > 1e-6f ? kTwoPi / std::fabs(moved) : 0.0f;
     std::snprintf(text, sizeof text, "calibration failed: pole pairs look like %.1f, back %.3f rad",
                   static_cast<double>(seen), static_cast<double>(back));
     log(text);
-    a.status = AckStatus::kFailed;
     latch(Fault::kCalibration);
-  } else {
-    Calibration c;
-    c.valid = true;
-    c.direction = moved > 0.0f ? 1 : -1;
-    const float z0 = static_cast<float>(c.direction) * p * cal_theta_[0];
-    const float z2 = static_cast<float>(c.direction) * p * cal_theta_[2];
-    c.zero_electric = wrap_two_pi(std::atan2(std::sin(z0) + std::sin(z2), std::cos(z0) + std::cos(z2)));
-    cal_ = c;
-    hal_.store_calibration(c);
-    std::snprintf(text, sizeof text, "calibrated: direction %d, zero %.4f rad, off by %.3f rad",
-                  c.direction, static_cast<double>(c.zero_electric), static_cast<double>(error));
-    log(text);
-    a.value = c.zero_electric;
+    Ack a;
+    a.of = MsgType::kCalibrate;
+    a.status = AckStatus::kFailed;
+    std::uint8_t frame[kMaxFrame];
+    send(frame, encode(a, frame));
+    return;
   }
+  Calibration c;
+  c.valid = true;
+  c.direction = moved > 0.0f ? 1 : -1;
+  const float z0 = static_cast<float>(c.direction) * p * cal_theta_[0];
+  const float z2 = static_cast<float>(c.direction) * p * cal_theta_[2];
+  c.zero_electric = wrap_two_pi(std::atan2(std::sin(z0) + std::sin(z2), std::cos(z0) + std::cos(z2)));
+  cal_ = c;
+  std::snprintf(text, sizeof text, "calibrated: direction %d, zero %.4f rad, off by %.3f rad",
+                c.direction, static_cast<double>(c.zero_electric), static_cast<double>(error));
+  log(text);
+  if (!cfg_.identify_windings) {
+    calibrated();
+    return;
+  }
+  // Then the windings' L / R, with the electrical angle now known.
+  const MotorParams& m = cfg_.motor;
+  if (!(cfg_.inertia > 0.0f && m.phase_resistance > 0.0f && m.kt() > 0.0f)) {
+    log("windings not measured: inertia, R or kt not configured");
+    calibrated();
+    return;
+  }
+  WindingIdent::Setup su;
+  su.tick_us = cfg_.tick_us;
+  const float lo = cfg_.current_lag_lo, hi = cfg_.current_lag_hi;
+  su.tau = lo > 0.0f && hi >= lo ? std::sqrt(lo * hi) : hi > 0.0f ? hi : 300e-6f;
+  su.resistance = m.phase_resistance;
+  su.kt = m.kt();
+  su.inertia = cfg_.inertia;
+  su.back_emf = m.back_emf_constant();
+  su.duty_delay = cfg_.duty_delay;
+  su.voltage_limit = voltage_limit(hal_.supply_voltage());
+  ident_.start(su, now);
+  cal_phase_ = CalPhase::kIdentify;
+  drive(true);
+  hal_.set_duties(0.5f, 0.5f, 0.5f);
+}
+
+// A sinusoidal q voltage at the electrical angle read, no more: no
+// back-EMF compensation, which the fit takes in (WindingFit::p1).
+void DeviceCore::identify(std::uint32_t now) {
+  const double theta = static_cast<double>(cal_.direction) * static_cast<double>(turns_.count()) *
+                       static_cast<double>(kTwoPi) / static_cast<double>(cfg_.counts_per_rev);
+  const float u = ident_.step(now, theta);
+  if (ident_.running()) {
+    const float vbus = hal_.supply_voltage();
+    const float most = voltage_limit(vbus);
+    const BridgeVoltages v = space_vector(0.0f, clampf(u, -most, most), electrical_angle(), vbus);
+    hal_.set_duties(v.a / vbus, v.b / vbus, v.c / vbus);
+    return;
+  }
+  // The bridge open while the fit takes its time: 44 us on an Apple M4,
+  // some 2300 double exponentials, sines and cosines among it, which by
+  // Espressif's figures (1619 cycles for a cos) is a few tens of
+  // milliseconds on an ESP32-S3; unmeasured.
+  drive(false);
+  cal_phase_ = CalPhase::kNone;
+  const WindingFit f = ident_.fit();
+  char text[kMaxLogText + 1];
+  if (!f.ok) {
+    std::snprintf(text, sizeof text, "windings not measured (%s)", f.why);
+    log(text);
+    calibrated();
+    return;
+  }
+  // The bounds: the measurement's three standard deviations either way,
+  // and 1 % for what the model leaves out (the bias in simulation), then
+  // the windings' heating.
+  const double rel = f.tau_sd / f.tau;
+  const double sd = std::sqrt(rel * rel + 1e-4);
+  const double heat = 1.0 + std::max(0.0f, cfg_.current_lag_spread);
+  cal_.lag_lo = static_cast<float>(f.tau * (1.0 - 3.0 * sd) / heat);
+  cal_.lag_hi = static_cast<float>(f.tau * (1.0 + 3.0 * sd) * heat);
+  std::snprintf(text, sizeof text, "windings: L/R %.0f us +- %.1f %%, delay %.0f us, J %.2e",
+                f.tau * 1e6, 100.0 * rel, f.delay * 1e6, f.inertia);
+  log(text);
+  std::snprintf(text, sizeof text, "current lag %.0f to %.0f us", cal_.lag_lo * 1e6, cal_.lag_hi * 1e6);
+  log(text);
+  const float lo = cfg_.current_lag_lo, hi = cfg_.current_lag_hi;
+  if (hi > 0.0f) {
+    const double set = lo > 0.0f && hi >= lo ? std::sqrt(lo * hi) : hi;
+    if (set < f.tau * (1.0 - 3.0 * sd) || set > f.tau * (1.0 + 3.0 * sd)) {
+      std::snprintf(text, sizeof text, "L/R configured as %.0f us: check L and R", set * 1e6);
+      log(text);
+    }
+  }
+  calibrated();
+}
+
+void DeviceCore::calibrated() {
+  use_lag();
+  hal_.store_calibration(cal_);
+  Ack a;
+  a.of = MsgType::kCalibrate;
+  a.value = cal_.zero_electric;
   std::uint8_t frame[kMaxFrame];
   send(frame, encode(a, frame));
+}
+
+void DeviceCore::use_lag() {
+  const bool measured = cfg_.identify_windings && cal_.lag_lo > 0.0f && cal_.lag_hi >= cal_.lag_lo;
+  lag_ = measured ? CurrentLag(cal_.lag_lo, cal_.lag_hi, cfg_.duty_delay)
+                  : CurrentLag(cfg_.current_lag_lo, cfg_.current_lag_hi, cfg_.duty_delay);
 }
 
 void DeviceCore::latch(Fault f) {
@@ -482,6 +581,13 @@ void DeviceCore::latch(Fault f) {
   fault_ = f;
   set_enabled(false);
   if (cal_phase_ != CalPhase::kNone) {
+    // Cut short; once the electrical zero is found, it is kept, with L /
+    // R as configured. The host hears of it as a calibration that did not
+    // finish.
+    if (cal_phase_ == CalPhase::kIdentify) {
+      use_lag();
+      hal_.store_calibration(cal_);
+    }
     cal_phase_ = CalPhase::kNone;
     drive(false);
   }
@@ -606,7 +712,7 @@ float DeviceCore::keep_to_cap(float tau, float dt, float before) {
       f0[k] = lag_.ahead(sign, 0.0f, dt);
       f1[k] = lag_.ahead(sign, tau, dt) - f0[k];
     }
-    late += cfg_.current_lag_hi + cfg_.duty_delay;
+    late += lag_.hi() + lag_.delay();
   }
   // The shaft as the rotor alone (share 1) and as held by a hand heavier
   // than any (share 0); the work is convex in the share, so the worse of

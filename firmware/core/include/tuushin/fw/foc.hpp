@@ -155,6 +155,9 @@ class CurrentLag {
   // (s). Both 0: the torque follows at once.
   CurrentLag(float lo, float hi, float delay) : lo_(lo), hi_(hi), delay_(delay) {}
   bool on() const { return hi_ > 0.0f || delay_ > 0.0f; }
+  float lo() const { return lo_; }
+  float hi() const { return hi_; }
+  float delay() const { return delay_; }
   // The torque set from now (N m): driving the windings, or with the
   // bridge open (0), where the current is gone at once at the fastest and
   // runs down over L / R at the slowest.

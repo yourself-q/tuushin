@@ -9,6 +9,7 @@ set(srcs
   calibration_store.cpp
   ${repo}/firmware/core/src/core.cpp
   ${repo}/firmware/core/src/foc.cpp
+  ${repo}/firmware/core/src/windings.cpp
   ${repo}/src/device/proto.cpp
   ${repo}/src/control/noise_tax.cpp
 )

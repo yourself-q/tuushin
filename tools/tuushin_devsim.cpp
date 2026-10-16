@@ -72,6 +72,8 @@ void usage() {
                "                        the current follows the voltage over L / R (0)\n"
                "  --pwm-us US           the PWM's period: a new duty waits for the next\n"
                "                        one (0)\n"
+               "  --identify-windings   measure L / R in calibration, from the encoder\n"
+               "                        alone, as the board does (fw/windings.hpp)\n"
                "  --tick-us US          the servo loop's tick (200; the emulated board's is\n"
                "                        1000)\n"
                "  --ppm PPM             how fast the board's clock runs against the host's\n"
@@ -272,7 +274,7 @@ int main(int argc, char** argv) {
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
   std::signal(SIGPIPE, SIG_IGN);
-  bool pty = false, quiet = false, calibrated = false;
+  bool pty = false, quiet = false, calibrated = false, identify = false;
   int tcp_port = 0;
   std::string bind = "127.0.0.1", path_file;
   double latency_ms = 0.5, duration = 0.0, ppm = 0.0;
@@ -310,6 +312,7 @@ int main(int argc, char** argv) {
       else if (a == "--seed") seed = static_cast<std::uint64_t>(parse_double(next(), "seed"));
       else if (a == "--inductance") pp.phase_inductance = parse_double(next(), "inductance") * 1e-3;
       else if (a == "--pwm-us") pp.pwm_period = parse_double(next(), "pwm-us") * 1e-6;
+      else if (a == "--identify-windings") identify = true;
       else if (a == "--tick-us") tick_us = static_cast<std::uint32_t>(parse_double(next(), "tick-us"));
       else if (a == "--ppm") ppm = parse_double(next(), "ppm");
       else if (a == "--duration") duration = parse_double(next(), "duration");
@@ -348,6 +351,7 @@ int main(int argc, char** argv) {
     hal.set_clock_ppm(ppm);
     fw::DeviceConfig dc = fw::device_config_for(pp, "devsim");
     if (tick_us > 0) dc.tick_us = tick_us;
+    dc.identify_windings = identify;
     if (calibrated) {
       hal.stored.valid = true;
       hal.stored.direction = static_cast<std::int8_t>(pp.direction);

@@ -13,15 +13,19 @@ namespace {
 
 constexpr const char* kNamespace = "tuushin";
 constexpr const char* kKey = "cal";
-constexpr std::uint8_t kVersion = 1;
+constexpr std::uint8_t kVersion = 2;
 
 // What is stored: a version, so that a later layout is not misread.
+// Version 1 had no L / R, which it reads as not measured.
 struct Stored {
   std::uint8_t version;
   std::int8_t direction;
   std::uint8_t pad[2];
   float zero_electric;
+  float lag_lo;
+  float lag_hi;
 };
+constexpr std::size_t kVersion1Size = 8;
 
 TaskHandle_t g_writer = nullptr;
 portMUX_TYPE g_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -34,6 +38,8 @@ void write_now(const fw::Calibration& c) {
   s.version = kVersion;
   s.direction = c.direction;
   s.zero_electric = c.zero_electric;
+  s.lag_lo = c.lag_lo;
+  s.lag_hi = c.lag_hi;
   if (c.valid) {
     nvs_set_blob(h, kKey, &s, sizeof s);
   } else {
@@ -68,14 +74,18 @@ bool CalibrationStore::begin() {
 bool CalibrationStore::load(fw::Calibration* c) {
   nvs_handle_t h;
   if (nvs_open(kNamespace, NVS_READONLY, &h) != ESP_OK) return false;
-  Stored s;
+  Stored s = {};
   std::size_t n = sizeof s;
-  const bool ok = nvs_get_blob(h, kKey, &s, &n) == ESP_OK && n == sizeof s && s.version == kVersion;
+  const bool read = nvs_get_blob(h, kKey, &s, &n) == ESP_OK;
   nvs_close(h);
+  const bool ok = read && ((s.version == kVersion && n == sizeof s) ||
+                           (s.version == 1 && n == kVersion1Size));
   if (!ok) return false;
   c->valid = true;
   c->direction = s.direction;
   c->zero_electric = s.zero_electric;
+  c->lag_lo = s.version == kVersion ? s.lag_lo : 0.0f;
+  c->lag_hi = s.version == kVersion ? s.lag_hi : 0.0f;
   return true;
 }
 

@@ -103,7 +103,28 @@ menu "tuushin device"
                 one divided and multiplied by 1 plus this, and taxes the
                 work that leaves uncertain. The copper's resistance rises
                 by 0.4 % a kelvin, so 20 % is the windings 50 K from
-                where R was measured.
+                where R was measured. With L / R measured in calibration
+                (below), the measurement's bounds widened by this.
+
+        config TUUSHIN_IDENTIFY_WINDINGS
+            bool "Measure L / R in calibration, from the encoder alone"
+            depends on !TUUSHIN_ENCODER_AS5600
+            default y
+            help
+                After the electrical zero, some 4 s of a hum at a few
+                hundred hertz that turns the shaft by a few milliradians;
+                a fit of the encoder's response (fw/windings.hpp) gives L
+                / R within about 1 % at a 200 us tick in simulation, and
+                the current's lag is then bounded about it instead of
+                about the configured one. The shaft must be free: the fit
+                rejects a knob held, or a motor whose friction is too
+                much of its torque (a gimbal motor's at a 1 ms tick), and
+                then the configured L / R stands, as the log says. The
+                configured inertia, R and kt design the hum, and the fit
+                checks the inertia it finds against the configured one;
+                it takes some tens of milliseconds, with the bridge open.
+                Not for the AS5600, whose filter lags the readings by
+                more than the hum's period.
 
         config TUUSHIN_TORQUE_CONSTANT_UNM_PER_A
             int "Torque constant (uN m/A, amplitude-invariant; 0: from KV)"

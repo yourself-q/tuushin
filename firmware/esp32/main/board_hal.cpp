@@ -50,6 +50,10 @@ fw::DeviceConfig board_config() {
     c.current_lag_lo = lag / spread;
     c.current_lag_hi = lag * spread;
   }
+  c.current_lag_spread = CONFIG_TUUSHIN_CURRENT_LAG_SPREAD_PCT * 0.01f;
+#if CONFIG_TUUSHIN_IDENTIFY_WINDINGS
+  c.identify_windings = true;
+#endif
   // The compare registers take a new duty where the timer next reaches
   // zero (Bridge), a period on at the most.
   c.duty_delay = 1.0f / static_cast<float>(CONFIG_TUUSHIN_PWM_HZ);

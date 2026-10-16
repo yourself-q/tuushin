@@ -195,11 +195,11 @@ void report() {
     last_covered = s.covered_us;
     std::printf("emu: t %.1f s  angle %+.3f rad  %+.4f N m  work %.4f J (cap overrun %.1f uJ at most)%s%s%s"
                 "  ticks %" PRIu32 "  missed %" PRIu32 "  worst tick %" PRIu32 " us (integration %" PRIu32
-                " us, load %d%%, lost %lld ms)  timer restarts %" PRIu32 "\n",
+                " us, load %d%%, lost %lld ms)  timer restarts %" PRIu32 "  stack spare %u B\n",
                 s.t, s.angle, s.torque, s.work, s.overrun * 1e6, s.driving ? "  driving" : "",
                 s.calibrating ? "  calibrating" : "", s.fault ? "  FAULT" : "", c.ticks, c.missed,
                 c.worst_tick_us, s.worst_integration_us, load, static_cast<long long>(s.lost_us / 1000),
-                c.rearmed);
+                c.rearmed, static_cast<unsigned>(uxTaskGetStackHighWaterMark(g_servo)));
   }
 }
 
@@ -227,7 +227,11 @@ extern "C" void app_main() {
   g_hal = &hal;
   g_core = &core;
   core.begin();
-  xTaskCreatePinnedToCore(servo, "servo", 6144, nullptr, configMAX_PRIORITIES - 1, nullptr,
+  // The fit of the windings' L / R in calibration takes some 2.5 KB of the
+  // stack below the tick's frame (-fstack-usage for the ESP32-S3:
+  // fit_windings 1440 B, fit_at 400, identify 352). The emulator reports
+  // what was never used ("stack spare").
+  xTaskCreatePinnedToCore(servo, "servo", 8192, nullptr, configMAX_PRIORITIES - 1, nullptr,
                           CONFIG_TUUSHIN_SERVO_CORE);
 #if CONFIG_TUUSHIN_EMULATED
   report();

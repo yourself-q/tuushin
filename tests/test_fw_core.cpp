@@ -129,9 +129,10 @@ struct Rig {
     }
   }
   // Calibrates with the shaft free; true if the device says it succeeded.
-  bool calibrate() {
+  // With identify_windings it takes some 4 s more.
+  bool calibrate(double dur = 3.5) {
     bare(MsgType::kCalibrate);
-    run(3.5);
+    run(dur);
     for (const Ack& a : acks) {
       if (a.of == MsgType::kCalibrate) return a.status == AckStatus::kOk;
     }
@@ -426,6 +427,95 @@ TEST_CASE(fw_calibration_fails_on_wrong_pole_pairs) {
   CHECK(!rig.core.calibration().valid);
   CHECK(rig.logged("calibration failed"));
   CHECK(!rig.hal.driver_on());
+}
+
+TEST_CASE(fw_calibration_measures_the_windings) {
+  // L / R configured twice the motor's: calibration measures it, and the
+  // books follow the measurement's bounds, which hold the motor's and not
+  // the configured one; a device started again takes them from the store.
+  PlantParams p;  // with cogging, friction and encoder noise
+  p.phase_inductance = 1.5e-3;
+  p.pwm_period = 50e-6;
+  const double tau = p.phase_inductance / p.phase_resistance;
+  DeviceConfig c = config_for(p);
+  c.current_lag_lo = static_cast<float>(2.0 * tau / 1.2);
+  c.current_lag_hi = static_cast<float>(2.0 * tau * 1.2);
+  c.identify_windings = true;
+  Rig rig(p, c);
+  // Where the shaft is when the electrical zero is found, and the hum begins.
+  double before = 0.0;
+  bool zeroed = false;
+  rig.bare(MsgType::kCalibrate);
+  rig.run(8.5, [&](double) {
+    if (zeroed || !rig.logged("calibrated:")) return;
+    zeroed = true;
+    before = rig.plant.angle();
+  });
+  bool ok = false;
+  for (const Ack& a : rig.acks) {
+    if (a.of == MsgType::kCalibrate) ok = a.status == AckStatus::kOk;
+  }
+  REQUIRE(ok);
+  for (const auto& l : rig.logs) std::printf("  log: %s\n", l.c_str());
+  CHECK(rig.logged("windings: L/R"));
+  CHECK(rig.logged("check L and R"));
+  const Calibration& cal = rig.core.calibration();
+  CHECK(cal.lag_lo < tau && tau < cal.lag_hi);
+  CHECK(cal.lag_hi < 2.0 * tau / 1.2);
+  CHECK(cal.lag_hi / cal.lag_lo < 1.2 * 1.2 * 1.25);
+  CHECK(rig.core.current_lag().lo() == cal.lag_lo && rig.core.current_lag().hi() == cal.lag_hi);
+  CHECK(rig.core.current_lag().delay() == c.duty_delay);
+  CHECK(rig.hal.stored.lag_lo == cal.lag_lo && rig.hal.stored.lag_hi == cal.lag_hi);
+  CHECK(!rig.hal.driver_on());
+  // The shaft hummed in place.
+  std::printf("  the shaft moved %.1f mrad\n", 1e3 * (rig.plant.angle() - before));
+  CHECK(std::fabs(rig.plant.angle() - before) < 0.02);
+  DeviceCore again(rig.hal, c);
+  again.begin();
+  CHECK(again.current_lag().lo() == cal.lag_lo && again.current_lag().hi() == cal.lag_hi);
+  // Not with the identification off: the configuration's.
+  DeviceConfig off = c;
+  off.identify_windings = false;
+  DeviceCore plain(rig.hal, off);
+  plain.begin();
+  CHECK(plain.current_lag().lo() == c.current_lag_lo && plain.current_lag().hi() == c.current_lag_hi);
+}
+
+TEST_CASE(fw_calibration_keeps_the_configured_lag_when_held) {
+  // A hand takes hold once the electrical zero is found: the fit rejects
+  // the hum's response, and the device keeps the zero and the configured
+  // L / R, and says why.
+  PlantParams p;
+  p.phase_inductance = 1.5e-3;
+  p.pwm_period = 50e-6;
+  DeviceConfig c = config_for(p);
+  c.identify_windings = true;
+  Rig rig(p, c);
+  bool held = false;
+  rig.bare(MsgType::kCalibrate);
+  rig.run(8.5, [&](double t) {
+    if (held || !rig.logged("calibrated:")) return;
+    held = true;
+    HandParams h;
+    h.present = true;
+    h.ref_offset = rig.plant.angle();
+    h.ref_amplitude = 0.0;
+    h.inertia = 1e-5;
+    h.b = 2e-3;
+    rig.plant.set_hand(h, t);
+  });
+  for (const auto& l : rig.logs) std::printf("  log: %s\n", l.c_str());
+  REQUIRE(held);
+  bool ok = false;
+  for (const Ack& a : rig.acks) {
+    if (a.of == MsgType::kCalibrate) ok = a.status == AckStatus::kOk;
+  }
+  CHECK(ok);
+  CHECK(rig.logged("windings not measured"));
+  CHECK(rig.core.calibration().valid);
+  CHECK(rig.core.calibration().lag_hi == 0.0f);
+  CHECK(rig.core.current_lag().lo() == c.current_lag_lo && rig.core.current_lag().hi() == c.current_lag_hi);
+  CHECK(rig.hal.stored.valid);
 }
 
 TEST_CASE(fw_torque_holds_a_spring) {

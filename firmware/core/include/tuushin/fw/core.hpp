@@ -7,6 +7,7 @@
 #include "tuushin/control/noise_tax.hpp"
 #include "tuushin/device/proto.hpp"
 #include "tuushin/fw/foc.hpp"
+#include "tuushin/fw/windings.hpp"
 
 // The servo loop of a one-axis force-feedback device on a microcontroller:
 // encoder in, torque out by field-oriented control, the host link
@@ -40,6 +41,11 @@ struct Calibration {
   bool valid = false;
   std::int8_t direction = 1;  // +1: the electrical angle grows with the encoder's
   float zero_electric = 0.0f;  // rad, theta_e = direction * p * theta_m - zero_electric
+  // The windings' L / R at the least and the most (s) as calibration
+  // measured it (DeviceConfig::identify_windings); 0: not measured, the
+  // configuration's.
+  float lag_lo = 0.0f;
+  float lag_hi = 0.0f;
 };
 
 // What the core needs from the board. No call may block.
@@ -118,6 +124,14 @@ struct DeviceConfig {
   float current_lag_lo = 0.0f;
   float current_lag_hi = 0.0f;
   float duty_delay = 0.0f;
+  // Measure L / R in calibration, after the electrical zero, with the
+  // encoder alone (WindingIdent): the shaft hums for a few seconds. Taken,
+  // it replaces the bounds above with the measurement's, widened by its
+  // own uncertainty and by current_lag_spread either way for the
+  // windings' heating (the copper's resistance rises 0.4 % a kelvin: 0.2
+  // is 50 K); rejected, the device logs why and keeps the configuration's.
+  bool identify_windings = false;
+  float current_lag_spread = 0.2f;
   device::DeviceKind kind = device::DeviceKind::kTorqueMotor;
   std::uint32_t firmware = 0x000200;
   char name[16] = "tuushin";
@@ -137,6 +151,8 @@ class DeviceCore {
   const device::State& last_state() const { return st_; }
   bool enabled() const { return enabled_; }
   const Calibration& calibration() const { return cal_; }
+  // The windings' lag the books follow: as calibrated or as configured.
+  const CurrentLag& current_lag() const { return lag_; }
   device::Fault fault() const { return fault_; }
   // The host's torque as applied in the last tick (after limits and cuts),
   // without the damping the loop adds.
@@ -163,13 +179,17 @@ class DeviceCore {
   float reading_variance() const { return reading_var_; }
 
  private:
-  enum class CalPhase { kNone, kSettle0, kSweepUp, kSettle1, kSweepDown, kSettle2 };
+  enum class CalPhase { kNone, kSettle0, kSweepUp, kSettle1, kSweepDown, kSettle2, kIdentify };
 
   void handle(const device::Message& m, std::uint32_t now);
   void on_command(const device::Command& c, std::uint32_t now);
   void on_set(const device::Set& s);
   void start_calibration(std::uint32_t now);
   void run_calibration(std::uint32_t now);
+  void identify(std::uint32_t now);
+  void calibrated();  // stores the calibration and acknowledges it
+  // The current's lag: as calibration measured it, or as configured.
+  void use_lag();
   void latch(device::Fault f);
   void set_enabled(bool on);
   // The bridge: driving the windings, or open (no current).
@@ -245,6 +265,7 @@ class DeviceCore {
   std::uint32_t cal_start_us_ = 0;
   float cal_theta_[3] = {0.0f, 0.0f, 0.0f};  // shaft angle at the three settles (rad, raw)
   float cal_turn_[3] = {0.0f, 0.0f, 0.0f};   // and over turns
+  WindingIdent ident_;
 
   std::uint16_t state_seq_ = 0;
   std::uint32_t next_state_us_ = 0;  // the next slot on the State lattice
