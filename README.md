@@ -740,7 +740,8 @@ slave asks it to (`net/turn.hpp`, `net/paths.hpp`):
   candidates first and to the relay 1 s later
   (`RendezvousConfig::relay_delay`); a direct path that opens answers well
   within that. It takes the first reply that authenticates, and the session
-  stays on that path.
+  starts on that path; one that starts on the relay moves to a direct path
+  that opens later (below).
 - **The relay carries only sealed datagrams.** TURN authenticates the
   slave's requests with its long-term credentials (MESSAGE-INTEGRITY, RFC
   8489, 9.2), and the client accepts a response to them only with a valid
@@ -780,6 +781,67 @@ link, which a relayed datagram crosses twice:
 No sample was lost in any of them. A relayed session starts about 1 s
 later than a direct one: the master waits `relay_delay` before it tries
 the relay.
+
+A direct path can also open after the session has started on the relay: a
+firewall that lets the other end in only later, a NAT whose mapping was
+not ready when the hellos came, an end that moves to a network without a
+symmetric NAT. While a session runs through the slave's relay, both ends
+check for one every second (`RendezvousConfig::direct_check_interval`):
+
+- **A copy races the relay.** Right after its link sends, an end sends a
+  copy of that datagram to the other end's own candidates. The copy has
+  the original's sequence number, so whichever arrives first is the newest
+  datagram there, and the link follows it (When an end moves, below); the
+  other is a duplicate. A copy that wins moves the other end's link to the
+  direct path, the other end's samples then come that way, and this end's
+  link follows them. A path that is shut, or slower than the relay, loses
+  every race and moves nothing. The checks are the session's own sealed
+  datagrams, so they need no STUN of their own; a WebRTC agent likewise
+  keeps checking the candidate pairs it does not use, and may switch to a
+  better one.
+- **The relay carries copies for one more second (make before break).**
+  After its link has left the relay, an end also sends a copy of every
+  datagram along it, for one interval. A path may be open one way only:
+  the master's NAT lets the slave in, since the master has sent to it,
+  while the slave's still drops the master. The slave's copy then moves
+  the master's link to a path on which the slave hears nothing; the copies
+  along the relay still reach the slave, whose next sample through the
+  relay brings the master back. Without them, each check would cost the
+  master's samples of a period and the relay's delay (about 20 at 1 kHz in
+  the unit tests).
+- **The end that moves first stays off the relay for half a second.** The
+  samples the other end sent along the relay before it heard of the move
+  are newer than the copy that won, and would pull the link straight back.
+  The two ends then go there and back, the stretch on the direct path
+  growing by only 2(R - D) a round trip, R being the relay's round trip
+  and D the direct path's: with the slave 100 ms behind its NAT, the lab's
+  session left the relay only 3.99 s in, after 19 and 23 moves (2.22 s
+  and one each now, below). For half an interval after it left, the link
+  takes what arrives along the relay without following it
+  (`HapticLink::stay_off`), which covers a direct round trip of up to
+  500 ms.
+
+In the lab, `--turn --open-at 3` makes the middle router drop what the
+two NATs send each other until 3 s after the master starts, about 2 s
+into the relayed session (6 s sessions; the times are the master's, from
+the start of its session):
+
+| scenario | result | moves, master / slave | round trip, p50 |
+|---|---|---|---|
+| cone NATs | left the relay 2.022 s in | 1 / 1 | 20.3 ms (about 41 on the relay) |
+| the slave 100 ms behind its NAT | left it 2.222 s in | 1 / 1 | 220.4 ms (about 241) |
+| the master 100 ms behind its NAT | left it 2.222 s in | 1 / 1 | 220.5 ms (about 241) |
+| a carrier-grade NAT behind each NAT | left it 2.043 s in | 1 / 1 | 40.7 ms (about 62) |
+| open from the slave to the master only (`--one-way`) | stayed on the relay | 8 / 0 | 40.7 ms |
+| the slave's NAT symmetric | stayed on the relay: nothing opens | 0 / 0 | 40.8 ms |
+| both NATs symmetric | the same | 0 / 0 | 40.6 ms |
+
+No sample was lost in any of them. Each move to the direct path costs a
+second of the relay carrying everything twice (1000 duplicates at each
+end). In the unit tests (`tests/sim_nat.hpp` and `tests/sim_turn.hpp`),
+with NATs that hold 25 ms each way and a relay 10 ms, so that the direct
+round trip is 100 ms and the relay saves 20, each end moves once; without
+`stay_off`, 11 and 9 times, and the session settles half a second later.
 
 ### When an end moves
 
@@ -1398,8 +1460,15 @@ few milliseconds, and the device held each rise back.
   TCP or TLS for networks that block UDP. The credentials are long-term
   ones; for coturn's time-limited credentials (its `use-auth-secret`),
   compute the user name and password outside and pass them in.
-- **A relayed session stays relayed.** Nothing moves a running session to a
-  direct path that opens later, as ICE's continued checks would. Every
+- **A relayed session checks for a direct path once a second.** A path
+  open one way only costs a detour at every check: the end that hears it
+  follows it for half a second, the other end hearing from it only
+  through the copies along the relay, which carries everything twice for
+  a second. A
+  direct round trip longer than half the interval (500 ms) outlasts
+  `stay_off`, and the ends go there and back before they settle. Nothing
+  moves a session from a direct path back to a relay that has become
+  faster. Between symmetric NATs no check succeeds, as at the start. Every
   master the rendezvous server announces gets a permission on the relay,
   and keeps it until the next allocation.
 - **A move during the handshake is not followed.** The rejoin starts with
@@ -1440,8 +1509,8 @@ few milliseconds, and the device held each rise back.
   `tuushin-probe`, published so that any simulator or testbed can replay
   them (`tuushin-netreplay` on Linux), alongside public sets such as the
   Starlink one above.
-- A relayed session that moves to a direct path once one opens; then QUIC
-  datagrams as a transport.
+- TURN over TCP and TLS for networks that block UDP; host candidates taken
+  again when an end moves; then QUIC datagrams as a transport.
 - The firmware on a chip and a real knob, measured: its timing, its
   encoder's noise, and the work cap under a real hand.
 - Deadbands that adapt to the measured delay; more degrees of freedom.
