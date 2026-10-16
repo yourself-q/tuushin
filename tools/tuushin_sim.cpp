@@ -55,7 +55,9 @@ void usage() {
                "                        wall the master does not render yet\n"
                "  --relax-rate R        model: m/s at which a rendered surface moves away\n"
                "                        from the master to the model's in contact (0.02)\n"
-               "  --active-relax-rate R model: the same towards the master (0)\n"
+               "  --active-relax-rate R model: the same towards the master (0.02)\n"
+               "  --no-yield            model: a force the master's PC cuts leaves the\n"
+               "                        rendered surface where it was\n"
                "  --estimate-damping    model: the slave estimates the wall's damping too\n"
                "  --no-tdpa             same as --passivity none\n"
                "  --constant-velocity-pc  PCs assume constant velocity over a sample\n"
@@ -254,6 +256,7 @@ Options parse(int argc, char** argv) {
     else if (a == "--inconsistent-commands") o.cfg.consistent_commands = false;
     else if (a == "--relax-rate") o.cfg.wall_renderer.relax_rate = std::stod(next());
     else if (a == "--active-relax-rate") o.cfg.wall_renderer.active_relax_rate = std::stod(next());
+    else if (a == "--no-yield") o.cfg.wall_renderer.yield_to_display = false;
     else if (a == "--estimate-damping") o.cfg.wall_estimator.estimate_damping = true;
     else if (a == "--contact-force") o.cfg.slave.report_contact_force = true;
     else if (a == "--drift-gain") o.cfg.slave.drift_gain = std::stod(next());

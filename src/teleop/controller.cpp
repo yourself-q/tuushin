@@ -469,6 +469,10 @@ MasterController::Step MasterController::step(Nanos now, Nanos sampled, double p
                         : control::limit_force(port_, f_reflected, v_meas_, dt_);
     out.display_force = pc.value;
     out.pc_active = pc.active;
+    if (cfg_.passivity == Passivity::kModelMediated && cfg_.wall_renderer.yield_to_display &&
+        pc.value < f_reflected) {
+      renderer_.yield(position, v_sent_, pc.value);
+    }
   } else {
     out.display_force = f_reflected;
   }

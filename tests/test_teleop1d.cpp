@@ -573,9 +573,11 @@ TEST_CASE(teleop_model_mediated_books_dithering_encoders_by_a_second_reading) {
   // each change booked by a reading its choice did not see, which without
   // an actuation lead only a second reading after the command provides.
   // With it the master's PC error falls from 15 N to 2.5 N and the master
-  // port stays passive.
+  // port stays passive. The rendered surface stays where the PC cut, so that
+  // its error measures the books.
   sim::Teleop1DConfig cfg;
   cfg.passivity = Passivity::kModelMediated;
+  cfg.wall_renderer.yield_to_display = false;
   cfg.duration = from_seconds(20.0);
   cfg.op.ref_freq = 0.45;
   cfg.op.ref_amplitude = 0.04;
@@ -599,4 +601,33 @@ TEST_CASE(teleop_model_mediated_books_dithering_encoders_by_a_second_reading) {
   CHECK(!reflective.diverged);
   CHECK(reflective.min_true_margin > -1e-7);
   CHECK(reflective.max_display_force > 1.0);
+}
+
+TEST_CASE(teleop_model_mediated_moves_the_surface_where_the_pc_cuts) {
+  // The same dither and delay with the second reading. Where the master's
+  // PC cuts a surface left in place has the next request catch up, and the
+  // force lags the master: more out than in, a limit cycle in contact.
+  // Moved in to what was displayed, the wall stays a spring of the master's
+  // position: the PC acts in 0.7 % of samples rather than 32 %, and the
+  // display varies a third as much.
+  sim::Teleop1DConfig cfg;
+  cfg.passivity = Passivity::kModelMediated;
+  cfg.duration = from_seconds(20.0);
+  cfg.op.ref_freq = 0.45;
+  cfg.op.ref_amplitude = 0.04;
+  cfg.master_encoder_resolution = cfg.slave_encoder_resolution = 55e-6;
+  cfg.master_encoder_noise = cfg.slave_encoder_noise = 0.5;
+  cfg.encoder_noise_known = true;
+  cfg.reread = true;
+  cfg.wall_renderer.yield_to_display = false;
+  const auto kept = run(cfg, from_millis(100));
+  cfg.wall_renderer.yield_to_display = true;
+  const auto moved = run(cfg, from_millis(100));
+  CHECK(!moved.diverged);
+  CHECK(moved.min_master_true_margin >= 0.0);
+  CHECK(kept.master_pc_active > 0.2);
+  CHECK(moved.master_pc_active < 0.05);
+  CHECK(moved.display_force_variation < 0.5 * kept.display_force_variation);
+  CHECK(moved.force_rmse < kept.force_rmse);
+  CHECK(moved.conveyed_force > 0.9);
 }

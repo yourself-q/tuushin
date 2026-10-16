@@ -186,4 +186,10 @@ double WallRenderer::force(double x, double v, double dt) {
   return f;
 }
 
+void WallRenderer::yield(double x, double v, double displayed) {
+  if (!model_.known() || x <= surface_) return;
+  const double s = x - (std::max(0.0, displayed) - model_.damping * v) / model_.stiffness;
+  surface_ = std::min(x, std::max(surface_, s));
+}
+
 }  // namespace tuushin::control

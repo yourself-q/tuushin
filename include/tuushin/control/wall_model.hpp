@@ -149,6 +149,21 @@ class WallEstimator {
 // rendering does; the rendering only decides how it feels, and how often
 // that controller has to step in.
 //
+// Where that controller displays less than the rendering asked for,
+// yield() moves the surface in until the wall gives what was displayed.
+// The cut is then not a force the wall lags behind, which the next request,
+// from the old surface, would try to catch up on: with dithering encoders
+// the controller held the force back while the master pushed in and let it
+// through while the master came back out, more force out than in, and the
+// master held contact in a limit cycle of 1 mm at 33 Hz, 2.1 contacts per
+// press at 100 ms each way. Moved, the surface keeps the wall a spring of
+// the master's position, as Lee and Huang's passive set-position
+// modulation keeps a spring's set position where the energy available
+// allows (IEEE T-RO 26(2), 2010). What moving it in releases is what the
+// controller dissipated; it does not go into the reserve, which would spend
+// it at once moving the surface back out. In simulation, 1.04 contacts per
+// press, with the controller active in 0.9 % of samples rather than 21.5 %.
+//
 // offset() is how far the rendered surface lies beyond the model's: the
 // master's position less the offset is where the slave should be for the
 // force the master displays (Mitra and Niemeyer's commands consistent with
@@ -156,6 +171,9 @@ class WallEstimator {
 struct WallRendererParams {
   double relax_rate = 0.02;         // m/s
   double active_relax_rate = 0.02;  // m/s
+  // Whether the master calls yield() when its passivity controller cuts the
+  // force.
+  bool yield_to_display = true;
 };
 
 class WallRenderer {
@@ -167,6 +185,10 @@ class WallRenderer {
   // The force to display with the master at x moving at v, positive
   // towards -x, after moving the rendered surface over the sample of dt s.
   double force(double x, double v, double dt);
+  // The master displayed `displayed` rather than the force(x, v, dt) just
+  // rendered, which was larger: the surface moves in so that the wall gives
+  // what was displayed.
+  void yield(double x, double v, double displayed);
 
   const WallModel& model() const { return model_; }
   double surface() const { return surface_; }
