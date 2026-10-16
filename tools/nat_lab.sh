@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # NAT traversal lab: a master and a slave behind Linux NATs that meet through
 # a rendezvous server, all in network namespaces on one Linux host. Needs
-# root, iproute2, iptables and conntrack (for the report), and coturn for
-# --turn; run it in a privileged container on other systems:
+# root, iproute2, iptables and conntrack (for the report), coturn for
+# --turn, and openssl (and libssl-dev in the build) for --turn-over tls; run
+# it in a privileged container on other systems:
 #
 #   docker run --rm -it --privileged -v "$PWD:/src" ubuntu:24.04 bash
-#   apt-get install g++ cmake pkg-config libsodium-dev iproute2 iptables conntrack coturn
+#   apt-get install g++ cmake pkg-config libsodium-dev iproute2 iptables conntrack coturn \
+#     libssl-dev openssl
 #   cmake -S /src -B /tmp/b && cmake --build /tmp/b && /src/tools/nat_lab.sh --build /tmp/b
 #
 # Topology. Both homes use the same private prefix, as homes often do, so the
@@ -91,6 +93,15 @@
 #   --one-way              with --open-at: the opening lets through what natB
 #                          sends to natA only; the session must stay on the
 #                          relay, and lose nothing to the path
+#   --turn-over HOW        with --turn: how the slave reaches the TURN server,
+#                          udp (3478), tcp (3478) or tls (5349, with a
+#                          certificate for 192.0.2.10 made for the run and
+#                          given to the slave as its CA) (udp)
+#   --block-udp            natB lets no UDP out but to the rendezvous server
+#                          (tuushin's rendezvous runs over UDP), as a firewall
+#                          that lets out what it knows of and web traffic;
+#                          with --turn-over tcp or tls the session must run
+#                          through the relay
 #   --keep DIR             keep the logs in DIR
 #
 # Prints one line: PASS or FAIL, the scenario, and the time from the master's
@@ -115,6 +126,8 @@ REBIND_AT=
 OPEN_AT=
 ONE_WAY=0
 TURN=0
+TURN_OVER=udp
+BLOCK_UDP=0
 CGNAT_A=0
 CGNAT_B=0
 SILENT_CGNAT=0
@@ -141,6 +154,8 @@ while [ $# -gt 0 ]; do
     --turn) TURN=1 ;;
     --open-at) OPEN_AT=$2; shift ;;
     --one-way) ONE_WAY=1 ;;
+    --turn-over) TURN_OVER=$2; shift ;;
+    --block-udp) BLOCK_UDP=1 ;;
     --cgnat-a) CGNAT_A=1 ;;
     --cgnat-b) CGNAT_B=1 ;;
     --silent-cgnat) SILENT_CGNAT=1 ;;
@@ -169,6 +184,18 @@ if [ -n "$OPEN_AT" ] && { [ "$TURN" = 0 ] || [ "$SAME_LAN" = 1 ]; }; then
 fi
 if [ "$ONE_WAY" = 1 ] && [ -z "$OPEN_AT" ]; then
   echo "--one-way needs --open-at" >&2
+  exit 1
+fi
+case "$TURN_OVER" in
+  udp | tcp | tls) ;;
+  *) echo "--turn-over is udp, tcp or tls" >&2; exit 1 ;;
+esac
+if [ "$TURN_OVER" != udp ] && [ "$TURN" = 0 ]; then
+  echo "--turn-over needs --turn" >&2
+  exit 1
+fi
+if [ "$BLOCK_UDP" = 1 ] && [ "$SAME_LAN" = 1 ]; then
+  echo "--block-udp is natB's; the slave is behind natA with --same-lan" >&2
   exit 1
 fi
 ROUTERS=
@@ -323,6 +350,10 @@ else
   nat natB b-w 203.0.113.2 203.0.113.1 "$NAT_B" "$NAT_B_INPUT" "$NAT_B_ERRORS"
 fi
 [ -z "$REBIND_AT" ] || nsx "$B_SIDE" ip addr add 203.0.113.3/24 dev b-w
+if [ "$BLOCK_UDP" = 1 ]; then
+  nsx natB iptables -I FORWARD 1 -o b-w -p udp -d 192.0.2.10 --dport 47200 -j ACCEPT
+  nsx natB iptables -I FORWARD 2 -o b-w -p udp -j DROP
+fi
 
 # The rebinding: new flows leave natB (or cgnB) from its second address, and
 # the old mappings go, so the slave's next datagram to anyone opens a new
@@ -383,12 +414,32 @@ if [ "$TURN" = 1 ]; then
   command -v turnserver >/dev/null || { echo "--turn needs coturn's turnserver" >&2; exit 1; }
   printf 'lab-secret\n' >"$LOG/turn-pass"
   chmod 600 "$LOG/turn-pass"
-  # Long-term credentials, UDP only, relayed addresses on the server's own.
+  # Long-term credentials, relayed addresses on the server's own, and the
+  # clients reaching the server the one way asked for.
+  case "$TURN_OVER" in
+    udp)
+      LISTEN="--no-tcp --no-tls"
+      RELAY="--turn 192.0.2.10" ;;
+    tcp)
+      LISTEN="--no-udp --no-tls"
+      RELAY="--turn turn:192.0.2.10?transport=tcp" ;;
+    tls)
+      # A certificate for the server's address, which the slave checks it
+      # against (the server has no name here), trusted as its own CA.
+      command -v openssl >/dev/null || { echo "--turn-over tls needs openssl" >&2; exit 1; }
+      openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
+        -subj /CN=turn.tuushin.lab -addext subjectAltName=IP:192.0.2.10 \
+        -keyout "$LOG/turn-key.pem" -out "$LOG/turn-cert.pem" 2>/dev/null
+      LISTEN="--no-udp --no-tcp --tls-listening-port=5349"
+      LISTEN="$LISTEN --cert=$LOG/turn-cert.pem --pkey=$LOG/turn-key.pem"
+      RELAY="--turn turns:192.0.2.10 --turn-ca $LOG/turn-cert.pem" ;;
+  esac
+  RELAY="$RELAY --turn-user lab --turn-pass-file $LOG/turn-pass"
+  # shellcheck disable=SC2086
   nsx server turnserver -n --listening-ip=192.0.2.10 --relay-ip=192.0.2.10 \
     --listening-port=3478 --lt-cred-mech --user=lab:lab-secret --realm=tuushin.lab \
-    --fingerprint --no-tcp --no-tls --no-dtls --no-cli --no-tcp-relay \
+    --fingerprint $LISTEN --no-dtls --no-cli --no-tcp-relay \
     --log-file=stdout --simple-log >"$LOG/turn.out" 2>&1 &
-  RELAY="--turn 192.0.2.10 --turn-user lab --turn-pass-file $LOG/turn-pass"
   sleep 0.3
 fi
 sleep 0.2
@@ -439,6 +490,8 @@ SCENARIO="$SCENARIO input=$NAT_A_INPUT/$NAT_B_INPUT"
 SCENARIO="$SCENARIO master-first=$MASTER_FIRST prime-hops=${PRIME_HOPS:-default}"
 [ -z "$REBIND_AT" ] || SCENARIO="$SCENARIO rebind-at=${REBIND_AT}s"
 [ "$TURN" = 0 ] || SCENARIO="$SCENARIO turn"
+[ "$TURN_OVER" = udp ] || SCENARIO="$SCENARIO turn-over=$TURN_OVER"
+[ "$BLOCK_UDP" = 0 ] || SCENARIO="$SCENARIO block-udp"
 [ -z "$OPEN_AT" ] || SCENARIO="$SCENARIO open-at=${OPEN_AT}s"
 [ "$ONE_WAY" = 0 ] || SCENARIO="$SCENARIO one-way"
 [ "$CGNAT_A$CGNAT_B" = 00 ] || SCENARIO="$SCENARIO cgnat=$CGNAT_A/$CGNAT_B"
@@ -470,6 +523,10 @@ if [ "$RC" = 0 ] && grep -q "^authenticated" "$LOG/master.out"; then
       grep -q "^left the relay" "$LOG/master.out" || OK=0
       grep -q "^left the relay" "$LOG/slave.out" || OK=0
     fi
+  fi
+  if [ "$TURN_OVER" != udp ]; then
+    # The relay came over the transport asked for.
+    grep -q "relay allocated at .* over $(echo "$TURN_OVER" | tr a-z A-Z)," "$LOG/slave.err" || OK=0
   fi
 fi
 # missing N from E: what the master's samples and the slave's lost
