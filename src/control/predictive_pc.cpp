@@ -482,19 +482,22 @@ double affordable_scale(double g, double h, double b) {
 // The same with a tax added to the cost, for F = |phi| > 0 and a >= 0 the
 // part of the held force with phi's sign: `rise` per newton by which
 // lambda * F exceeds a, and `fall` per newton by which it falls short of
-// it, a credit.
+// it, a credit. Beyond a the cost also grows by quad * lambda F (lambda F -
+// toward), with toward the held force in phi's direction (a = toward when
+// that is positive), which is zero at a (NoiseTax's reserve).
 double affordable_scale_taxed(double g, double h, double b, double F, double a, double rise,
-                              double fall) {
+                              double fall, double quad = 0.0, double toward = 0.0) {
   // Up to lambda0 = a / F the cost is -lambda * (g - fall * F) +
   // lambda^2 * h - fall * a, which holds at lambda = 0.
   const double l = affordable_scale(g - fall * F, h, b + fall * a);
-  if (rise == fall || l * F < a) return l;
+  if ((rise == fall && quad == 0.0) || l * F < a) return l;
   // Beyond lambda0 the cost is the other quadratic, which agrees with the
   // first at lambda0 and holds there (lambda0 <= l; with a = 0 there is no
   // first piece, and the cost holds at zero). Each holds on an
   // interval that contains zero, so the largest root of the second beyond
   // lambda0 is the answer.
-  return std::max(a / F, affordable_scale(g - rise * F, h, b + rise * a));
+  return std::max(a / F, affordable_scale(g - rise * F + quad * F * toward, h + quad * F * F,
+                                          b + rise * a));
 }
 
 }  // namespace
@@ -533,7 +536,7 @@ double quantization_tax(const DevicePredictor& device, double phi) {
 
 PcResult limit_force_predictive(double budget, double phi, const DevicePredictor& device,
                                 int hold_samples, double confidence, int tax_samples,
-                                int rise_samples) {
+                                int rise_samples, const ChangeTax* noise) {
   PcResult r;
   r.value = phi;
   if (phi == 0.0) return r;
@@ -555,23 +558,40 @@ PcResult limit_force_predictive(double budget, double phi, const DevicePredictor
   // (quantization_tax_line at the device's count_bounds()); a held force of
   // the other sign is credited its fall to zero whatever phi's size.
   const auto u = device.count_bounds();
-  const double rate = phi > 0.0 ? q - u.lo : u.hi;
-  const double credit = phi > 0.0 ? q - u.hi : u.lo;
+  double rate = phi > 0.0 ? q - u.lo : u.hi;
+  double credit = phi > 0.0 ? q - u.hi : u.lo;
   const double F = std::fabs(phi);
   const double held = device.held_force();
   const double kept = phi * held > 0.0 ? std::fabs(held) : 0.0;
-  const double flip = phi * held < 0.0 ? -quantization_tax(q, held, 0.0, u.lo, u.hi) : 0.0;
+  double flip = phi * held < 0.0 ? -quantization_tax(q, held, 0.0, u.lo, u.hi) : 0.0;
+  // With the noise tax a newton of rise pays its bias part, a rise also
+  // its part of the noise's bound, and nothing is credited.
+  double quad = 0.0;
+  const double toward = phi > 0.0 ? held : -held;
+  if (noise) {
+    rate = noise->rise;
+    credit = 0.0;
+    flip = 0.0;
+    quad = 2.0 * noise->slope;
+  }
   // W(lambda) = lambda * g - lambda^2 * h with h > 0 over n samples, its
   // lower confidence bound with `confidence`.
   auto g = [&](double n) { return phi * device.hold_base(n) - confidence * F * device.hold_sd(n); };
   auto h = [&](double n) { return phi * phi * device.hold_compliance(n); };
   // The tax is paid once whatever the horizon: within every horizon, or
   // with tax_samples over that horizon alone.
-  const double tq = tax_samples > 0 ? 0.0 : rate;
-  double l = affordable_scale_taxed(g(1.0), h(1.0), b + flip, F, kept, tq, credit);
+  const double tq = tax_samples > 0 ? 0.0 : rate, tquad = tax_samples > 0 ? 0.0 : quad;
+  double l = affordable_scale_taxed(g(1.0), h(1.0), b + flip, F, kept, tq, credit, tquad, toward);
   if (hold_samples > 1) {
     l = std::min(l, affordable_scale_taxed(g(hold_samples), h(hold_samples), b + flip, F, kept,
-                                           tq, credit));
+                                           tq, credit, tquad, toward));
+  }
+  if (noise && noise->fixed > 0.0 && tax_samples <= 0 && l * F > kept) {
+    // A fixed part breaks the pieces' agreement at the kept force, so the
+    // pieces above need not hold beyond it: check the force found instead.
+    const double tax = noise->most(held, l * phi);
+    auto holds = [&](double n) { return l * g(n) - l * l * h(n) - tax >= -b; };
+    if (!holds(1.0) || (hold_samples > 1 && !holds(hold_samples))) l = kept / F;
   }
   if (rise_samples > 0 && q > 0.0 && l * F > kept) {
     // A rise, which pays a tax, goes no further than the force the expected
@@ -583,12 +603,14 @@ PcResult limit_force_predictive(double budget, double phi, const DevicePredictor
   if (tax_samples > 0 && l * F > kept) {
     // A rise must repay the books' deficit and its own tax within
     // tax_samples = N, less a held force of the other sign's credit:
-    // lambda * g(N) - lambda^2 * h(N) - rate * (lambda * F - kept) >= -budget - flip.
+    // lambda * g(N) - lambda^2 * h(N) - rate * (lambda * F - kept) >= -budget - flip,
+    // with the noise tax less quad * lambda F (lambda F - toward).
     // The left side is concave, so the rises that do lie in one interval
     // [lo, hi]. Books in deficit can exclude the small rises; if the other
     // constraints allow only those, the force stays at the kept one.
-    const double l0 = kept / F, gn = g(tax_samples) - rate * F, hn = h(tax_samples);
-    const double c0 = rate * kept + budget + flip;
+    const double l0 = kept / F, gn = g(tax_samples) - rate * F + quad * F * toward;
+    const double hn = h(tax_samples) + quad * F * F;
+    const double c0 = rate * kept + budget + flip - (noise ? noise->fixed : 0.0);
     const double disc = gn * gn + 4.0 * hn * c0;
     if (disc < 0.0) {
       l = l0;
@@ -601,9 +623,37 @@ PcResult limit_force_predictive(double budget, double phi, const DevicePredictor
     }
   }
   if (l >= 1.0) return r;  // the full force is affordable
-  r.value = l * phi;
+  // A force kept is the held one exactly, which a tax's fixed part, due on
+  // any rise, would not let through rounded up.
+  r.value = kept > 0.0 && std::fabs(l * F - kept) <= kept * 1e-12 ? held : l * phi;
   r.gain = 1.0 - l;
   r.active = true;
+  return r;
+}
+
+PcResult limit_force_predictive(double budget, double phi, const DevicePredictor& device,
+                                int hold_samples, double confidence, int tax_samples,
+                                int rise_samples, const NoiseTax* noise) {
+  if (!noise) {
+    return limit_force_predictive(budget, phi, device, hold_samples, confidence, tax_samples,
+                                  rise_samples, static_cast<const ChangeTax*>(nullptr));
+  }
+  // Three rounds take a first rise from rest to within a percent of the
+  // largest force the charge itself affords.
+  constexpr int kRounds = 3;
+  const double held = device.held_force();
+  ChangeTax plan = noise->plan();
+  PcResult r = limit_force_predictive(budget, phi, device, hold_samples, confidence,
+                                      tax_samples, rise_samples, &plan);
+  for (int i = 0; i < kRounds && r.active; ++i) {
+    const ChangeTax last = plan;
+    plan = noise->plan(held, r.value);
+    if (plan.slope == last.slope && plan.fixed == last.fixed) break;
+    const PcResult next = limit_force_predictive(budget, phi, device, hold_samples, confidence,
+                                                 tax_samples, rise_samples, &plan);
+    if (!(std::fabs(next.value) > std::fabs(r.value))) break;
+    r = next;
+  }
   return r;
 }
 

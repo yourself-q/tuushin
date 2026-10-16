@@ -79,6 +79,12 @@ void usage() {
                "                        readings before rounding (0)\n"
                "  --slave-encoder-noise N   the same for the slave (0)\n"
                "  --encoders-unknown    controllers treat the encoder readings as exact\n"
+               "  --noise-tax           with encoder noise: controllers know its size, within\n"
+               "                        the tolerance, and tax a force change on it with\n"
+               "                        a bound that holds with probability 1 - delta\n"
+               "  --noise-tolerance T   the relative tolerance either way (0.1)\n"
+               "  --noise-tax-delta D   the bound's failure probability (1e-3)\n"
+               "  --noise-tax-scale F   the force change in N the bound is tightest for (0.25)\n"
                "  --force-rate R        with encoders: operator's least force rate in N/s (20)\n"
                "  --fixed-force-rate    with encoders: the filters keep the force rate\n"
                "  --fixed-reading-noise with encoders: the filters take a reading's error to\n"
@@ -189,6 +195,10 @@ Options parse(int argc, char** argv) {
     else if (a == "--master-encoder-noise") o.cfg.master_encoder_noise = std::stod(next());
     else if (a == "--slave-encoder-noise") o.cfg.slave_encoder_noise = std::stod(next());
     else if (a == "--encoders-unknown") o.cfg.encoder_resolution_known = false;
+    else if (a == "--noise-tax") o.cfg.encoder_noise_known = true;
+    else if (a == "--noise-tolerance") o.cfg.encoder_noise_tolerance = std::stod(next());
+    else if (a == "--noise-tax-delta") o.cfg.noise_tax_delta = std::stod(next());
+    else if (a == "--noise-tax-scale") o.cfg.noise_tax_force_scale = std::stod(next());
     else if (a == "--actuation-delay-unknown") {
       o.cfg.master_model_actuation_delay = 0;
       o.cfg.slave_model_actuation_delay = 0;

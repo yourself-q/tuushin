@@ -133,6 +133,7 @@ TEST_CASE(noise_tax_plan_bounds_every_charge) {
     const double kept = phi * prev > 0.0 ? std::fabs(prev) : 0.0;
     const double most = plan.rise * std::max(0.0, std::fabs(phi) - kept) +
                         2.0 * plan.slope * std::max(0.0, phi * (phi - prev));
+    CHECK_NEAR(plan.most(prev, phi), most, 1e-15);
     const double c = tax.charge(prev, phi);
     // The charge is a difference of two values of U: rounding.
     const double slack = most * 1e-12 + tax.charged() * 1e-14;
@@ -143,6 +144,35 @@ TEST_CASE(noise_tax_plan_bounds_every_charge) {
     prev = phi;
   }
   CHECK(changes > 10000);
+}
+
+// The plan on the tangent at a target bounds every change too, the more
+// tightly the nearer the change is to its target, and is exact there; cost()
+// is what charge() returns.
+TEST_CASE(noise_tax_plan_at_a_target_bounds_every_charge_and_meets_it_there) {
+  Rng rng(9);
+  NoiseTax tax(0.003, 0.58, 1e-3, 0.25);
+  tax.open();
+  // From rest to 2 N: the peak's tangent takes several times the charge.
+  CHECK(tax.plan().most(0.0, 2.0) > 4.0 * tax.cost(0.0, 2.0));
+  CHECK_NEAR(tax.plan(0.0, 2.0).most(0.0, 2.0), tax.cost(0.0, 2.0), 1e-12);
+  double prev = 0.0;
+  for (int k = 0; k < 5000; ++k) {
+    const double target = 6.0 * (rng.uniform() - 0.3);
+    const ChangeTax plan = tax.plan(prev, target);
+    CHECK(plan.fixed >= 0.0);
+    for (int j = 0; j < 8; ++j) {
+      const double phi = j == 0 ? target : 6.0 * (rng.uniform() - 0.3);
+      const double c = tax.cost(prev, phi);
+      const double most = plan.most(prev, phi);
+      CHECK(c <= most + most * 1e-12 + tax.charged() * 1e-14);
+      if (j == 0 && plan.fixed > 0.0) CHECK_NEAR(most, c, 1e-12 * (1.0 + c));
+    }
+    const double phi = rng.uniform() < 0.3 ? 0.0 : target;
+    const double expected = tax.cost(prev, phi);
+    CHECK_NEAR(tax.charge(prev, phi), expected, 1e-15);
+    prev = phi;
+  }
 }
 
 // Monte Carlo: readings of a device that dwells near the edge of a count,

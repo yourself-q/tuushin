@@ -8,9 +8,11 @@
 #include "tuushin/rng.hpp"
 
 using tuushin::Rng;
+using tuushin::control::ChangeTax;
 using tuushin::control::DevicePredictor;
 using tuushin::control::ForceSegment;
 using tuushin::control::limit_force_predictive;
+using tuushin::control::NoiseTax;
 using tuushin::control::quantization_tax;
 using tuushin::control::ReflectiveStore;
 
@@ -389,6 +391,88 @@ TEST_CASE(predictive_pc_force_is_the_largest_affordable_with_the_tax) {
                   held, phi, budget, hold, r.value);
       return;
     }
+  }
+}
+
+// The same with the noise tax's plan in place of the interval tax: the PC's
+// force costs at most the budget with ChangeTax::most() as the tax, and any
+// larger force of the same sign would not.
+TEST_CASE(predictive_pc_force_is_the_largest_affordable_with_the_noise_tax) {
+  Rng rng(13);
+  const double dt = 1e-3;
+  for (int trial = 0; trial < 20000; ++trial) {
+    const double m = 0.05 + rng.uniform();
+    const double q = rng.uniform() * 1e-4;
+    HeldMass dev{m, dt, rng.normal() * 3.0};
+    dev.v = rng.normal() * 0.05;
+    DevicePredictor pred(m, dt, q);
+    for (int k = 0; k < 4; ++k) {
+      const double held = rng.bernoulli(0.3) ? 0.0 : rng.normal() * 5.0;
+      const double dx = dev.step(held);
+      pred.observe(std::round(dev.x / q) * q - std::round((dev.x - dx) / q) * q, held);
+    }
+    // Half the time with a fixed part, as a plan at a target has.
+    const ChangeTax noise{rng.uniform() * 0.02 * q, rng.exponential(1.0) * q,
+                          rng.bernoulli(0.5) ? 0.0 : rng.exponential(1e-4)};
+    const double phi = rng.normal() * 8.0;
+    const double budget = rng.bernoulli(0.3) ? 0.0 : rng.exponential(5e-4);
+    const int hold = rng.bernoulli(0.5) ? 1 : 2;
+    const auto r = limit_force_predictive(budget, phi, pred, hold, 0.0, 0, 0, &noise);
+    const auto cost = [&](double f) {
+      const double tax = noise.most(pred.held_force(), f);
+      double worst = tax - pred.work(f);
+      if (hold > 1) worst = std::max(worst, tax - pred.hold_work(f, hold));
+      return worst;
+    };
+    const bool sign_ok = r.value * phi >= 0.0 && std::fabs(r.value) <= std::fabs(phi);
+    const double scale = 1e-12 + 1e-9 * std::fabs(phi) * (q + 1e-4);
+    const bool affordable = cost(r.value) <= budget + scale;
+    const double bigger = r.value + 1e-6 * phi;
+    // With a fixed part the force is checked, not the largest.
+    const bool largest =
+        !r.active || r.value == phi || noise.fixed > 0.0 || cost(bigger) > budget - scale;
+    // Repaid over four samples instead, a rise covers its tax there.
+    const auto later = limit_force_predictive(budget, phi, pred, hold, 0.0, 4, 0, &noise);
+    const double kept = later.value * pred.held_force() > 0.0 ? std::fabs(pred.held_force()) : 0.0;
+    // A force kept, up to rounding, pays no tax.
+    const bool repaid = std::fabs(later.value) <= kept * (1.0 + 1e-12) ||
+                        noise.most(pred.held_force(), later.value) -
+                                pred.hold_work(later.value, 4) <= budget + scale;
+    if (!sign_ok || !affordable || !largest || !repaid) {
+      CHECK(sign_ok);
+      CHECK(affordable);
+      CHECK(largest);
+      CHECK(repaid);
+      std::printf("trial %d m %g q %g held %g phi %g budget %g hold %d -> %g, %g\n", trial, m,
+                  q, pred.held_force(), phi, budget, hold, r.value, later.value);
+      return;
+    }
+  }
+}
+
+// With the noise tax itself: the force affords what the tax would charge
+// for it, and the plans at the force found raise a first rise from rest
+// well beyond what the peak's tangent alone allows.
+TEST_CASE(predictive_pc_affords_the_noise_tax_charge) {
+  const double m = 0.2, dt = 1e-3, q = 55e-6;
+  HeldMass dev{m, dt, 0.0};
+  dev.v = 0.03;
+  DevicePredictor pred(m, dt, q);
+  for (int k = 0; k < 200; ++k) pred.observe(dev.step(0.0), 0.0);
+  NoiseTax tax(0.003 * q, 0.58 * q, 1e-3, 0.25);
+  tax.open();
+  const ChangeTax peak = tax.plan();
+  for (double budget : {0.0, 1e-5, 1e-4}) {
+    const double phi = 8.0;
+    const auto base = limit_force_predictive(budget, phi, pred, 2, 0.0, 4, 0, &peak);
+    const auto r = limit_force_predictive(budget, phi, pred, 2, 0.0, 4, 0, &tax);
+    CHECK(r.active);
+    CHECK(r.value >= base.value);
+    CHECK(tax.cost(0.0, r.value) - pred.hold_work(r.value, 4) <= budget + 1e-15);
+    // Within a percent of the largest force the charge itself affords.
+    const double more = 1.01 * r.value;
+    CHECK(tax.cost(0.0, more) - pred.hold_work(more, 4) > budget);
+    CHECK(r.value > (budget > 5e-5 ? 2.0 : 1.4) * base.value);
   }
 }
 

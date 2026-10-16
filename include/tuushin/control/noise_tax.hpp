@@ -75,9 +75,17 @@ namespace tuushin::control {
 // a new peak, so a force that rises pays in advance for falling back, and
 // falls are free, as with quantization_tax(): zero force stays affordable
 // whatever the budget. U(0) = sqrt(2 rho log(1 / delta)) is charged when
-// the books open. Since U is concave, a controller planning a change may
-// count on at most rise() per newton of rise plus 2 slope() phi (phi -
-// prev) where positive, slope() = s^2 U'(peak) (ChangeTax).
+// the books open.
+//
+// Planning a change. Since U is concave, it lies below each of its
+// tangents, and a controller may count on a change costing at most the
+// bias part plus a fixed part and 2 slope phi (phi - prev) where that is
+// positive (ChangeTax): with the tangent at the peak, slope = s^2 U'(peak)
+// and no fixed part, which is tight for small changes; with the tangent at
+// the V* a change to a force `target` would reach, a smaller slope and a
+// fixed part, which is exact at the target. A first rise from rest, the
+// costliest change, is where the two differ most: to 2 N from rest at
+// half a count, the tangent at the peak takes five times the charge.
 //
 // What the bound assumes: Gaussian noise before the rounding, of a
 // standard deviation within the range given; independent from reading to
@@ -102,10 +110,18 @@ DitherBounds dither_bounds(double lo, double hi);
 
 // What a change of the port force from prev to phi pays at most: `rise`
 // per newton by which |phi| grows (the whole of |phi| when the sign
-// flips), plus 2 slope phi (phi - prev) when that is positive.
+// flips), plus `fixed` and 2 slope phi (phi - prev) when that is positive.
 struct ChangeTax {
   double rise = 0.0;   // J/N
   double slope = 0.0;  // J/N^2
+  double fixed = 0.0;  // J
+  double most(double prev, double phi) const {
+    const double kept = phi * prev > 0.0 ? (prev > 0.0 ? prev : -prev) : 0.0;
+    const double grow = (phi > 0.0 ? phi : -phi) - kept;
+    const double reserve = phi * (phi - prev);
+    return rise * (grow > 0.0 ? grow : 0.0) +
+           (reserve > 0.0 ? fixed + 2.0 * slope * reserve : 0.0);
+  }
 };
 
 class NoiseTax {
@@ -122,8 +138,14 @@ class NoiseTax {
   // the reading it takes effect on, and returns what to book as an output
   // (J). Opens the books if they are not.
   double charge(double prev, double phi);
-  // The most charge() takes from now on, apart from opening the books.
+  // What charge(prev, phi) would return, apart from opening the books.
+  double cost(double prev, double phi) const;
+  // The most charge() takes from now on, apart from opening the books: on
+  // the tangent at the peak (no fixed part), or on the tangent at the V* a
+  // change from `prev`, the force last charged, to `target` would reach,
+  // which is exact there. Each bounds every change.
   ChangeTax plan() const;
+  ChangeTax plan(double prev, double target) const;
 
   bool opened() const { return opened_; }
   // U(v) for v in J^2.
@@ -132,6 +154,7 @@ class NoiseTax {
   double charged() const { return paid_; } // the noise part charged so far, J
 
  private:
+  double slope(double v) const;  // U'(v)
   double bias_, proxy_, rho_, log_delta2_;
   bool opened_ = false;
   double v_ = 0.0;     // V

@@ -161,6 +161,12 @@ struct Teleop1DConfig {
   // counts (teleop::SimulatedDevice::set_encoder_noise).
   double master_encoder_noise = 0.0;
   double slave_encoder_noise = 0.0;
+  // Whether the controllers know their encoders' noise, within a relative
+  // tolerance either way, and tax it (teleop::MasterConfig::encoder_noise_lo).
+  bool encoder_noise_known = false;
+  double encoder_noise_tolerance = 0.1;
+  double noise_tax_delta = 1e-3;
+  double noise_tax_force_scale = 0.25;
   // Gaussian noise on the slave's force sensor, N (standard deviation).
   // The metrics use the true contact force.
   double force_sensor_noise = 0.0;

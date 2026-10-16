@@ -9,6 +9,7 @@
 
 #include "tuushin/codec/deadband.hpp"
 #include "tuushin/control/held_device.hpp"
+#include "tuushin/control/noise_tax.hpp"
 #include "tuushin/control/predictive_pc.hpp"
 #include "tuushin/control/reading_noise.hpp"
 #include "tuushin/control/reflection.hpp"
@@ -205,6 +206,17 @@ class DeviceModel {
   // other than the port force to change (N/s), and how many readings after
   // a tax it is refunded.
   void set_count_window(std::size_t readings, double force_drift, std::size_t refund_lag);
+  // For an encoder whose noise before its rounding has a standard deviation
+  // within [lo, hi] counts: a command that takes effect a whole number of
+  // samples after the last reading, and so on a reading it did not see, is
+  // taxed as control::NoiseTax charges it, with `delta` and `force_scale`,
+  // and other commands as above. With a resolution only.
+  void set_noise_tax(double lo, double hi, double delta, double force_scale);
+  // The noise tax when it applies to the next command, as
+  // limit_force_predictive takes it; null otherwise.
+  const control::NoiseTax* change_tax() const;
+  // The noise tax's books, if it was set.
+  const control::NoiseTax* noise_tax() const { return noise_tax_ ? &*noise_tax_ : nullptr; }
 
  private:
   struct Candidate {
@@ -242,6 +254,9 @@ class DeviceModel {
   std::deque<Settled> settled_;
   long readings_ = 0;  // readings observed so far
   std::size_t refund_lag_;
+  std::optional<control::NoiseTax> noise_tax_;
+  // Whether the next command takes effect on a reading it did not see.
+  bool on_unseen_reading() const;
 };
 
 struct MasterConfig {
@@ -294,6 +309,16 @@ struct MasterConfig {
   int count_window = 24;
   double force_drift = 50.0;
   int refund_lag = 12;
+  // With a resolution: the standard deviation of the encoder's noise before
+  // its rounding, in counts, as a range [lo, hi] the true one lies in. With
+  // hi > 0 a force that takes effect a whole number of samples after it is
+  // commanded is taxed as control::NoiseTax charges it, which bounds the
+  // books with probability 1 - noise_tax_delta (control/noise_tax.hpp);
+  // other forces, and every force with hi = 0, as above.
+  double encoder_noise_lo = 0.0;
+  double encoder_noise_hi = 0.0;
+  double noise_tax_delta = 1e-3;
+  double noise_tax_force_scale = 0.25;  // N
   bool deadband = false;
   codec::DeadbandParams deadband_params{0.1, 0.002, from_millis(100)};
   // How long after a command the device applies it (ActuatorSchedule). The
@@ -457,6 +482,10 @@ struct SlaveConfig {
   int count_window = 24;
   double force_drift = 50.0;
   int refund_lag = 12;
+  double encoder_noise_lo = 0.0;
+  double encoder_noise_hi = 0.0;
+  double noise_tax_delta = 1e-3;
+  double noise_tax_force_scale = 0.25;  // N
   bool deadband = false;
   codec::DeadbandParams deadband_params{0.1, 0.05, from_millis(100)};
   // Between samples the slave extrapolates the master position with the last

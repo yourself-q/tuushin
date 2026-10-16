@@ -91,6 +91,12 @@ double NoiseTax::open() {
   return paid_;
 }
 
+double NoiseTax::slope(double v) const {
+  // U'(V) = (log((V + rho) / rho) + 2 log(1 / delta) + 1) / (2 U(V)).
+  const double w = v + rho_;
+  return (std::log(w / rho_) + log_delta2_ + 1.0) / (2.0 * bound(v));
+}
+
 double NoiseTax::charge(double prev, double phi) {
   double out = open();
   if (phi == prev) return out;
@@ -109,11 +115,31 @@ double NoiseTax::charge(double prev, double phi) {
   return out;
 }
 
-ChangeTax NoiseTax::plan() const {
-  // U'(V) = (log((V + rho) / rho) + 2 log(1 / delta) + 1) / (2 U(V)).
-  const double w = peak_ + rho_;
-  const double du = (std::log(w / rho_) + log_delta2_ + 1.0) / (2.0 * bound(peak_));
-  return {2.0 * bias_, proxy_ * proxy_ * du};
+double NoiseTax::cost(double prev, double phi) const {
+  if (phi == prev) return 0.0;
+  const double kept = phi * prev > 0.0 ? std::fabs(prev) : 0.0;
+  double out = 2.0 * bias_ * std::max(0.0, std::fabs(phi) - kept);
+  const double s2 = proxy_ * proxy_;
+  const double reserved = v_ + s2 * (phi - prev) * (phi - prev) + s2 * phi * phi;
+  if (reserved > peak_) out += bound(reserved) - bound(peak_);
+  return out;
+}
+
+ChangeTax NoiseTax::plan() const { return {2.0 * bias_, proxy_ * proxy_ * slope(peak_), 0.0}; }
+
+ChangeTax NoiseTax::plan(double prev, double target) const {
+  // A change to phi moves V* from v_ + s^2 prev^2 by d = 2 s^2 phi (phi -
+  // prev), and U(V*) - U(peak) <= U(x) + U'(x) (V* - x) - U(peak) for every
+  // x: with x the V* of the target, at most fixed + U'(x) d, fixed =
+  // U(x) - U(peak) - U'(x) (x - v_ - s^2 prev^2) where that is positive.
+  const double s2 = proxy_ * proxy_;
+  const double from = v_ + s2 * prev * prev;
+  const double d = 2.0 * s2 * target * (target - prev);
+  const double x = from + d;
+  if (!(x > peak_)) return plan();
+  const double du = slope(x);
+  const double fixed = std::max(0.0, bound(x) - bound(peak_) - du * d);
+  return {2.0 * bias_, s2 * du, fixed};
 }
 
 }  // namespace tuushin::control

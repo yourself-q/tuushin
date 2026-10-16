@@ -117,6 +117,12 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
   mc.count_window = cfg.count_window;
   mc.force_drift = cfg.force_drift;
   mc.refund_lag = cfg.refund_lag;
+  if (cfg.encoder_noise_known) {
+    mc.encoder_noise_lo = cfg.master_encoder_noise / (1.0 + cfg.encoder_noise_tolerance);
+    mc.encoder_noise_hi = cfg.master_encoder_noise * (1.0 + cfg.encoder_noise_tolerance);
+  }
+  mc.noise_tax_delta = cfg.noise_tax_delta;
+  mc.noise_tax_force_scale = cfg.noise_tax_force_scale;
   mc.deadband = cfg.forward_deadband;
   mc.deadband_params = cfg.forward_deadband_params;
   mc.actuation_delay = cfg.master_model_actuation_delay >= 0 ? cfg.master_model_actuation_delay
@@ -148,6 +154,12 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
   sc.count_window = cfg.count_window;
   sc.force_drift = cfg.force_drift;
   sc.refund_lag = cfg.refund_lag;
+  if (cfg.encoder_noise_known) {
+    sc.encoder_noise_lo = cfg.slave_encoder_noise / (1.0 + cfg.encoder_noise_tolerance);
+    sc.encoder_noise_hi = cfg.slave_encoder_noise * (1.0 + cfg.encoder_noise_tolerance);
+  }
+  sc.noise_tax_delta = cfg.noise_tax_delta;
+  sc.noise_tax_force_scale = cfg.noise_tax_force_scale;
   sc.deadband = cfg.backward_deadband;
   sc.deadband_params = cfg.backward_deadband_params;
   sc.actuation_delay = cfg.slave_model_actuation_delay >= 0 ? cfg.slave_model_actuation_delay

@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "tuushin/control/bounded_lp.hpp"
+#include "tuushin/control/noise_tax.hpp"
 
 #include "tuushin/control/tdpa.hpp"
 
@@ -640,11 +641,26 @@ double quantization_tax(const DevicePredictor& device, double phi);
 // deficit (a negative budget) from the work predicted over `tax_samples`
 // samples, less `confidence` standard deviations. With a resolution and
 // `rise_samples` > 0 such a rise also goes no further than the expected
-// work over `rise_samples` samples can pay for. The result's gain is the
-// fraction of the requested force that was removed, 1 - lambda. While the
-// device is not ready() the result is zero force.
+// work over `rise_samples` samples can pay for. With `noise` the tax is
+// NoiseTax's instead, as ChangeTax bounds it: no credit, and a rise or a
+// change of sign pays its bias part and its share of the noise's bound,
+// both as the quantization tax would be counted (a fixed part with
+// `tax_samples` = 0 is checked at the force found, which falls back to the
+// held force if it fails). The result's gain is the fraction of the
+// requested force that was removed, 1 - lambda. While the device is not
+// ready() the result is zero force.
 PcResult limit_force_predictive(double budget, double phi, const DevicePredictor& device,
                                 int hold_samples = 2, double confidence = 0.0,
-                                int tax_samples = 0, int rise_samples = 0);
+                                int tax_samples = 0, int rise_samples = 0,
+                                const ChangeTax* noise = nullptr);
+
+// The same with the tax `noise` charges, if not null, for a change from
+// the device's held force: on its plan at the peak first, then, a few
+// times while that raises the force, on its plan at the force found, which
+// the force found before still affords. Every plan bounds the charge, so
+// the force is affordable whichever was used.
+PcResult limit_force_predictive(double budget, double phi, const DevicePredictor& device,
+                                int hold_samples, double confidence, int tax_samples,
+                                int rise_samples, const NoiseTax* noise);
 
 }  // namespace tuushin::control

@@ -146,17 +146,47 @@ DeviceModel::DeviceModel(double mass, Nanos dt, double resolution, double force_
   }
 }
 
+bool DeviceModel::on_unseen_reading() const {
+  // A lead of whole samples: the command takes effect on a later reading,
+  // not within a sample, which the model would split by readings it saw.
+  const double lead = predictor().lead_samples();
+  return lead >= 1.0 - 1e-9 && std::fabs(lead - std::round(lead)) <= 1e-6;
+}
+
+void DeviceModel::set_noise_tax(double lo, double hi, double delta, double force_scale) {
+  const double q = predictor().resolution();
+  if (!(q > 0.0) || !(hi > 0.0)) {
+    noise_tax_.reset();
+    return;
+  }
+  const auto d = control::dither_bounds(lo, hi);
+  noise_tax_.emplace(q * d.bias, q * d.proxy, delta, force_scale);
+}
+
+const control::NoiseTax* DeviceModel::change_tax() const {
+  return noise_tax_ && on_unseen_reading() ? &*noise_tax_ : nullptr;
+}
+
 DeviceModel::Tax DeviceModel::book_tax(double phi) {
   Tax t;
   const control::DevicePredictor& dev = predictor();
   const double q = dev.resolution();
   if (!(q > 0.0)) return t;
+  if (noise_tax_) {
+    // Opened with the first command, before any force: U(0) is a debt the
+    // first rise must repay, as with a deficit.
+    t.charged += noise_tax_->open();
+    if (on_unseen_reading()) {
+      t.charged += noise_tax_->charge(dev.held_force(), phi);
+      return t;
+    }
+  }
   const auto line = control::quantization_tax_line(q, dev.held_force(), phi);
   if (line.beta == 0.0) {
-    t.charged = line.alpha;
+    t.charged += line.alpha;
   } else {
     const auto u = dev.count_bounds();
-    t.charged = line.worst(u.lo, u.hi);
+    t.charged += line.worst(u.lo, u.hi);
     if (!taxes_.empty() && taxes_.back().reading == readings_) {
       // A second command on the same reading acts from later than it, where
       // its bounds no longer hold: neither tax is refunded.
@@ -340,6 +370,8 @@ MasterController::MasterController(const MasterConfig& cfg)
       enc_(cfg.deadband_params) {
   model_.set_count_window(static_cast<std::size_t>(std::max(0, cfg.count_window)),
                           cfg.force_drift, static_cast<std::size_t>(std::max(0, cfg.refund_lag)));
+  model_.set_noise_tax(cfg.encoder_noise_lo, cfg.encoder_noise_hi, cfg.noise_tax_delta,
+                       cfg.noise_tax_force_scale);
 }
 
 void MasterController::receive(std::uint32_t seq, const Sample& s) {
@@ -417,7 +449,8 @@ MasterController::Step MasterController::step(Nanos now, Nanos sampled, double p
                               cfg_.pc_rise_samples.value_or(
                                   cfg_.passivity == Passivity::kModelMediated
                                       ? 0
-                                      : kReflectiveRiseSamples))
+                                      : kReflectiveRiseSamples),
+                              model_.change_tax())
                         : control::limit_force(port_, f_reflected, v_meas_, dt_);
     out.display_force = pc.value;
     out.pc_active = pc.active;
@@ -477,6 +510,8 @@ SlaveController::SlaveController(const SlaveConfig& cfg, double position)
       x_master_est_(position) {
   model_.set_count_window(static_cast<std::size_t>(std::max(0, cfg.count_window)),
                           cfg.force_drift, static_cast<std::size_t>(std::max(0, cfg.refund_lag)));
+  model_.set_noise_tax(cfg.encoder_noise_lo, cfg.encoder_noise_hi, cfg.noise_tax_delta,
+                       cfg.noise_tax_force_scale);
   if (cfg.passivity == Passivity::kReflective && cfg.report_contact_force) {
     throw std::invalid_argument(
         "SlaveController: energy reflection needs the coupling force reported, not the contact "
@@ -563,7 +598,9 @@ SlaveController::Step SlaveController::step(Nanos now, Nanos sampled, double pos
     // nothing will leave towards the slave. The predictive PC also pays the
     // force's quantization tax from its grant, and what the forces in flight
     // are expected to take out at worst.
-    const double tax = control::quantization_tax(dev, phi);
+    const control::NoiseTax* noise = model_.change_tax();
+    const double tax =
+        noise ? noise->cost(dev.held_force(), phi) : control::quantization_tax(dev, phi);
     const double lead = dev.lead_samples() > 0.0
                             ? dev.lead_work() - cfg_.pc_confidence * dev.lead_sd()
                             : 0.0;
@@ -575,7 +612,8 @@ SlaveController::Step SlaveController::step(Nanos now, Nanos sampled, double pos
     const auto pc = cfg_.predictive_pc
                         ? control::limit_force_predictive(grant.slave, phi, dev,
                                                           cfg_.pc_hold_samples, cfg_.pc_confidence,
-                                                          cfg_.pc_tax_samples, cfg_.pc_rise_samples)
+                                                          cfg_.pc_tax_samples, cfg_.pc_rise_samples,
+                                                          noise)
                         : control::limit_force(grant.slave, phi, velocity, dt_);
     f_ctrl_ = -pc.value;
     out.pc_active = pc.active || grant.limited;
