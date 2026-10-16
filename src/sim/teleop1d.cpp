@@ -72,7 +72,8 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
     std::fprintf(log.get(),
                  "t,x_ref,x_m,v_m,f_hand,f_display,x_s,v_s,x_cmd,x_master_est,v_req,v_c,f_slave,"
                  "f_contact,ein_m,eout_m,ein_s,eout_s,store,grant_m,pc_m,pc_s,sent_fwd,sent_bwd,"
-                 "delay_m,delay_s,model_k,model_surface,render_surface,x_command,w_act_m,reserve\n");
+                 "delay_m,delay_s,model_k,model_surface,render_surface,x_command,w_act_m,reserve,"
+                 "x_true_m,u_lo_m,u_hi_m\n");
   }
 
   // Physics: the devices integrate between control steps with the forces
@@ -113,6 +114,9 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
   mc.pc_confidence = cfg.pc_confidence;
   mc.pc_tax_samples = cfg.pc_tax_samples;
   mc.pc_rise_samples = cfg.master_pc_rise_samples;
+  mc.count_window = cfg.count_window;
+  mc.force_drift = cfg.force_drift;
+  mc.refund_lag = cfg.refund_lag;
   mc.deadband = cfg.forward_deadband;
   mc.deadband_params = cfg.forward_deadband_params;
   mc.actuation_delay = cfg.master_model_actuation_delay >= 0 ? cfg.master_model_actuation_delay
@@ -141,6 +145,9 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
   sc.pc_confidence = cfg.pc_confidence;
   sc.pc_tax_samples = cfg.pc_tax_samples;
   sc.pc_rise_samples = cfg.slave_pc_rise_samples;
+  sc.count_window = cfg.count_window;
+  sc.force_drift = cfg.force_drift;
+  sc.refund_lag = cfg.refund_lag;
   sc.deadband = cfg.backward_deadband;
   sc.deadband_params = cfg.backward_deadband_params;
   sc.actuation_delay = cfg.slave_model_actuation_delay >= 0 ? cfg.slave_model_actuation_delay
@@ -192,6 +199,7 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
     // 2. Sample both devices; this integrates the physics over the last
     //    sample with the forces that were held during it.
     const double x_m = master_dev.read_position(now_m);
+    const double x_true_m = master_dev.position();
     const double x_s = slave_dev.read_position(now_s);
     if (!check_plausible(now)) break;
     const double v_m = master_dev.true_velocity();
@@ -199,6 +207,7 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
 
     // 3. Master step.
     const auto ms = master.step(now_m, x_m, master_dev.force_cut_after());
+    const auto u_m = master.predictor().count_bounds();
     master_dev.command_force(-ms.display_force);
     const double f_display = ms.display_force;
     if (ms.send) fwd_sender.send(forward, fwd_queue, now_m, cfg.packet_bytes, ms.sample);
@@ -244,7 +253,8 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
       const auto& sp = slave.channel_port();
       std::fprintf(log.get(),
                    "%.4f,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,"
-                   "%.6g,%.6g,%.6g,%.6g,%.6g,%d,%d,%d,%d,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.9g,%.6g\n",
+                   "%.6g,%.6g,%.6g,%.6g,%.6g,%d,%d,%d,%d,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.9g,%.6g,"
+                   "%.9g,%.6g,%.6g\n",
                    t, x_ref, x_m, v_m, f_hand, f_display, x_s, v_s, slave.command(),
                    slave.master_estimate(), slave.requested_velocity(), slave.command_velocity(),
                    slave.reported_force(), f_contact, mp.input_energy(), mp.output_energy(),
@@ -256,7 +266,7 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
                    to_seconds(slave.actuation_delay()) * 1e3, master.renderer().model().stiffness,
                    master.renderer().model().surface, master.renderer().surface(),
                    master.command_position(), master_dev.actuator_work(),
-                   master.renderer().reserve());
+                   master.renderer().reserve(), x_true_m, u_m.lo, u_m.hi);
     }
 
     sum_pos_err2 += (x_m - x_s) * (x_m - x_s);

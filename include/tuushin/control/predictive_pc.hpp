@@ -2,7 +2,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <deque>
+#include <optional>
 #include <vector>
+
+#include "tuushin/control/bounded_lp.hpp"
 
 #include "tuushin/control/tdpa.hpp"
 
@@ -288,8 +293,9 @@ namespace tuushin::control {
 // substitute: at 50 N/s it halved the variation at 50 ms but cut the force
 // conveyed from 17 to 11 %.
 //
-// Measured in the 1-DoF simulator (reflective scheme, 55 um master and 1 um
-// slave encoders, 20 s over nine hand motions): with the filter, the tax,
+// Measured in the 1-DoF simulator with the tax that assumes nothing
+// (count_window 0, see "Crossings"; reflective scheme, 55 um master and
+// 1 um slave encoders, 20 s over nine hand motions): with the filter, the tax,
 // the model error margin and the ports paying their own excess first
 // (control/tdpa.hpp), the actuators never generate energy at 10, 50 or
 // 100 ms each way, on the nominal devices and on the eight misdescribed
@@ -307,6 +313,88 @@ namespace tuushin::control {
 // much. With the tax prepaid as well it conveyed 32, 12 and 4 %, and
 // nothing at all on the three motions too slow to pay it.
 //
+// Crossings. The tax above assumes nothing about where in its count the
+// device lies, and charges every rise as if the reading erred by a whole
+// count against it. A sampled device tells more: when the reading changes,
+// the device has just crossed the edge between two counts, and lies past it
+// by no more than it moved over the sample. With u = (the upper edge of the
+// count read) - x, in [0, q], a reading's error is u plus a constant, which
+// drops out of the sum by parts, and the work the books miss up to sample
+// N is
+//
+//   phi_N u_{N+1} - sum_{k <= N} u_k (phi_k - phi_{k-1}).
+//
+// With u_k known to lie in [lo, hi] the tax of the change at sample k is,
+// with phi > 0, (q - lo) per newton of rise and a credit of (q - hi) per
+// newton of fall (the first term is at most q phi_N throughout); with
+// phi < 0, hi per newton by which |phi| rises and a credit of lo per newton
+// by which it falls; a change of sign passes through zero. lo = 0 and
+// hi = q give the tax above. Just after the reading went up across an
+// edge, u lies in [q - D, q]; just after it went down, in [0, D]; D is how
+// far the device can have moved past that edge. A device that dithers
+// across an edge by d into a spring of stiffness K pays (2 D - q) K q for a
+// round trip, a credit where D < q / 2: the spring does -2 d K q of work on
+// it, which the tax with D = d books exactly, while the tax above books
+// -2 K q^2.
+//
+// Bounds from the window. Where the device lay at each reading the
+// readings tell together, not one by one. Over the last count_window
+// readings the device moved from each to the next as a mass under the port
+// force and an H that changes by at most force_drift N/s, and each reading
+// put it within its count: constraints linear in the state at the window's
+// start and the changes of H, so the bounds on u at any reading in the
+// window are two linear programs, which BoundedLp solves (the
+// bounded-variable primal simplex of G. B. Dantzig, "Linear programming and
+// extensions", 1963, with R. G. Bland's rule, "New finite pivoting rules
+// for the simplex method", Math. Oper. Res. 2(2), 1977). This is
+// set-membership estimation with quantized measurements, as in M. Casini,
+// A. Garulli and A. Vicino, "Adaptive threshold selection for set
+// membership state estimation with quantized measurements", IEEE T-AC,
+// 2025, but over a window, a smoother ("Optimal set-membership smoothing",
+// arXiv 2410.09857): later readings narrow the bounds at earlier ones.
+// Within a sample H may stray from its mean by the drift, which the model
+// leaves out; each bound is widened by the most that moves the device. The
+// books then bound the true work from below as far as the device is a mass
+// of the mass assumed, pushed by an H that drifts no faster than
+// force_drift and does not jump (Coulomb friction's does), no longer for
+// every motion. Readings that no such motion explains leave the program
+// infeasible, and the window starts again from the next.
+//
+// Refunds. A force acts from the reading it was commanded on, and the
+// readings after it narrow where the device lay at that one. The books
+// charge each change at once at the bounds the readings so far give
+// (count_bounds()), and the PC chooses the force against that charge, a
+// fall's credit included. refund_lag readings later they settle it: at most
+// the worst of its line over the bounds then known and, since the u in a
+// window are not independent, at most what bounding it jointly with the
+// changes settled before it within the window allows (worst_tax(): the
+// largest sum of their lines the readings allow, less what those were
+// settled at). Over a chatter of the force the joint bound is far below
+// the sum of the termwise ones, since the device cannot lie at the worst
+// place for every change at once. The books are refunded the difference.
+//
+// Nothing is known, and the tax is the one above, after an irregular
+// sample, on readings that change by a fraction of a count or are noisier
+// than their quantization (set_reading_noise: a variance above q^2 / 12,
+// as on a magnetic encoder with half a count of noise), for a force that
+// takes effect only after the next reading (a lead of a sample or more),
+// and for a second command on the same reading, which acts from later than
+// its bounds hold.
+//
+// Measured in the 1-DoF simulator (model-mediated scheme, 100 ms each way,
+// 55 um encoders on both sides, 20 s over twelve hand motions, no rise
+// hold): with exact encoders the master's force breaks a contact into 1.01
+// per hand cycle on average, varies by 22.9 N/s and falls short of the
+// rendered force by 0.25 N RMS. With the tax above it breaks it into 3.59,
+// varies by 125 N/s and falls short by 5.7 N; with the window's bounds and
+// refunds settled term by term, 1.56, 37 N/s and 0.68 N; settled jointly,
+// 1.59, 36 N/s and 0.54 N; with the PC counting on a fall's credit as well,
+// 1.15, 35 N/s and 0.58 N. Taxed at the true u, which no controller knows,
+// the master gives 1.28, 29 N/s and 0.26 N: what is left is the width of
+// the bounds near rest, not the use made of them. On the same runs the
+// joint settlement overcharged the true tax by 3.0 mJ, against 6.3 mJ term
+// by term, and never undercharged it.
+//
 // Sign convention: power into the controlled two-port is phi * dx, and the
 // device accelerates by -phi / m. At a haptic master phi is the displayed
 // force when it pushes against the positive direction; at a slave robot phi
@@ -317,6 +405,15 @@ namespace tuushin::control {
 struct ForceSegment {
   double phi = 0.0;
   double samples = 0.0;
+};
+
+// The quantization tax of a change of the port force as a function of u,
+// where the device lies in its count (see "Crossings"): alpha + beta * u.
+// worst() is its largest value for u in [lo, hi]; with lo = 0 and hi = q
+// that is quantization_tax(). Negative for a refund.
+struct TaxLine {
+  double alpha = 0.0, beta = 0.0;
+  double worst(double lo, double hi) const { return alpha + beta * (beta > 0.0 ? hi : lo); }
 };
 
 class DevicePredictor {
@@ -376,6 +473,33 @@ class DevicePredictor {
   double lead_work() const;
   double lead_sd() const;
 
+  // Where the device lies in the count its encoder reads, as bounds on
+  // u = (the count's upper edge) - x (m, see "Crossings"), [0, q] when
+  // nothing is known: count_bounds_at(lag) at the reading `lag` readings
+  // before the last, from all the readings in the window, those after it
+  // included; count_bounds() at the last reading, for a force that takes
+  // effect before the next one (nothing is known for a lead of a sample or
+  // more).
+  struct CountBounds {
+    double lo = 0.0, hi = 0.0;
+  };
+  CountBounds count_bounds() const;
+  CountBounds count_bounds_at(std::size_t lag) const;
+  // The largest sum of taxes, each `line` at u at the reading `lag`
+  // readings before the last, that the readings in the window allow: the
+  // u are not independent, since the device moved from one to the next as
+  // the model says. +infinity when nothing is known of some u.
+  struct LaggedTax {
+    std::size_t lag;
+    TaxLine line;
+  };
+  double worst_tax(const std::vector<LaggedTax>& taxes) const;
+  // How many readings the window holds now.
+  std::size_t count_window_readings() const { return window_.size(); }
+  // The bounds rest on the last `readings` readings, and on the forces other
+  // than the port force changing by at most `force_drift` N/s.
+  void set_count_window(std::size_t readings, double force_drift);
+
   // The port force held before the next one: the last of the lead, or the
   // force observed at the end of the last sample, or 0 after
   // observe_irregular(), whose force was cut. The quantization tax of the
@@ -426,6 +550,16 @@ class DevicePredictor {
   static void held_forces(const std::vector<ForceSegment>& segments, double r, double& phi_d,
                           double& phi_v);
   void filter(double dx, double phi_d, double phi_v, double r, bool regular);
+  // Keeps a sample for count_bounds_at(), or forgets them all after one
+  // the model does not describe or that moved by a fraction of a count.
+  void remember(double dx, double phi_d, double phi_v, double r, bool regular);
+  // Builds the linear program over the window and finds a feasible point;
+  // forgets the window if there is none. True if there is one.
+  bool solve_window() const;
+  // How far the device may lie from where the model puts it at the reading
+  // `lag` before the last, in counts: what H's drift within the samples
+  // until then can add up to.
+  double model_slack(std::size_t lag) const;
   // Standard deviation of a quantity whose error is gv times that of the
   // velocity, k c times that of H, and k times the model error.
   double spread(double gv, double k) const;
@@ -457,6 +591,20 @@ class DevicePredictor {
   // running mean of nu^2 - S.
   double miss_ = 0.0;
   double excess_ = 0.0;
+  // The readings count_bounds_at() rests on, oldest first: the counts each
+  // moved by and the sample's port force and length, as push() takes them.
+  struct Reading {
+    double counts, phi_d, phi_v, r;
+  };
+  // A window that turns out infeasible is forgotten when found so.
+  mutable std::deque<Reading> window_;
+  std::size_t window_size_;
+  double force_drift_;
+  // The window's linear program, built on demand, and the bounds found,
+  // per lag (lo > hi where not yet found).
+  mutable std::optional<BoundedLp> lp_;
+  mutable bool solved_ = false;
+  mutable std::vector<CountBounds> found_;
 };
 
 // Energy (J) to book as an output when the port force goes from `prev`, the
@@ -469,18 +617,28 @@ class DevicePredictor {
 // |sum_k phi_k (e_{k+1} - e_k)| can be when every reading error lies in one
 // interval of width q.
 double quantization_tax(double q, double prev, double phi);
+// The same as a function of u, where the device lies in its count (see
+// "Crossings"), as TaxLine.
+TaxLine quantization_tax_line(double q, double prev, double phi);
+// Its worst value for u known to lie in [lo, hi] within [0, q].
+double quantization_tax(double q, double prev, double phi, double lo, double hi);
+// The tax of moving `device`'s held force to phi, with its resolution and
+// count_bounds().
+double quantization_tax(const DevicePredictor& device, double phi);
 
 // Scales `phi` towards zero so that the predicted work over the coming
 // sample, and over `hold_samples` samples if that is larger than one, less
 // `confidence` standard deviations of it (DevicePredictor::hold_sd), stays
 // above -budget (budget in J; negative values count as zero). With an
 // encoder resolution the quantization tax of moving from the held force to
-// the result counts as well: against each of those predictions when
-// `tax_samples` is 0, and otherwise only for a rise beyond the held force.
-// With `tax_samples` > 0, with or without a resolution, such a rise must
-// repay its tax and any deficit (a negative budget) from the work
-// predicted over `tax_samples` samples, less `confidence` standard
-// deviations. With a resolution and
+// the result counts as well, as quantization_tax(device, result) charges
+// it: a rise's tax and a fall's credit at the device's count_bounds()
+// (later refunds are booked, not counted on). The credit counts against
+// each of those predictions; the tax does when `tax_samples` is 0, and
+// otherwise only for a rise beyond the held force. With `tax_samples` > 0,
+// with or without a resolution, such a rise must repay its tax and any
+// deficit (a negative budget) from the work predicted over `tax_samples`
+// samples, less `confidence` standard deviations. With a resolution and
 // `rise_samples` > 0 such a rise also goes no further than the expected
 // work over `rise_samples` samples can pay for. The result's gain is the
 // fraction of the requested force that was removed, 1 - lambda. While the

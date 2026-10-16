@@ -189,6 +189,23 @@ class DeviceModel {
   // The variance of a reading's error the filters assume, m^2.
   double reading_noise() const { return bank_[best_].dev.reading_noise(); }
 
+  // The quantization tax of commanding phi next (control::quantization_tax,
+  // at the worst place in its count the device may lie in), to book as an
+  // output, and the refunds of taxes booked `refund_lag` readings ago,
+  // whose worst place the readings since have narrowed (see "Crossings" in
+  // control/predictive_pc.hpp), to book as an input. Call once per command
+  // with a resolution.
+  struct Tax {
+    double charged = 0.0;
+    double refund = 0.0;
+  };
+  Tax book_tax(double phi);
+  // How many readings the bounds on where the device lies in its count rest
+  // on (0: none, the tax assumes nothing), how fast they take the forces
+  // other than the port force to change (N/s), and how many readings after
+  // a tax it is refunded.
+  void set_count_window(std::size_t readings, double force_drift, std::size_t refund_lag);
+
  private:
   struct Candidate {
     Nanos delay;
@@ -206,6 +223,25 @@ class DeviceModel {
   bool adapt_;
   double log_walk_ = 0.0;  // log of the factor on the filters' force walk
   std::optional<control::ReadingNoise> noise_;
+  // Taxes booked within the last refund_lag_ readings, with the line of
+  // each in u, the bounds on u when it was booked and what it charged.
+  struct TaxRecord {
+    long reading;
+    control::TaxLine line;
+    double lo, hi, charged;
+  };
+  std::deque<TaxRecord> taxes_;
+  // Taxes refunded within the window, with what each was finally charged:
+  // their sum bounds the true taxes since the first of them, which a joint
+  // bound over the window may undercut (see book_tax).
+  struct Settled {
+    long reading;
+    control::TaxLine line;
+    double net;
+  };
+  std::deque<Settled> settled_;
+  long readings_ = 0;  // readings observed so far
+  std::size_t refund_lag_;
 };
 
 struct MasterConfig {
@@ -234,7 +270,12 @@ struct MasterConfig {
   // cannot pay. With a resolution a rise also goes no further than the
   // force the expected motion could pay for over `pc_rise_samples` samples,
   // so that the force does not rise on every count transition and decay
-  // before the next, paying the tax each time (0 lets it).
+  // before the next, paying the tax each time (0 lets it). Unset, it is 64
+  // in the reflective architecture and 0 in the model-mediated one: there
+  // the rendered wall holds the master where the mass the PC predicts with
+  // would yield over 64 samples, and the hold kept the force far below the
+  // wall's (an RMS shortfall of 7.5 N against 0.58 N without at 100 ms,
+  // over tools/tuushin-sim's hand sweep; 32 samples left 1.5 N).
   // With `estimate_reading_noise` the filters take a reading's error to be
   // as large as the readings' second differences show it to be, and at
   // least the quantization's (control/reading_noise.hpp).
@@ -244,7 +285,15 @@ struct MasterConfig {
   bool estimate_reading_noise = true;
   double pc_confidence = 1.0;
   int pc_tax_samples = 4;
-  int pc_rise_samples = 64;
+  std::optional<int> pc_rise_samples;
+  // With a resolution: how many readings the bounds on where the device
+  // lies in its count rest on (0: the tax assumes nothing about it), how
+  // fast they take the operator's push to change (N/s), and how many
+  // readings after a tax it is refunded as far as the readings since
+  // narrow those bounds (0: never; control/predictive_pc.hpp, "Crossings").
+  int count_window = 24;
+  double force_drift = 50.0;
+  int refund_lag = 12;
   bool deadband = false;
   codec::DeadbandParams deadband_params{0.1, 0.002, from_millis(100)};
   // How long after a command the device applies it (ActuatorSchedule). The
@@ -338,6 +387,8 @@ class MasterController {
   // (DeviceModel::set_actuation_delay).
   void set_actuation_delay(Nanos delay) { model_.set_actuation_delay(delay); }
   double reading_noise() const { return model_.reading_noise(); }  // m^2
+  // The device model the controller predicts and books with.
+  const control::DevicePredictor& predictor() const { return model_.predictor(); }
   std::uint64_t samples_sent() const { return sent_; }
   // kModelMediated: the model the master renders, and the position sent
   // with the last step, the master's less the rendering's offset.
@@ -402,6 +453,10 @@ struct SlaveConfig {
   double pc_confidence = 1.0;
   int pc_tax_samples = 4;
   int pc_rise_samples = 0;
+  // As at the master, with the environment's push.
+  int count_window = 24;
+  double force_drift = 50.0;
+  int refund_lag = 12;
   bool deadband = false;
   codec::DeadbandParams deadband_params{0.1, 0.05, from_millis(100)};
   // Between samples the slave extrapolates the master position with the last
@@ -478,6 +533,8 @@ class SlaveController {
   Nanos actuation_delay() const { return model_.actuation_delay(); }
   void set_actuation_delay(Nanos delay) { model_.set_actuation_delay(delay); }
   double reading_noise() const { return model_.reading_noise(); }  // m^2
+  // The device model the controller predicts and books with.
+  const control::DevicePredictor& predictor() const { return model_.predictor(); }
   std::uint64_t samples_sent() const { return sent_; }
   // kModelMediated: the slave's estimate of the wall.
   const control::WallModel& wall() const { return estimator_.model(); }

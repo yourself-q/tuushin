@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 namespace tuushin::control {
@@ -26,12 +27,29 @@ constexpr double kAdaptLogMax = 5.545177444479562;  // 2 ln 16
 // How long the model error margin remembers a miss: the time constant of
 // its decay, in s.
 constexpr double kMissSeconds = 0.05;
+// The readings the bounds on where the device lies in its count rest on,
+// and how fast they take the forces other than the port force to change,
+// N/s ("Crossings").
+constexpr std::size_t kCountWindow = 24;
+constexpr double kForceDrift = 50.0;
+// How far from a whole number of counts a reading displacement may lie and
+// still count as one: rounding, not a resolution other than the filter's.
+constexpr double kCountTolerance = 1e-6;
+// How far outside its count, in counts, the linear program lets the device
+// lie beyond what the force's drift within a sample allows: rounding.
+constexpr double kCountSlack = 1e-9;
 
 }  // namespace
 
 DevicePredictor::DevicePredictor(double mass, double dt, double resolution, double force_rate,
                                  bool adapt_force_rate)
-    : dt_(dt), mass_(mass), q_(resolution), force_rate_(force_rate), adapt_(adapt_force_rate) {
+    : dt_(dt),
+      mass_(mass),
+      q_(resolution),
+      force_rate_(force_rate),
+      adapt_(adapt_force_rate),
+      window_size_(kCountWindow),
+      force_drift_(kForceDrift) {
   if (!(mass > 0.0) || !(dt > 0.0)) {
     throw std::invalid_argument("DevicePredictor: mass and dt must be positive");
   }
@@ -169,7 +187,10 @@ void DevicePredictor::push(double dx, double phi_d, double phi_v, double r, bool
   phiv1_ = phi_v;
   r1_ = r;
   regular_ = regular ? std::min(regular_ + 1, 2) : 0;
-  if (q_ > 0.0) filter(dx, phi_d, phi_v, r, regular);
+  if (q_ > 0.0) {
+    filter(dx, phi_d, phi_v, r, regular);
+    remember(dx, phi_d, phi_v, r, regular);
+  }
 }
 
 void DevicePredictor::filter(double dx, double phi_d, double phi_v, double r, bool regular) {
@@ -229,6 +250,166 @@ void DevicePredictor::filter(double dx, double phi_d, double phi_v, double r, bo
   for (int i = 0; i < 3; ++i) {
     for (int j = 0; j < 3; ++j) p_[i][j] = p[i][j] - k[i] * p[0][j];
   }
+}
+
+void DevicePredictor::remember(double dx, double phi_d, double phi_v, double r, bool regular) {
+  lp_.reset();
+  solved_ = false;
+  found_.clear();
+  const double counts = dx / q_;
+  if (!regular || std::fabs(counts - std::round(counts)) > kCountTolerance) {
+    // Not a sample the model describes, or not whole counts: the encoder's
+    // resolution is not the one assumed.
+    window_.clear();
+    return;
+  }
+  window_.push_back({std::round(counts), phi_d, phi_v, r});
+  while (window_.size() > window_size_) window_.pop_front();
+}
+
+void DevicePredictor::set_count_window(std::size_t readings, double force_drift) {
+  window_size_ = readings;
+  force_drift_ = force_drift;
+  while (window_.size() > window_size_) window_.pop_front();
+  lp_.reset();
+  solved_ = false;
+  found_.clear();
+}
+
+bool DevicePredictor::solve_window() const {
+  // In counts, the state at the window's start: s0, where the device lies
+  // from its count's lower edge; w0, its velocity times dt; g0, H times
+  // c / q. H changes from one sample to the next by xi_j times the drift
+  // over the time between their middles, xi_j in [-1, 1], and sigma_j is
+  // where the device lies after sample j, an affine function of
+  // z = (s0, w0, g0, xi): S_j z + K_j - sigma_j = 0, sigma_j in [0, 1]. Over
+  // a sample of r, the model moves s by r w + r^2 (g - c phi_d / q) less the
+  // counts the reading moved by, and w by 2 r (g - c phi_v / q).
+  if (solved_) return lp_.has_value();
+  solved_ = true;
+  const std::size_t n = window_.size();
+  if (n == 0) return false;
+  const std::size_t nz = 3 + (n - 1), cols = nz + n;
+  lp_.emplace(n, cols);
+  BoundedLp& lp = *lp_;
+  const double cq = c_ / q_;
+  const double kappa = cq * force_drift_ * dt_;
+  std::vector<double> sv(nz, 0.0), wv(nz, 0.0), gv(nz, 0.0);
+  sv[0] = wv[1] = gv[2] = 1.0;
+  double ks = 0.0, kw = 0.0, span = 0.0, moved = 0.0;
+  for (const auto& rd : window_) {
+    span += rd.r;
+    moved += rd.counts;
+  }
+  // Phase 1 starts in the middle of the count, at the mean velocity, with
+  // the filter's H.
+  std::vector<double> z(nz, 0.0);
+  z[0] = 0.5;
+  z[1] = moved / span;
+  z[2] = cq * h_;
+  lp.set_bounds(0, 0.0, 1.0);
+  lp.set_bounds(1, -std::numeric_limits<double>::infinity(),
+                std::numeric_limits<double>::infinity());
+  lp.set_bounds(2, -std::numeric_limits<double>::infinity(),
+                std::numeric_limits<double>::infinity());
+  for (std::size_t j = 0; j + 1 < n; ++j) lp.set_bounds(3 + j, -1.0, 1.0);
+  for (std::size_t k = 0; k < nz; ++k) lp.set_start(k, z[k]);
+  double slack = kCountSlack;
+  for (std::size_t j = 0; j < n; ++j) {
+    const Reading& rd = window_[j];
+    const double r = rd.r;
+    if (j > 0) gv[3 + j - 1] = kappa * 0.5 * (window_[j - 1].r + r);
+    for (std::size_t k = 0; k < nz; ++k) sv[k] += r * wv[k] + r * r * gv[k];
+    ks += r * kw - r * r * cq * rd.phi_d - rd.counts;
+    for (std::size_t k = 0; k < nz; ++k) wv[k] += 2.0 * r * gv[k];
+    kw -= 2.0 * r * cq * rd.phi_v;
+    // Within a sample H may stray from its mean by the drift; that moves the
+    // device by up to drift h^3 / (12 m), which the model leaves out and
+    // which adds up from sample to sample.
+    slack += kappa * r * r * r / 6.0;
+    double at = ks;
+    for (std::size_t k = 0; k < nz; ++k) {
+      if (sv[k] != 0.0) lp.set(j, k, sv[k]);
+      at += sv[k] * z[k];
+    }
+    lp.set(j, nz + j, -1.0);
+    lp.set_rhs(j, -ks);
+    lp.set_bounds(nz + j, -slack, 1.0 + slack);
+    lp.set_start(nz + j, at);
+  }
+  if (!lp.solve_feasible()) {
+    // The readings leave no motion the model allows: H changed faster than
+    // assumed, or the model does not hold. Start again from the next.
+    window_.clear();
+    lp_.reset();
+    return false;
+  }
+  return true;
+}
+
+double DevicePredictor::model_slack(std::size_t lag) const {
+  double slack = kCountSlack;
+  const double kappa = c_ / q_ * force_drift_ * dt_;
+  for (std::size_t j = 0; j + lag < window_.size(); ++j) {
+    const double r = window_[j].r;
+    slack += kappa * r * r * r / 6.0;
+  }
+  return slack;
+}
+
+double DevicePredictor::worst_tax(const std::vector<LaggedTax>& taxes) const {
+  constexpr double kUnknown = std::numeric_limits<double>::infinity();
+  if (taxes.empty()) return 0.0;
+  if (q_ <= 0.0 || noise_ > q_ * q_ / 12.0) return kUnknown;
+  for (const auto& t : taxes) {
+    if (t.lag >= window_.size()) return kUnknown;
+  }
+  if (!solve_window()) return kUnknown;
+  // With u = q (1 - s) the sum is sum (alpha + q beta) - q sum beta s,
+  // largest where sum beta s is least; each s may lie off the model's by
+  // its slack.
+  const std::size_t n = window_.size(), nz = 2 + n;
+  std::vector<double> c(lp_->cols(), 0.0);
+  double fixed = 0.0;
+  for (const auto& t : taxes) {
+    c[nz + (n - 1 - t.lag)] += t.line.beta;
+    fixed += t.line.alpha + q_ * t.line.beta + q_ * std::fabs(t.line.beta) * model_slack(t.lag);
+  }
+  double least = 0.0;
+  if (!lp_->minimize(c, least)) return kUnknown;
+  return fixed - q_ * least;
+}
+
+DevicePredictor::CountBounds DevicePredictor::count_bounds() const {
+  if (lead_samples_ >= 1.0) return {0.0, q_};
+  return count_bounds_at(0);
+}
+
+DevicePredictor::CountBounds DevicePredictor::count_bounds_at(std::size_t lag) const {
+  const CountBounds unknown{0.0, q_};
+  // Nothing is known on readings noisier than their quantization.
+  if (q_ <= 0.0 || noise_ > q_ * q_ / 12.0 || lag >= window_.size()) return unknown;
+  if (!solve_window() || lag >= window_.size()) return unknown;
+  if (found_.size() <= lag) found_.resize(lag + 1, CountBounds{1.0, 0.0});
+  CountBounds& f = found_[lag];
+  if (f.lo > f.hi) {
+    const std::size_t n = window_.size(), nz = 2 + n, col = nz + (n - 1 - lag);
+    std::vector<double> c(lp_->cols(), 0.0);
+    double least = 0.0, most = 0.0;
+    c[col] = 1.0;
+    const bool ok = lp_->minimize(c, least);
+    c[col] = -1.0;
+    if (!ok || !lp_->minimize(c, most)) return unknown;
+    most = -most;
+    // The device's true place differs from the model's by up to the slack
+    // within samples up to that reading.
+    const double slack = model_slack(lag);
+    least = std::clamp(least - slack, 0.0, 1.0);
+    most = std::clamp(most + slack, 0.0, 1.0);
+    // u = q (1 - s).
+    f = {q_ * (1.0 - most), q_ * (1.0 - least)};
+  }
+  return f;
 }
 
 double DevicePredictor::force_rate() const {
@@ -298,15 +479,22 @@ double affordable_scale(double g, double h, double b) {
   return std::clamp(lambda, 0.0, 1.0);
 }
 
-// The same with the tax q * max(0, lambda * F - a) added to the cost, for
-// F = |phi| > 0 and a >= 0 the part of the held force with phi's sign.
-double affordable_scale_taxed(double g, double h, double b, double F, double a, double q) {
-  const double l = affordable_scale(g, h, b);
-  if (q <= 0.0 || l * F <= a) return l;
-  // Beyond lambda0 = a / F the cost is steeper by q * F. The constraint is
-  // still concave and holds at lambda0 (untaxed there, and lambda0 < l), so
-  // its largest root beyond lambda0 is the answer.
-  return std::max(a / F, affordable_scale(g - q * F, h, b + q * a));
+// The same with a tax added to the cost, for F = |phi| > 0 and a >= 0 the
+// part of the held force with phi's sign: `rise` per newton by which
+// lambda * F exceeds a, and `fall` per newton by which it falls short of
+// it, a credit.
+double affordable_scale_taxed(double g, double h, double b, double F, double a, double rise,
+                              double fall) {
+  // Up to lambda0 = a / F the cost is -lambda * (g - fall * F) +
+  // lambda^2 * h - fall * a, which holds at lambda = 0.
+  const double l = affordable_scale(g - fall * F, h, b + fall * a);
+  if (rise == fall || l * F < a) return l;
+  // Beyond lambda0 the cost is the other quadratic, which agrees with the
+  // first at lambda0 and holds there (lambda0 <= l; with a = 0 there is no
+  // first piece, and the cost holds at zero). Each holds on an
+  // interval that contains zero, so the largest root of the second beyond
+  // lambda0 is the answer.
+  return std::max(a / F, affordable_scale(g - rise * F, h, b + rise * a));
 }
 
 }  // namespace
@@ -314,6 +502,33 @@ double affordable_scale_taxed(double g, double h, double b, double F, double a, 
 double quantization_tax(double q, double prev, double phi) {
   const double kept = phi * prev > 0.0 ? std::fabs(prev) : 0.0;
   return q * std::max(0.0, std::fabs(phi) - kept);
+}
+
+namespace {
+
+// The tax of a change from `from` to `to` on one side of zero: per newton
+// by which |phi| grows, q - u for a positive force and u for a negative one.
+TaxLine side_tax(double q, double from, double to) {
+  const double side = to != 0.0 ? to : from;
+  const double d = std::fabs(to) - std::fabs(from);
+  return side > 0.0 ? TaxLine{q * d, -d} : TaxLine{0.0, d};
+}
+
+}  // namespace
+
+TaxLine quantization_tax_line(double q, double prev, double phi) {
+  if (prev * phi >= 0.0) return side_tax(q, prev, phi);
+  const TaxLine a = side_tax(q, prev, 0.0), b = side_tax(q, 0.0, phi);
+  return {a.alpha + b.alpha, a.beta + b.beta};
+}
+
+double quantization_tax(double q, double prev, double phi, double lo, double hi) {
+  return quantization_tax_line(q, prev, phi).worst(lo, hi);
+}
+
+double quantization_tax(const DevicePredictor& device, double phi) {
+  const auto u = device.count_bounds();
+  return quantization_tax(device.resolution(), device.held_force(), phi, u.lo, u.hi);
 }
 
 PcResult limit_force_predictive(double budget, double phi, const DevicePredictor& device,
@@ -335,18 +550,28 @@ PcResult limit_force_predictive(double budget, double phi, const DevicePredictor
   }
   const double b = std::max(0.0, budget);
   const double q = device.resolution();
+  // What a newton of rise beyond the held force is taxed, and what a newton
+  // of fall towards zero is credited, as the books charge it
+  // (quantization_tax_line at the device's count_bounds()); a held force of
+  // the other sign is credited its fall to zero whatever phi's size.
+  const auto u = device.count_bounds();
+  const double rate = phi > 0.0 ? q - u.lo : u.hi;
+  const double credit = phi > 0.0 ? q - u.hi : u.lo;
   const double F = std::fabs(phi);
-  const double kept = phi * device.held_force() > 0.0 ? std::fabs(device.held_force()) : 0.0;
+  const double held = device.held_force();
+  const double kept = phi * held > 0.0 ? std::fabs(held) : 0.0;
+  const double flip = phi * held < 0.0 ? -quantization_tax(q, held, 0.0, u.lo, u.hi) : 0.0;
   // W(lambda) = lambda * g - lambda^2 * h with h > 0 over n samples, its
   // lower confidence bound with `confidence`.
   auto g = [&](double n) { return phi * device.hold_base(n) - confidence * F * device.hold_sd(n); };
   auto h = [&](double n) { return phi * phi * device.hold_compliance(n); };
   // The tax is paid once whatever the horizon: within every horizon, or
   // with tax_samples over that horizon alone.
-  const double tq = tax_samples > 0 ? 0.0 : q;
-  double l = affordable_scale_taxed(g(1.0), h(1.0), b, F, kept, tq);
+  const double tq = tax_samples > 0 ? 0.0 : rate;
+  double l = affordable_scale_taxed(g(1.0), h(1.0), b + flip, F, kept, tq, credit);
   if (hold_samples > 1) {
-    l = std::min(l, affordable_scale_taxed(g(hold_samples), h(hold_samples), b, F, kept, tq));
+    l = std::min(l, affordable_scale_taxed(g(hold_samples), h(hold_samples), b + flip, F, kept,
+                                           tq, credit));
   }
   if (rise_samples > 0 && q > 0.0 && l * F > kept) {
     // A rise, which pays a tax, goes no further than the force the expected
@@ -357,13 +582,13 @@ PcResult limit_force_predictive(double budget, double phi, const DevicePredictor
   }
   if (tax_samples > 0 && l * F > kept) {
     // A rise must repay the books' deficit and its own tax within
-    // tax_samples = N:
-    // lambda * g(N) - lambda^2 * h(N) - q * (lambda * F - kept) >= -budget.
+    // tax_samples = N, less a held force of the other sign's credit:
+    // lambda * g(N) - lambda^2 * h(N) - rate * (lambda * F - kept) >= -budget - flip.
     // The left side is concave, so the rises that do lie in one interval
     // [lo, hi]. Books in deficit can exclude the small rises; if the other
     // constraints allow only those, the force stays at the kept one.
-    const double l0 = kept / F, gn = g(tax_samples) - q * F, hn = h(tax_samples);
-    const double c0 = q * kept + budget;
+    const double l0 = kept / F, gn = g(tax_samples) - rate * F, hn = h(tax_samples);
+    const double c0 = rate * kept + budget + flip;
     const double disc = gn * gn + 4.0 * hn * c0;
     if (disc < 0.0) {
       l = l0;

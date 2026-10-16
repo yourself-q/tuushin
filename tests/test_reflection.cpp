@@ -369,8 +369,11 @@ TEST_CASE(predictive_pc_force_is_the_largest_affordable_with_the_tax) {
     const int hold = rng.bernoulli(0.5) ? 1 : 2;
     const auto r = limit_force_predictive(budget, phi, pred, hold);
     const auto cost = [&](double f) {
-      double worst = quantization_tax(q, held, f) - pred.work(f);
-      if (hold > 1) worst = std::max(worst, quantization_tax(q, held, f) - pred.hold_work(f, hold));
+      // The tax at the bounds the readings put on where the device lies in
+      // its count, as the PC charges it.
+      const double tax = quantization_tax(pred, f);
+      double worst = tax - pred.work(f);
+      if (hold > 1) worst = std::max(worst, tax - pred.hold_work(f, hold));
       return worst;
     };
     const bool sign_ok = r.value * phi >= 0.0 && std::fabs(r.value) <= std::fabs(phi);
@@ -598,11 +601,16 @@ TEST_CASE(predictive_pc_force_is_the_largest_affordable_over_the_horizon) {
         limit_force_predictive(budget, phi, pred, hold, confidence, horizon, rise_horizon);
     // The least slack over the constraints; negative means violated.
     const auto slack = [&](double f) {
-      const double b = std::max(0.0, budget), tax = quantization_tax(q, held, f);
+      const double b = std::max(0.0, budget), tax = quantization_tax(pred, f);
       const auto lcb = [&](double n) {
         return pred.hold_work(f, n) - confidence * std::fabs(f) * pred.hold_sd(n);
       };
-      const double prepaid = horizon > 0 ? 0.0 : tax;
+      // With a horizon for the rise only a fall towards zero, a credit, is
+      // charged against the others.
+      const double fallen = f * held > 0.0 ? (std::fabs(f) < std::fabs(held) ? f : held) : 0.0;
+      const auto u = pred.count_bounds();
+      const double prepaid =
+          horizon > 0 ? quantization_tax(pred.resolution(), held, fallen, u.lo, u.hi) : tax;
       double s = b + lcb(1.0) - prepaid;
       if (hold > 1) s = std::min(s, b + lcb(hold) - prepaid);
       // A rise, beyond the rounding of a force scaled back to the kept one;

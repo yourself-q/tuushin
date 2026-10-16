@@ -2,6 +2,7 @@ add_executable(tuushin_tests
   test_main.cpp
   test_deadband.cpp
   test_bounded_lp.cpp
+  test_count_bounds.cpp
   test_tdpa.cpp
   test_reading_noise.cpp
   test_channel.cpp

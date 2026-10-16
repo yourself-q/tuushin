@@ -300,9 +300,16 @@ TEST_CASE(teleop_coarse_encoder_rises_that_last_chatter_less) {
   // affordable force, and every count it does not lowers it again: each
   // rise pays the tax at once, and the force chatters at the count rate.
   // Holding a rise to the force the expected motion could keep paying for
-  // over 64 samples removes a quarter to two thirds of the chatter on every
-  // hand motion, and costs no energy. (Before the model error margin, which
-  // calms the force too, it removed one half to three quarters.)
+  // over 64 samples calms it on every hand motion, and costs no energy.
+  // With the bounds the readings put on where the master lies in its count
+  // the tax is lighter, and how much chatter is left to remove varies
+  // more: the hold removes 12 % of it (100 ms, 0.6 Hz, 5 cm, where the
+  // bounds alone calm the force nearly as far as the hold does under the
+  // tax that assumes nothing) to 70 %, and 58 % over all twelve motions.
+  // (Under that tax it removed a quarter to two thirds on every motion;
+  // before the model error margin, which calms the force too, one half to
+  // three quarters.)
+  double held_sum = 0.0, unheld_sum = 0.0;
   for (int ms : {10, 50, 100}) {
     for (double freq : {0.4, 0.6}) {
       for (double amplitude : {0.03, 0.05}) {
@@ -313,10 +320,13 @@ TEST_CASE(teleop_coarse_encoder_rises_that_last_chatter_less) {
         CHECK(!held.diverged);
         CHECK(held.max_book_excess < 1e-12);
         CHECK(held.min_true_margin > -1e-9);
-        CHECK(held.display_force_variation < 0.8 * unheld.display_force_variation);
+        CHECK(held.display_force_variation < 0.95 * unheld.display_force_variation);
+        held_sum += held.display_force_variation;
+        unheld_sum += unheld.display_force_variation;
       }
     }
   }
+  CHECK(held_sum < 0.5 * unheld_sum);
 }
 
 TEST_CASE(teleop_coarse_encoder_forces_start_on_slow_motions) {

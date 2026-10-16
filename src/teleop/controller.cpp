@@ -2,7 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
+#include <deque>
 #include <limits>
 #include <stdexcept>
 
@@ -100,6 +100,12 @@ constexpr double kAdaptLogMax = 5.545177444479562;  // 2 ln 16
 // The share of the reflective store, beyond its grant, that the slave
 // device's work cap lets it take out (SlaveController::step).
 constexpr double kCapSpareShare = 0.5;
+// How many readings after a tax its bound on where the device lay in its
+// count is narrowed by the readings since (DeviceModel::book_tax).
+constexpr std::size_t kRefundLag = 12;
+// The master's rise horizon in the reflective architecture when its
+// configuration leaves it unset (MasterConfig::pc_rise_samples).
+constexpr int kReflectiveRiseSamples = 64;
 
 // The work into the two-port over a sample: the device's measured work
 // when it reports it, else the device model's. The port force phi opposes
@@ -118,7 +124,7 @@ double booked_work(std::optional<double>& last, const std::optional<double>& mea
 DeviceModel::DeviceModel(double mass, Nanos dt, double resolution, double force_rate,
                          bool adapt_force_rate, Nanos delay, Nanos max_delay, Nanos step,
                          bool estimate_noise)
-    : dt_(to_seconds(dt)), adapt_(adapt_force_rate) {
+    : dt_(to_seconds(dt)), adapt_(adapt_force_rate), refund_lag_(kRefundLag) {
   if (estimate_noise && resolution > 0.0) {
     noise_.emplace(to_seconds(dt), resolution);
   }
@@ -140,6 +146,79 @@ DeviceModel::DeviceModel(double mass, Nanos dt, double resolution, double force_
   }
 }
 
+DeviceModel::Tax DeviceModel::book_tax(double phi) {
+  Tax t;
+  const control::DevicePredictor& dev = predictor();
+  const double q = dev.resolution();
+  if (!(q > 0.0)) return t;
+  const auto line = control::quantization_tax_line(q, dev.held_force(), phi);
+  if (line.beta == 0.0) {
+    t.charged = line.alpha;
+  } else {
+    const auto u = dev.count_bounds();
+    t.charged = line.worst(u.lo, u.hi);
+    if (!taxes_.empty() && taxes_.back().reading == readings_) {
+      // A second command on the same reading acts from later than it, where
+      // its bounds no longer hold: neither tax is refunded.
+      taxes_.pop_back();
+    } else if (refund_lag_ > 0 && dev.lead_samples() < 1.0) {
+      taxes_.push_back({readings_, line, u.lo, u.hi, t.charged});
+    }
+  }
+  // The readings since a tax tell where the device lay when it was booked
+  // better than those before it; the true u lies within both bounds. The
+  // taxes settled so far are charged at most an upper bound D on the sum of
+  // their true values; each new one raises it by the least of its own bound
+  // (termwise) and what bounding it jointly with those settled within the
+  // window allows: D before the first of them plus the joint worst. Over a
+  // chatter of the port force the joint bound is far below the termwise
+  // sum, since the device cannot lie at the worst place for every tax at
+  // once.
+  const std::size_t window = dev.count_window_readings();
+  while (!settled_.empty() &&
+         readings_ - settled_.front().reading >= static_cast<long>(window)) {
+    settled_.pop_front();
+  }
+  while (!taxes_.empty() &&
+         readings_ - taxes_.front().reading >= static_cast<long>(refund_lag_)) {
+    const TaxRecord rec = taxes_.front();
+    taxes_.pop_front();
+    const auto lag = static_cast<std::size_t>(readings_ - rec.reading);
+    const auto later = dev.count_bounds_at(lag);
+    const double lo = std::max(rec.lo, later.lo), hi = std::min(rec.hi, later.hi);
+    if (lo > hi) {
+      // The readings contradict the bounds the tax was charged by: refund
+      // nothing, and start the sum afresh.
+      settled_.clear();
+      continue;
+    }
+    double net = std::min(rec.charged, rec.line.worst(lo, hi));
+    if (!settled_.empty()) {
+      std::vector<control::DevicePredictor::LaggedTax> joint;
+      double before = 0.0;
+      for (const auto& st : settled_) {
+        joint.push_back({static_cast<std::size_t>(readings_ - st.reading), st.line});
+        before += st.net;
+      }
+      joint.push_back({lag, rec.line});
+      net = std::min(net, dev.worst_tax(joint) - before);
+    }
+    settled_.push_back({rec.reading, rec.line, net});
+    t.refund += rec.charged - net;
+  }
+  return t;
+}
+
+void DeviceModel::set_count_window(std::size_t readings, double force_drift,
+                                   std::size_t refund_lag) {
+  for (auto& c : bank_) c.dev.set_count_window(readings, force_drift);
+  refund_lag_ = refund_lag;
+  if (refund_lag_ == 0) {
+    taxes_.clear();
+    settled_.clear();
+  }
+}
+
 void DeviceModel::set_actuation_delay(Nanos delay) {
   if (bank_.size() != 1) return;
   bank_[0].actuator.set_delay(delay);
@@ -157,6 +236,7 @@ void DeviceModel::set_actuation_delay(Nanos delay) {
 // it at all, and neither scores.
 double DeviceModel::book_and_observe(Nanos from, Nanos to, double dx, double h,
                                      Nanos cut_after, Nanos issued, Nanos issue) {
+  ++readings_;
   double work = 0.0;
   double least_miss = std::numeric_limits<double>::infinity();
   for (std::size_t i = 0; i < bank_.size(); ++i) {
@@ -257,7 +337,10 @@ MasterController::MasterController(const MasterConfig& cfg)
              cfg.actuation_delay, cfg.actuation_delay_max, cfg.actuation_delay_step,
              cfg.estimate_reading_noise),
       renderer_(cfg.wall_renderer),
-      enc_(cfg.deadband_params) {}
+      enc_(cfg.deadband_params) {
+  model_.set_count_window(static_cast<std::size_t>(std::max(0, cfg.count_window)),
+                          cfg.force_drift, static_cast<std::size_t>(std::max(0, cfg.refund_lag)));
+}
 
 void MasterController::receive(std::uint32_t seq, const Sample& s) {
   const bool newest = !has_value_ || seq > last_seq_;
@@ -328,9 +411,13 @@ MasterController::Step MasterController::step(Nanos now, Nanos sampled, double p
   const double f_reflected = has_value_ ? f_reflected_ : 0.0;
   if (cfg_.passivity != Passivity::kNone) {
     const auto pc = cfg_.predictive_pc
-                        ? control::limit_force_predictive(std::max(0.0, balance()), f_reflected, dev,
-                                                          cfg_.pc_hold_samples, cfg_.pc_confidence,
-                                                          cfg_.pc_tax_samples, cfg_.pc_rise_samples)
+                        ? control::limit_force_predictive(
+                              std::max(0.0, balance()), f_reflected, dev, cfg_.pc_hold_samples,
+                              cfg_.pc_confidence, cfg_.pc_tax_samples,
+                              cfg_.pc_rise_samples.value_or(
+                                  cfg_.passivity == Passivity::kModelMediated
+                                      ? 0
+                                      : kReflectiveRiseSamples))
                         : control::limit_force(port_, f_reflected, v_meas_, dt_);
     out.display_force = pc.value;
     out.pc_active = pc.active;
@@ -343,8 +430,8 @@ MasterController::Step MasterController::step(Nanos now, Nanos sampled, double p
     out.display_force = std::clamp(out.display_force, -cfg_.max_force, cfg_.max_force);
   }
   if (cfg_.encoder_resolution > 0.0) {
-    port_.account_energy(-control::quantization_tax(cfg_.encoder_resolution, dev.held_force(),
-                                                    out.display_force));
+    const auto tax = model_.book_tax(out.display_force);
+    port_.account_energy(tax.refund - tax.charged);
   }
   f_display_ = out.display_force;
   model_.command(now, f_display_);
@@ -388,6 +475,8 @@ SlaveController::SlaveController(const SlaveConfig& cfg, double position)
       x_sampled_(position),
       x_cmd_(position),
       x_master_est_(position) {
+  model_.set_count_window(static_cast<std::size_t>(std::max(0, cfg.count_window)),
+                          cfg.force_drift, static_cast<std::size_t>(std::max(0, cfg.refund_lag)));
   if (cfg.passivity == Passivity::kReflective && cfg.report_contact_force) {
     throw std::invalid_argument(
         "SlaveController: energy reflection needs the coupling force reported, not the contact "
@@ -474,8 +563,7 @@ SlaveController::Step SlaveController::step(Nanos now, Nanos sampled, double pos
     // nothing will leave towards the slave. The predictive PC also pays the
     // force's quantization tax from its grant, and what the forces in flight
     // are expected to take out at worst.
-    const double tax =
-        control::quantization_tax(cfg_.encoder_resolution, dev.held_force(), phi);
+    const double tax = control::quantization_tax(dev, phi);
     const double lead = dev.lead_samples() > 0.0
                             ? dev.lead_work() - cfg_.pc_confidence * dev.lead_sd()
                             : 0.0;
@@ -536,13 +624,11 @@ SlaveController::Step SlaveController::step(Nanos now, Nanos sampled, double pos
     f_ctrl_ = f_coupling;
     x_cmd_ += v_c_ * dt_;
   }
-  const double tax =
-      cfg_.encoder_resolution > 0.0
-          ? control::quantization_tax(cfg_.encoder_resolution, dev.held_force(), -f_ctrl_)
-          : 0.0;
-  terminal_net_ -= tax;
+  const auto booked = cfg_.encoder_resolution > 0.0 ? model_.book_tax(-f_ctrl_) : DeviceModel::Tax{};
+  const double tax = booked.charged;
+  terminal_net_ += booked.refund - tax;
   if (cfg_.passivity == Passivity::kReflective) {
-    store_.account_slave_energy(-tax);
+    store_.account_slave_energy(booked.refund - tax);
     if (port_work_) {
       // The device's cap: its grant, less the tax, which is booked and
       // is no work of the device's, and a share of what the store holds

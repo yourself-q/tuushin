@@ -90,6 +90,11 @@ void usage() {
                "  --pc-rise N           with encoders: samples a master force rise must be\n"
                "                        affordable for on the expected motion, 0 = off (64)\n"
                "  --slave-pc-rise N     the same at the slave (0)\n"
+               "  --count-window N      with encoders: readings the bounds on where a device\n"
+               "                        lies in its count rest on, 0 = none (24)\n"
+               "  --force-drift R       how fast they take the pushes to change, N/s (50)\n"
+               "  --refund-lag N        readings after which a tax is refunded as far as\n"
+               "                        the readings since narrow those bounds, 0 = never (12)\n"
                "  --initial-energy E    reflect: energy in the store at start in J (0)\n"
                "  --deadband K          perceptual deadband with Weber fraction K, both ways\n"
                "  --wall-k K            wall stiffness in N/m, or N/m^n (5000)\n"
@@ -199,6 +204,9 @@ Options parse(int argc, char** argv) {
     else if (a == "--pc-tax") o.cfg.pc_tax_samples = std::stoi(next());
     else if (a == "--pc-rise") o.cfg.master_pc_rise_samples = std::stoi(next());
     else if (a == "--slave-pc-rise") o.cfg.slave_pc_rise_samples = std::stoi(next());
+    else if (a == "--count-window") o.cfg.count_window = std::stoi(next());
+    else if (a == "--force-drift") o.cfg.force_drift = std::stod(next());
+    else if (a == "--refund-lag") o.cfg.refund_lag = std::stoi(next());
     else if (a == "--initial-energy") o.cfg.initial_energy = std::stod(next());
     else if (a == "--passivity") {
       const std::string p = next();

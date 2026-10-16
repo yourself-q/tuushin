@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 
 #include "tuushin/codec/deadband.hpp"
@@ -175,8 +176,13 @@ struct Teleop1DConfig {
   bool estimate_reading_noise = true;
   double pc_confidence = 1.0;
   int pc_tax_samples = 4;
-  int master_pc_rise_samples = 64;
+  std::optional<int> master_pc_rise_samples;  // unset: the architecture's
   int slave_pc_rise_samples = 0;
+  // With known resolutions, both controllers' bounds on where their
+  // devices lie in their counts (teleop::MasterConfig::count_window).
+  int count_window = 24;
+  double force_drift = 50.0;
+  int refund_lag = 12;
   // The actuation delays the controllers book and predict with
   // (teleop::ActuatorSchedule); negative means the devices' true ones
   // (MasterParams::actuation_delay), 0 takes every force to act at once.
