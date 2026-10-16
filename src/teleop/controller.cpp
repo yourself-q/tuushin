@@ -647,6 +647,7 @@ SlaveController::Step SlaveController::step(Nanos now, Nanos sampled, double pos
     // force the operator feels as a feedforward: in contact with a wall the
     // model describes, the slave then rests where the master is and pushes
     // as hard as the operator does, whatever the coupling's stiffness.
+    if (cfg_.encoder_resolution > 0.0) estimator_.set_position_noise(model_.reading_noise());
     estimator_.observe(position, velocity, contact_force);
     const double f_ff = live ? std::max(0.0, last_.energy) : 0.0;
     x_cmd_ = x_master_est_;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <deque>
 
@@ -66,6 +67,24 @@ struct WallModel {
 // simulation the operator felt 4000 of 5000 N/m. The surface takes up what
 // the stiffness leaves out.
 //
+// Noisy positions. A least-squares slope over positions read with an error
+// of variance s^2 is the true one times sxx_true / (sxx_true + n s^2): the
+// error spreads the positions without spreading the forces. Over 100
+// samples a few hundred micrometres apart, half a count of dither on a
+// 55 um encoder (31.7 um with the rounding) put the stiffness at 3000 to
+// 4600 of 5000 N/m, and the surface, which takes up what the stiffness
+// leaves out, 0.7 mm towards the master. With set_position_noise() the fit
+// takes the error's spread out of the positions' (the method of moments
+// for a known error variance, W. A. Fuller, Measurement Error Models,
+// Wiley 1987, sec. 1.1), and trusts a slope only where the true spread is
+// at least `min_reliability` of the read one: below that the correction
+// divides by little more than its own error. The standard error includes
+// the error's share. A fit with damping is not corrected: its velocity is
+// the positions differenced, whose error would have to be known as well.
+// With the slave's estimate of its reading noise, at 100 ms each way, the
+// model's stiffness stayed within 4000 to 6200 N/m and the operator felt
+// 4500 to 5200 rather than 3300 to 4000.
+//
 // Surface. With a stiffness, the surface is where the last `surface_window`
 // samples say it is (x - (f - b v) / k, averaged), so that a wall that moved
 // is found again within a few samples whatever the stiffness fit lags. Out
@@ -87,6 +106,7 @@ struct WallEstimatorParams {
   double stiffness_deadband = 0.1;
   bool estimate_damping = false;
   double max_stiffness = 50000.0;  // N/m; fits beyond it are not trusted
+  double min_reliability = 0.5;
 };
 
 class WallEstimator {
@@ -96,6 +116,9 @@ class WallEstimator {
   // One sample of the slave: its position (m), velocity (m/s) and the force
   // the wall pushes it back with (N).
   void observe(double x, double v, double f);
+  // The variance of a position's error (m^2), which the stiffness fit
+  // corrects for; 0 by default.
+  void set_position_noise(double variance) { position_noise_ = std::max(0.0, variance); }
   const WallModel& model() const { return model_; }
   bool in_contact() const { return contact_; }
   // The force noise taken (N, standard deviation).
@@ -116,6 +139,7 @@ class WallEstimator {
   bool has_last_ = false;
   bool contact_ = false;
   std::size_t run_ = 0;  // samples in a row past the threshold to switch
+  double position_noise_ = 0.0;  // m^2
   WallModel model_;
 };
 

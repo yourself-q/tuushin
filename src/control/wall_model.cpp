@@ -103,12 +103,28 @@ void WallEstimator::fit() {
       params = 3.0;
     }
   }
+  const bool damped = params > 2.0;
+  // The positions' spread less their error's.
+  const double su = n * position_noise_;
+  const double sxx_true = sxx - su;
+  const bool corrected = !damped && su > 0.0;
+  if (corrected) {
+    if (sxx_true < p_.min_reliability * sxx) return;
+    k = sxf / sxx_true;
+  }
   if (!(k > 0.0) || k > p_.max_stiffness) return;
   // The residuals' variance, and from it the slope's standard error; with
-  // damping, that of the stiffness given the velocity's share.
-  const double sse = std::max(0.0, sff - k * sxf - b * svf);
+  // damping, that of the stiffness given the velocity's share; corrected,
+  // Fuller's, in which the residuals carry k times the positions' error and
+  // the spread taken out is itself uncertain.
+  const double sse = corrected ? std::max(0.0, sff - 2.0 * k * sxf + k * k * sxx)
+                               : std::max(0.0, sff - k * sxf - b * svf);
   const double s2 = n > params ? sse / (n - params) : 0.0;
-  const double var_k = params > 2.0 ? s2 * svv / det : s2 / sxx;
+  const double var_k =
+      damped      ? s2 * svv / det
+      : corrected ? s2 / sxx_true +
+                        su * (s2 + k * k * position_noise_) / (sxx_true * sxx_true)
+                  : s2 / sxx;
   const double se = std::sqrt(var_k);
   if (se > p_.max_relative_error * k) return;
   if (model_.known() && std::fabs(k - model_.stiffness) <=
