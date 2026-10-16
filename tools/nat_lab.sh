@@ -97,7 +97,9 @@
 #                          udp (3478), tcp (3478) or tls (5349, with a
 #                          certificate for 192.0.2.10 made for the run and
 #                          given to the slave as its CA) (udp)
-#   --block-udp            natB lets no UDP out but to the rendezvous server
+#   --block-udp            natB lets no UDP out but to the rendezvous server;
+#                          with --open-at, the session must stay on the relay
+#                          (the direct path cannot open), and lose nothing
 #                          (tuushin's rendezvous runs over UDP), as a firewall
 #                          that lets out what it knows of and web traffic;
 #                          with --turn-over tcp or tls the session must run
@@ -515,10 +517,12 @@ if [ "$RC" = 0 ] && grep -q "^authenticated" "$LOG/master.out"; then
       grep -q "^session " "$LOG/slave.out" 2>/dev/null && break
       sleep 0.1
     done
-    if [ "$ONE_WAY" = 1 ]; then
-      # Stayed, and the master's samples all reached the slave.
+    if [ "$ONE_WAY" = 1 ] || [ "$BLOCK_UDP" = 1 ]; then
+      # Stayed, and the master's samples all reached the slave (and, with
+      # --block-udp, the slave's the master).
       ! grep -q "^left the relay" "$LOG/master.out" "$LOG/slave.out" || OK=0
       grep -q "missing 0 " "$LOG/slave.out" || OK=0
+      [ "$BLOCK_UDP" = 0 ] || grep -q "missing 0 " "$LOG/master.out" || OK=0
     else
       grep -q "^left the relay" "$LOG/master.out" || OK=0
       grep -q "^left the relay" "$LOG/slave.out" || OK=0
