@@ -1197,53 +1197,71 @@ quantization tax and a share of what the store holds beyond, or less its
 deficit. The firmware keeps to the cap tick by tick
 (`DeviceCore::keep_to_cap`). It predicts the coming tick's work from a
 velocity observer that feeds the motor's torque forward (Lorenz and Van
-Patten 1991), taking the worse of a rotor alone and of one held by a hand
-of any inertia, and lowers the torque until the work fits what is left.
-Once the cap is spent it holds the torque while the torque does no work,
-and lets it rise again only where the work the rise takes out repays the
-quantization tax it costs. What it cannot foresee, the books then owe. A
-shaft at a count's edge steps the torque's way unannounced, the torque
-times a count: 38 µJ at the ceiling. And the velocity estimate lags a
-stiff contact's push as it changes, which the torque turns into work at
-τ·dt for each rad/s it misses: where the cap is spent, a knob thrown off
-the object meets a torque the prediction lets turn it round within the
-tick for no work, and it comes back faster by what the estimate missed.
-Each device reports the most it overran its cap
-(`DeviceCore::worst_overrun`, in `tuushin-devsim`'s last lines and the
-ESP32's report): in 16 runs of the lab below, 7 to 34 µJ at the master
-and 7 to 70 µJ at the slave; with the emulated board's 1 ms tick and the
-coupling it gets under QEMU (`DEVSIM_ARGS="--tick-us 1000 --latency 0.1"
-SLAVE_ARGS="--kp 700"`), up to 115 µJ at the slave in 12 runs, half of
-them under 33 µJ. A margin for the estimate's spread does not pay: it
-cut a torque braking a hand's slow turn and let it back on at every
-count, at the tax each time.
+Patten 1991), taking the worse of a rotor alone and of one held by a
+hand of any inertia, and lowers the torque until the work fits what is
+left. Once the cap is spent it holds the torque while the torque does no
+work, and lets it rise again only where the work the rise takes out
+repays the quantization tax it costs. A rise it holds back it does not
+make, and it gives back the tax the host's books took for it when they
+commanded it (`State::tax` falls). Until it did, a slave on the emulated
+board, at rest against the object while its host raised the force twice,
+left the store 0.09 mJ down for as long as it stayed there: more than
+half of that run's lowest margin, −0.166 mJ. What it cannot foresee, the
+books then owe. A shaft at a count's edge steps the torque's way
+unannounced, the torque times a count: 38 µJ at the ceiling. And the
+velocity estimate lags a stiff contact's push as it changes, which the
+torque turns into work at τ·dt for each rad/s it misses: where the cap
+is spent, a knob thrown off the object meets a torque the prediction
+lets turn it round within the tick for no work, and it comes back faster
+by what the estimate missed. Each device reports the most it overran its
+cap (`DeviceCore::worst_overrun`, in `tuushin-devsim`'s last lines and
+the ESP32's report): in 16 runs of the lab below, 7 to 34 µJ at the
+master and 7 to 70 µJ at the slave; with the emulated board's 1 ms tick
+and the coupling it gets under QEMU (`DEVSIM_ARGS="--tick-us 1000
+--latency 0.1" SLAVE_ARGS="--kp 700"`), up to 115 µJ at the slave in 12
+runs, half of them under 33 µJ. A margin for the estimate's spread does
+not pay: it cut a torque braking a hand's slow turn and let it back on
+at every count, at the tax each time.
 
 Ten seconds of `device_lab.sh` on an Apple M4 Mac, a hand at the master,
 an object half a radian on at the slave:
 
 | | master | slave |
 |---|---|---|
-| States, lost | 10032, 0 | 13176, 0 |
-| device round trip p50 (a command to the State applying it) | 1.26 ms | 1.38 ms |
-| coupling | | 525 N/m |
-| largest force | 3.60 N displayed | 11.3 N |
-| energy | 0.0313 J | −0.0302 J |
-| work cap overrun at most | 34 µJ | 37 µJ |
-| margin at the end, and at its lowest | +1.10 mJ, −0.047 mJ | |
+| States, lost | 10032, 0 | 13193, 0 |
+| device round trip p50 (a command to the State applying it) | 1.40 ms | 1.28 ms |
+| coupling | | 524 N/m |
+| largest force | 3.52 N displayed | 11.4 N |
+| energy | 0.0303 J | −0.0294 J |
+| work cap overrun at most | 7.3 µJ | 20 µJ |
+| margin at the end, and at its lowest | +0.85 mJ, −0.024 mJ | |
 
-The dip is the teleoperator's, not the books'. Before the work cap, in a
+Before the work cap the dip was the teleoperator's, not the books'. In a
 run followed sample by sample (no damping on the devices, a coupling of
-300 N/m, a dip of 1.57 mJ), the slave's passivity controller switched the
-force between nothing and 3 to 4 N from one sample to the next as the
-slave left the object, and the 17.5 g knob bounced off it: with States
-0.8 to 1.8 ms old and a command acting 0.9 ms after it is sent, the speed
-reversed within a sample, and that one sample did 0.7 mJ of work; the
-master made the other 0.6 mJ. Under QEMU, the ESP32 firmware at the slave
-dipped 0.35, 1.27 and 2.1 mJ in three runs. With the cap, that set-up
-(`DEVICE_OPTS=",damping=0" SLAVE_ARGS="--kp 300"`) dipped 0.012 to 0.019
-mJ in three runs, the table's 0.041 to 0.060 mJ in five, and at a 1 ms
-tick 0.016 to 0.067 mJ in three: of the order of the devices'
-overruns.
+300 N/m, a dip of 1.57 mJ), the slave's passivity controller switched
+the force between nothing and 3 to 4 N from one sample to the next as
+the slave left the object, and the 17.5 g knob bounced off it: with
+States 0.8 to 1.8 ms old and a command acting 0.9 ms after it is sent,
+the speed reversed within a sample, and that one sample did 0.7 mJ of
+work; the master made the other 0.6 mJ. Under QEMU, the ESP32 firmware
+at the slave dipped 0.35, 1.27 and 2.1 mJ in three runs. With the cap,
+and the tax of the rises it holds back given back, that set-up
+(`DEVICE_OPTS=",damping=0" SLAVE_ARGS="--kp 300"`) dipped 0.013 to 0.039
+mJ in three runs, the table's 0.019 to 0.038 mJ in five, at a 1 ms tick
+0.002 to 0.032 mJ in three, and under QEMU 0.008 to 0.019 mJ in three,
+where the ESP32 overran its cap by 1.8 to 4.8 µJ.
+
+What is left is what the devices cannot foresee, and the books in
+flight. Mostly it is the master's overrun, which the margin meets where
+the slave's store is spent. At a 1 ms tick the slave once raised the
+force on a knob moving into the object at 0.17 m/s, which the object
+stopped within the tick: the rise took out none of the 0.085 mJ of tax
+it cost, and pushed the knob back with 0.038 mJ; the master's balance
+covered all but 0.031 mJ of the two. And the tax of a rise the device
+holds back stays in the books until the State that gives it back
+arrives, a round trip and a State's age after the command: 0.018 mJ at
+the start of one run, whose slave's host raised the force on a knob at
+rest every few milliseconds, and the device held each rise back.
 
 ## Known issues
 
@@ -1301,12 +1319,14 @@ overruns.
   motor's resistance and torque constant, and the resistance drifts with
   the windings' temperature.
 - **A device keeps to its work cap closely, not exactly.** What its
-  readings cannot foresee, a count's step and the velocity estimate's lag
-  behind a stiff contact's push, overruns the cap by up to 70 µJ at a
-  5 kHz tick and 115 µJ at 1 kHz in the lab, and the teleoperator's
-  margin still dips as the slave leaves the object, by 0.012 to 0.067 mJ
-  (A device in the loop, above). The prediction assumes a rigid shaft; a
-  compliant coupling between the motor and the knob is not modelled.
+  readings cannot foresee, a count's step and the velocity estimate's
+  lag behind a stiff contact's push, overruns the cap by up to 70 µJ at
+  a 5 kHz tick and 115 µJ at 1 kHz in the lab. The teleoperator's margin
+  still dips, by 0.002 to 0.039 mJ in the lab and under QEMU, and the
+  tax of a rise the device holds back is spent in the host's books until
+  the device gives it back, a round trip later (A device in the loop,
+  above). The prediction assumes a rigid shaft; a compliant coupling
+  between the motor and the knob is not modelled.
 - **Only the slave takes a relay, over UDP.** One relay is enough to cross
   both NATs, but a slave without one cannot be reached through a symmetric
   NAT, and a master cannot offer a relay of its own. There is no TURN over
