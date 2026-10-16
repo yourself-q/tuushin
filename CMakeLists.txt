@@ -12,6 +12,7 @@ endif()
 
 option(TUUSHIN_BUILD_TESTS "Build the unit tests" ON)
 option(TUUSHIN_BUILD_TOOLS "Build the command-line tools" ON)
+option(TUUSHIN_TLS "TURN over TLS, with OpenSSL if it is found" ON)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -72,6 +73,28 @@ else()
   endif()
   target_include_directories(tuushin PRIVATE ${SODIUM_INCLUDE_DIR})
   target_link_libraries(tuushin PRIVATE ${SODIUM_LIBRARY})
+endif()
+
+# OpenSSL (Apache License 2.0, 3.0 on) for TURN over TLS (net/tls.hpp); a
+# build without it relays over UDP and TCP only. Homebrew keeps OpenSSL out
+# of the default search path.
+set(TUUSHIN_HAVE_TLS OFF)
+if(TUUSHIN_TLS)
+  if(APPLE)
+    list(APPEND CMAKE_PREFIX_PATH /opt/homebrew/opt/openssl@3 /usr/local/opt/openssl@3)
+  endif()
+  find_package(OpenSSL 1.1.1 QUIET)
+  if(OpenSSL_FOUND)
+    set(TUUSHIN_HAVE_TLS ON)
+  else()
+    message(STATUS "OpenSSL not found: no TURN over TLS (apt install libssl-dev, brew install openssl@3)")
+  endif()
+endif()
+if(TUUSHIN_HAVE_TLS)
+  target_sources(tuushin PRIVATE src/net/tls_openssl.cpp)
+  target_link_libraries(tuushin PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+else()
+  target_sources(tuushin PRIVATE src/net/tls_none.cpp)
 endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")

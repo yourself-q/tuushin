@@ -26,3 +26,8 @@ add_executable(tuushin_tests
 )
 target_link_libraries(tuushin_tests PRIVATE tuushin_fw)
 add_test(NAME tuushin_tests COMMAND tuushin_tests)
+# TURN over TLS, against a TLS front of the tests' own (sim_tls.hpp).
+if(TUUSHIN_HAVE_TLS)
+  target_sources(tuushin_tests PRIVATE test_tls.cpp)
+  target_link_libraries(tuushin_tests PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()

@@ -15,7 +15,8 @@ std::string Route::to_string() const {
 Paths::Paths(UdpSocket& direct) : direct_(direct) {}
 
 void Paths::enable_relay(const Endpoint& server, const std::string& username,
-                         const std::string& password, RelayTransport transport) {
+                         const std::string& password, RelayTransport transport,
+                         const TlsSettings& tls) {
   const Endpoint local = direct_.local_endpoint();
   const auto address = local.address();
   const auto bind = Endpoint::from_address(address.data(), address.size(), 0);
@@ -34,9 +35,14 @@ void Paths::enable_relay(const Endpoint& server, const std::string& username,
     rx_.assign(std::size_t{1} << 16, 0);
     return;
   }
-  open_stream_ = [to = *to, from = *bind, dscp = direct_.dscp()]() -> std::unique_ptr<Stream> {
-    return std::make_unique<TcpStream>(to, from, dscp);
-  };
+  if (transport == RelayTransport::kTls) {
+    open_stream_ = [connector = TlsConnector(tls), to = *to, from = *bind,
+                    dscp = direct_.dscp()]() { return connector.open(to, from, dscp); };
+  } else {
+    open_stream_ = [to = *to, from = *bind, dscp = direct_.dscp()]() -> std::unique_ptr<Stream> {
+      return std::make_unique<TcpStream>(to, from, dscp);
+    };
+  }
   turn_.emplace(server, username, password, TurnClient::Transport::kStream);
   // Room for the largest message (20 + 65535 bytes) after a partial one.
   rx_.assign(std::size_t{1} << 17, 0);
@@ -154,8 +160,11 @@ std::optional<std::size_t> Paths::recv_stream(std::uint8_t* buffer, std::size_t 
 }
 
 bool Paths::wait_readable(Nanos timeout) {
-  // A message read with an earlier one and not yet handed out.
-  if (stream_ && next_message() != std::optional<std::size_t>{0}) return true;
+  // A message read with an earlier one and not yet handed out, or bytes
+  // the stream holds.
+  if (stream_ && (next_message() != std::optional<std::size_t>{0} || stream_->has_buffered())) {
+    return true;
+  }
   WaitFor waits[3];
   waits[0].fd = direct_.native_handle();
   if (relay_socket_) waits[1].fd = relay_socket_->native_handle();
@@ -187,7 +196,7 @@ void Paths::tend_stream(Nanos now) {
     turn_->connecting(now);
     try {
       stream_ = open_stream_();
-    } catch (const std::system_error& e) {
+    } catch (const std::exception& e) {
       turn_->disconnected(e.what(), now);
       return;
     }

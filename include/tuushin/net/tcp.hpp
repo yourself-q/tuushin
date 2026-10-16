@@ -31,6 +31,9 @@ class Stream {
   // Reads what has arrived, up to `capacity` bytes: the count, 0 if nothing
   // has, -1 once the connection is closed (by the other end or an error).
   virtual long read(std::uint8_t* buffer, std::size_t capacity) = 0;
+  // Whether bytes have arrived that read() returns without the socket
+  // becoming readable again (TLS decrypts a record at a time).
+  virtual bool has_buffered() const { return false; }
 
   // The socket, to wait on; and whether to wait for it to take more bytes
   // too (it is connecting, or bytes are waiting).

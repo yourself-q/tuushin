@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "paths_harness.hpp"
 #include "sim_turn.hpp"
 #include "test.hpp"
 #include "tuushin/net/paths.hpp"
@@ -17,6 +18,8 @@
 using namespace tuushin;
 using namespace tuushin::net;
 namespace stun = tuushin::net::stun;
+using test::PathsUnderTest;
+using test::receive;
 
 namespace {
 
@@ -571,19 +574,6 @@ struct Relayed {
   std::vector<std::pair<Endpoint, std::string>> received;
 };
 
-// The next datagram at `socket` within a second, as text.
-std::string receive(UdpSocket& socket, Endpoint* from) {
-  std::uint8_t buf[2048];
-  const Nanos deadline = monotonic_now() + kNanosPerSecond;
-  while (monotonic_now() < deadline) {
-    socket.wait_readable(kNanosPerMilli);
-    if (const auto n = socket.recv_from(buf, sizeof buf, from)) {
-      return std::string(reinterpret_cast<char*>(buf), *n);
-    }
-  }
-  return {};
-}
-
 }  // namespace
 
 TEST_CASE(turn_relays_through_a_server) {
@@ -724,34 +714,6 @@ TEST_CASE(paths_carry_datagrams_directly_and_through_the_relay) {
   REQUIRE(pump([&] { return received.size() == 5; }));
   CHECK(received[4].from == (Route{other.local_endpoint(), true}));
 }
-
-namespace {
-
-// Paths with a relay and a buffer for what arrives, pumped until a
-// condition holds.
-struct PathsUnderTest {
-  explicit PathsUnderTest(UdpSocket& direct) : paths(direct) {}
-
-  bool pump(const std::function<bool()>& done, Nanos timeout = 2 * kNanosPerSecond) {
-    const Nanos deadline = monotonic_now() + timeout;
-    while (!done() && monotonic_now() < deadline) {
-      paths.service(monotonic_now());
-      paths.wait_readable(kNanosPerMilli);
-      paths.service(monotonic_now());
-      std::uint8_t buf[256];
-      Route from;
-      while (const auto n = paths.recv(buf, sizeof buf, &from)) {
-        received.emplace_back(from, std::string(reinterpret_cast<char*>(buf), *n));
-      }
-    }
-    return done();
-  }
-
-  Paths paths;
-  std::vector<std::pair<Route, std::string>> received;
-};
-
-}  // namespace
 
 TEST_CASE(paths_reach_the_relay_over_tcp) {
   UdpSocket direct(*Endpoint::resolve("127.0.0.1", 0));

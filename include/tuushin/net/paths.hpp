@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "tuushin/net/tcp.hpp"
+#include "tuushin/net/tls.hpp"
 #include "tuushin/net/turn.hpp"
 #include "tuushin/net/udp.hpp"
 #include "tuushin/time.hpp"
@@ -34,14 +35,16 @@ struct Route {
 };
 
 // How this end reaches its TURN server: in datagrams, or over a TCP
-// connection where UDP does not get out.
-enum class RelayTransport { kUdp, kTcp };
+// connection where UDP does not get out, or over TLS on TCP where only
+// what looks like HTTPS does (RFC 8656, 3.1).
+enum class RelayTransport { kUdp, kTcp, kTls };
 
 // This end's ways to its peers: its socket, and optionally a relay on a
 // TURN server (turn.hpp), allocated from a second socket of its own, since
 // the server knows an allocation by the address it sees the client at and
 // takes every datagram from there for TURN's; or over a TCP connection of
-// its own, which the server knows the allocation by. The connection is
+// its own (TLS on it, optionally), which the server knows the allocation
+// by. The connection is
 // opened again when it drops (TurnClient's timers), and what arrives on it
 // is cut into TURN messages here.
 //
@@ -67,11 +70,14 @@ class Paths {
   // Allocates a relay on `server` with long-term credentials, from a new
   // socket bound to the direct socket's address with an ephemeral port and
   // marked with its DSCP, since it carries the same datagrams; over TCP the
-  // connections are made from such sockets. Throws if that socket cannot
-  // be bound or cannot send to the server.
+  // connections are made from such sockets, and over TLS they check the
+  // server by `tls`. Throws if that socket cannot be bound or cannot send
+  // to the server, or (std::runtime_error) if TLS cannot be set up
+  // (TlsConnector).
   void enable_relay(const Endpoint& server, const std::string& username,
                     const std::string& password,
-                    RelayTransport transport = RelayTransport::kUdp);
+                    RelayTransport transport = RelayTransport::kUdp,
+                    const TlsSettings& tls = {});
 
   UdpSocket& direct() { return direct_; }
   // The TURN client, if a relay is enabled.
