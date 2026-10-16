@@ -26,6 +26,7 @@ add_executable(tuushin_tests
   test_hops.cpp
   test_device_proto.cpp
   test_fw_core.cpp
+  test_fw_windings.cpp
   test_device_remote.cpp
 )
 target_link_libraries(tuushin_tests PRIVATE tuushin_fw)

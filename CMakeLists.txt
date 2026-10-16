@@ -109,6 +109,7 @@ endif()
 # it. The ESP-IDF project in firmware/esp32 compiles the same sources.
 add_library(tuushin_fw
   firmware/core/src/core.cpp
+  firmware/core/src/windings.cpp
   firmware/core/src/foc.cpp
   firmware/core/src/plant.cpp
 )
