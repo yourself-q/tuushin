@@ -594,9 +594,9 @@ readings:
 
 | one-way delay | model-mediated: stiffness | force error | conveyed | reflective: stiffness | force error | conveyed |
 |---|---|---|---|---|---|---|
-| 10 ms | 3468 N/m | 0.45 N | 100 % | 1094 N/m | 1.56 N | 101 % |
-| 50 ms | 1065 N/m | 0.69 N | 100 % | 192 N/m | 3.57 N | 41 % |
-| 100 ms | 498 N/m | 1.05 N | 101 % | 206 N/m | 5.38 N | 56 % |
+| 10 ms | 3483 N/m | 0.45 N | 100 % | 1094 N/m | 1.56 N | 101 % |
+| 50 ms | 1086 N/m | 0.67 N | 100 % | 192 N/m | 3.57 N | 41 % |
+| 100 ms | 523 N/m | 1.05 N | 101 % | 206 N/m | 5.38 N | 56 % |
 
 The force error is the RMS of the displayed against the contact force,
 delay included. The stiffness falls with the delay for one reason, the
@@ -608,7 +608,7 @@ at its own stiffness: on the 0.45 Hz motion at 100 ms each way, 5180 to
 where it is. No
 passivity controller can do anything about the first touch; sensing the
 wall before touching it could. The master's port gave out at most
-8.8e−8 J over these runs, the overrun of a one-sample prediction.
+6.1e−8 J over these runs, the overrun of a one-sample prediction.
 
 With 55 µm encoders at both ends the PC error (the displayed force less
 what the model asks for) is 0.57 N at 100 ms against 0.25 N with exact
@@ -654,6 +654,57 @@ from sample to sample, 131 N/s of variation against 23 N/s with exact
 readings; as the bound grows with the squared changes, the chatter adds
 to what limits the PC. Rendering from the filtered position instead of
 the reading cut the chatter by a quarter but not the error.
+
+**The limit cycle, and a surface that yields.** The chatter was a limit
+cycle. Held in the wall, the master oscillated by about a millimetre at
+33 Hz: the PC held the force back while the hand pushed in, so that it
+rose behind what the model asked for, and let it through while the hand
+came back out, until the books ran dry. More force on the way out than on
+the way in is negative damping, which kept the oscillation going, and
+the large changes it made raised the noise bound, which tightened the PC
+further. What the PC cut against was the trouble: a cut left the
+rendered surface where it was, and the next request, from that surface,
+tried to catch up. The master now moves the rendered surface in where
+its PC cuts, until the wall gives what was displayed
+(`WallRenderer::yield`), as passive set-position modulation moves a
+spring's set position where the energy available allows (D. Lee and
+K. Huang, IEEE T-RO 26(2), 2010). The wall stays a spring of the hand's
+position, and what the move releases, the energy the PC dissipated, is
+not spent on moving it back out. The PC error is then near zero by
+construction (the PC errors and episodes above are with `--no-yield`), so
+what follows compares the feel instead: for each contact after the
+first, a line through the displayed force over the position, whose
+slope is the stiffness felt and whose zero is the surface felt.
+
+The slave's fit fell short under the noise too. The positions' error
+spreads them without spreading the forces, which attenuates a
+least-squares slope, and the model put the wall at 3000 to 4600 N/m,
+with its surface 0.7 mm towards the master to make up the force. The fit
+now takes the error's spread out of the positions' (the method of
+moments for a known error variance, W. A. Fuller, *Measurement Error
+Models*, 1987), with the slave's own estimate of its reading noise
+(31.7 µm for half a count and the rounding, 31.8 µm in theory). The same
+twelve motions, medians with the 10th to 90th percentiles:
+
+| one-way delay | readings | contacts | stiffness felt | surface felt, beyond the wall |
+|---|---|---|---|---|
+| 10 ms | exact | 114 | 5056 N/m (5008 to 5080) | 0.012 mm (0.002 to 0.020) |
+| 10 ms | half a count | 117 | 4963 N/m (4500 to 5341) | 0.17 mm (0.03 to 0.38) |
+| 100 ms | exact | 114 | 5308 N/m (4916 to 5453) | 0.09 mm (0.03 to 0.13) |
+| 100 ms | half a count | 117 | 4896 N/m (4431 to 5381) | 0.23 mm (0.11 to 0.53) |
+| 100 ms | half a count, `--no-yield` | 284 | 5229 N/m (2623 to 10518) | 0.49 mm (0.04 to 4.09) |
+
+The motions make 113 presses after their first; with the surface
+yielding the hand meets the wall once per press, and the PC acts in
+0.9 % of the samples rather than 24 %. The force error against the
+contact is 0.53 N at 10 ms and 1.10 N at 100 ms, against 0.45 and 1.05 N
+with exact readings, and the master's true margin stays at 0 J. What the
+noise still costs is a surface felt 0.1 to 0.2 mm deeper, where the PC's
+cuts left it, a stiffness that varies by about a tenth from contact to
+contact, near the Weber fraction the model's updates are held to, and a
+displayed force that varies by 79 N/s against 23 N/s: most of that is
+the noise itself, rendered, 5000 N/m times 31.7 µm being 0.16 N on every
+reading.
 
 On the reflective scheme the second reading does not help: at 100 ms its
 PC acts in 91 % of the samples with exact readings too, and with the
@@ -1615,10 +1666,12 @@ few milliseconds, and the device held each rise back.
   microjoule. Encoders that dither cost far more: with half a count of
   noise the master conveys a fifth of the contact force at 10 ms, and
   under a tenth at 50 and 100 ms (Encoders that dither, above). The
-  model-mediated scheme with the noise tax and a second reading keeps
-  the PC error to about 2 N at 10 to 100 ms, against 0.04 to 0.25 N
-  with exact readings, and a held contact still breaks into two force
-  episodes (Model-mediated teleoperation, above).
+  model-mediated scheme with the noise tax, a second reading, a surface
+  that yields where the PC cuts and a fit corrected for the noise meets
+  the wall once per press, at a stiffness felt within a tenth of the
+  wall's, but 0.1 to 0.2 mm deeper than with exact readings, and with
+  the noise rendered as 0.16 N of force on every reading
+  (Model-mediated teleoperation, above).
 - **Exact readings of a misdescribed device are covered nearly, not
   entirely.** The model error margin covers misses like those already
   seen; a miss larger than any before it is not, and over nine hand
