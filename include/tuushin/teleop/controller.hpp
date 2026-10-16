@@ -45,9 +45,15 @@ namespace tuushin::teleop {
 //              (control/wall_model.hpp) through an impedance-type PC on its
 //              own books, and the slave follows the master's position with
 //              the force the master displays as a feedforward. The master's
-//              device port is passive whatever the models are; the slave's
-//              actuator is a position servo with its own supply, and nothing
-//              books its energy.
+//              device port is passive whatever the models are, to the PC's
+//              prediction: a lossless rendered spring returns all the
+//              operator put in, so the books stand at zero as a contact
+//              ends, and the one-sigma prediction of the sample in which the
+//              master turns overran them by 0.14 uJ against a 20 kN/m wall
+//              in simulation, repaid by the next rise (pc_tax_samples);
+//              pc_confidence 1.5 left no overrun. The slave's actuator is a
+//              position servo with its own supply, and nothing books its
+//              energy.
 enum class Passivity { kNone, kChannel, kReflective, kModelMediated };
 
 // One haptic sample as the two ends exchange it.

@@ -134,11 +134,21 @@ void WallRenderer::update(const WallModel& m, double x) {
   const double spring =
       model_.known() && x > surface_ ? model_.stiffness * (x - surface_) : 0.0;
   if (spring > 0.0) {
-    // Inside: the same spring force from the new stiffness, which stores
-    // f^2 / 2k.
-    reserve_ += 0.5 * spring * spring * (1.0 / model_.stiffness - 1.0 / m.stiffness);
+    // Inside: the same spring force from the new stiffness. A spring stores
+    // f^2 / 2k: a stiffer one releases energy, a softer one would store more
+    // than the operator put in, which only the reserve may pay for; beyond
+    // it the force drops to what the stored energy gives.
+    const double stored = 0.5 * spring * spring / model_.stiffness;
+    const double extra = 0.5 * spring * spring / m.stiffness - stored;
     model_ = m;
-    surface_ = x - spring / m.stiffness;
+    if (extra <= reserve_) {
+      reserve_ -= extra;
+      surface_ = x - spring / m.stiffness;
+    } else {
+      const double energy = stored + std::max(0.0, reserve_);
+      reserve_ = 0.0;
+      surface_ = x - std::sqrt(2.0 * energy / m.stiffness);
+    }
   } else {
     // Outside, or the first model: the model's surface, but not past the
     // master.

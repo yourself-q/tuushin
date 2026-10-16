@@ -121,7 +121,8 @@ class WallEstimator {
 
 // Renders a WallModel at the master. When a new model arrives while the
 // master is inside the wall, its surface is not taken at once: the
-// rendered surface is placed so that the force stays what it was. Placed at
+// rendered surface is placed so that the force stays what it was, as far
+// as the reserve below pays for a softer spring storing more. Placed at
 // the new model's surface, a wall the master learns of a round trip after
 // it reached it would push with the stiffness times how far the master went
 // on meanwhile, 6 cm/s for 0.2 s into 5000 N/m being 60 N: the jump of a
@@ -170,8 +171,8 @@ class WallRenderer {
   const WallModel& model() const { return model_; }
   double surface() const { return surface_; }
   double offset() const { return model_.known() ? surface_ - model_.surface : 0.0; }
-  // Energy released and not yet spent moving the surface back (J); less
-  // than 0 while a softer stiffness owes some.
+  // Energy released and not yet spent moving the surface back or on a
+  // softer spring (J).
   double reserve() const { return reserve_; }
 
  private:

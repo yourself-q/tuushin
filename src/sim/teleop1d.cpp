@@ -72,7 +72,7 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
     std::fprintf(log.get(),
                  "t,x_ref,x_m,v_m,f_hand,f_display,x_s,v_s,x_cmd,x_master_est,v_req,v_c,f_slave,"
                  "f_contact,ein_m,eout_m,ein_s,eout_s,store,grant_m,pc_m,pc_s,sent_fwd,sent_bwd,"
-                 "delay_m,delay_s,model_k,model_surface,render_surface,x_command\n");
+                 "delay_m,delay_s,model_k,model_surface,render_surface,x_command,w_act_m,reserve\n");
   }
 
   // Physics: the devices integrate between control steps with the forces
@@ -244,7 +244,7 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
       const auto& sp = slave.channel_port();
       std::fprintf(log.get(),
                    "%.4f,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,"
-                   "%.6g,%.6g,%.6g,%.6g,%.6g,%d,%d,%d,%d,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+                   "%.6g,%.6g,%.6g,%.6g,%.6g,%d,%d,%d,%d,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.9g,%.6g\n",
                    t, x_ref, x_m, v_m, f_hand, f_display, x_s, v_s, slave.command(),
                    slave.master_estimate(), slave.requested_velocity(), slave.command_velocity(),
                    slave.reported_force(), f_contact, mp.input_energy(), mp.output_energy(),
@@ -255,7 +255,8 @@ Teleop1DResult run_teleop1d(const Teleop1DConfig& cfg, net::ChannelModel& forwar
                    to_seconds(master.actuation_delay()) * 1e3,
                    to_seconds(slave.actuation_delay()) * 1e3, master.renderer().model().stiffness,
                    master.renderer().model().surface, master.renderer().surface(),
-                   master.command_position());
+                   master.command_position(), master_dev.actuator_work(),
+                   master.renderer().reserve());
     }
 
     sum_pos_err2 += (x_m - x_s) * (x_m - x_s);
