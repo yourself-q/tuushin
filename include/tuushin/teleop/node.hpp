@@ -146,11 +146,15 @@ struct RendezvousConfig {
   Nanos direct_check_interval = kNanosPerSecond;
 };
 
-// A relay on a TURN server (net/turn.hpp), with long-term credentials.
+// A relay on a TURN server (net/turn.hpp), with long-term credentials,
+// reached over UDP, TCP or TLS (net/paths.hpp).
 struct RelayConfig {
   net::Endpoint server;
   std::string username;
   std::string password;
+  net::RelayTransport transport = net::RelayTransport::kUdp;
+  // For kTls: how the server's certificate is checked.
+  net::TlsSettings tls;
 };
 
 struct MasterNodeConfig {

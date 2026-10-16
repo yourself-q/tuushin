@@ -26,6 +26,10 @@
 //   on the robot side:     tuushin-teleop slave --key-file K --rendezvous SERVER
 //                              --turn TURNSERVER --turn-user U --turn-pass-file P
 //
+// The relay is reached over UDP; where UDP does not get out, over TCP
+// (--turn turn:TURNSERVER?transport=tcp) or TLS (--turn turns:TURNSERVER),
+// which a firewall that lets only web traffic out also lets through.
+//
 // Both ends can impair their outgoing datagrams in-process to try a path on
 // loopback: --emulate-delay 25 on each end gives a 50 ms round trip, and
 // --emulate-trace replays a path recorded with tuushin-probe.
@@ -43,6 +47,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
@@ -59,6 +64,7 @@
 #include "tuushin/device/remote.hpp"
 #include "tuushin/net/channel.hpp"
 #include "tuushin/net/rendezvous.hpp"
+#include "tuushin/net/tls.hpp"
 #include "tuushin/net/trace.hpp"
 #include "tuushin/net/udp.hpp"
 #include "tuushin/rt/thread.hpp"
@@ -95,9 +101,13 @@ void usage() {
                "      --log PREFIX         per-session CSV log PREFIX<session>.csv\n"
                "      --hello-state FILE   keep the newest answered hello's time in FILE, so\n"
                "                           that hellos recorded before a restart stay refused\n"
-               "      --turn HOST[:PORT]   with --rendezvous: take a relay on this TURN server\n"
-               "                           (port 3478) and announce it, for masters that\n"
-               "                           cannot reach this end directly\n"
+               "      --turn SERVER        with --rendezvous: take a relay on this TURN server\n"
+               "                           and announce it, for masters that cannot reach\n"
+               "                           this end directly. HOST[:PORT] (UDP, port 3478)\n"
+               "                           or a TURN URI: turn:HOST[:PORT][?transport=tcp]\n"
+               "                           for TCP, turns:HOST[:PORT] for TLS (port 5349)\n"
+               "      --turn-ca FILE       with turns:, trust the PEM certificates in FILE\n"
+               "                           instead of the system's\n"
                "      --turn-user NAME     the TURN server's long-term credentials: user name\n"
                "      --turn-pass-file FILE\n"
                "                           and a file holding the password (first line)\n"
@@ -152,7 +162,8 @@ double parse_double(const std::string& s, const char* what) {
 
 constexpr std::uint16_t kDefaultPort = 47100;
 constexpr std::uint16_t kDefaultRendezvousPort = 47200;
-constexpr std::uint16_t kDefaultTurnPort = 3478;  // RFC 8656, section 18
+constexpr std::uint16_t kDefaultTurnPort = 3478;   // RFC 8656, section 18
+constexpr std::uint16_t kDefaultTurnsPort = 5349;  // over TLS, likewise
 
 struct Options {
   std::string mode;
@@ -183,7 +194,7 @@ struct Options {
   double wall_k = 5000.0;
   double kp = -1.0, kd = -1.0;  // negative: the default
   std::string hello_state;
-  std::string turn, turn_user, turn_pass_file;
+  std::string turn, turn_user, turn_pass_file, turn_ca;
   // emulation
   double delay_ms = 0.0, jitter_ms = 0.0, loss = 0.0;
   bool reorder = false;
@@ -532,13 +543,54 @@ std::optional<teleop::RendezvousConfig> rendezvous_of(const Options& o,
   return rc;
 }
 
+std::string lowercase(std::string s) {
+  for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return s;
+}
+
+// --turn: "HOST[:PORT]" over UDP, or a TURN URI (RFC 7065): "turn:" with
+// an optional "?transport=udp" or "?transport=tcp", or "turns:" for TLS.
+// "turns:...?transport=udp" would be DTLS, which is not supported.
+struct TurnServer {
+  std::string host;
+  std::uint16_t port;
+  net::RelayTransport transport;
+};
+
+TurnServer parse_turn(const std::string& s) {
+  const std::string scheme = lowercase(s.substr(0, s.find(':') + 1));
+  const bool secure = scheme == "turns:";
+  const bool uri = secure || scheme == "turn:";
+  std::string rest = uri ? s.substr(scheme.size()) : s;
+  std::string transport;
+  if (uri) {
+    const auto q = rest.find('?');
+    if (q != std::string::npos) {
+      const std::string query = rest.substr(q + 1);
+      rest = rest.substr(0, q);
+      transport = query.rfind("transport=", 0) == 0 ? lowercase(query.substr(10)) : "?";
+      if (transport != "udp" && transport != "tcp") {
+        throw std::runtime_error("bad TURN URI " + s + ": the query is transport=udp or tcp");
+      }
+    }
+  }
+  if (secure && transport == "udp") {
+    throw std::runtime_error("--turn " + s + ": TURN over DTLS is not supported; turns: is over TCP");
+  }
+  const auto [host, port] = split_host_port(rest, secure ? kDefaultTurnsPort : kDefaultTurnPort);
+  if (host.empty()) throw std::runtime_error("--turn " + s + " names no host");
+  return {host, port,
+          secure ? net::RelayTransport::kTls
+                 : transport == "tcp" ? net::RelayTransport::kTcp : net::RelayTransport::kUdp};
+}
+
 // The relay of --turn, reached from `sock`. The password comes from a file
 // rather than the command line, which other users can read in the process
 // list.
 std::optional<teleop::RelayConfig> relay_of(const Options& o, const net::UdpSocket& sock) {
   if (o.turn.empty()) {
-    if (!o.turn_user.empty() || !o.turn_pass_file.empty()) {
-      throw std::runtime_error("--turn-user and --turn-pass-file need --turn");
+    if (!o.turn_user.empty() || !o.turn_pass_file.empty() || !o.turn_ca.empty()) {
+      throw std::runtime_error("--turn-user, --turn-pass-file and --turn-ca need --turn");
     }
     return std::nullopt;
   }
@@ -548,9 +600,15 @@ std::optional<teleop::RelayConfig> relay_of(const Options& o, const net::UdpSock
   if (o.turn_user.empty() || o.turn_pass_file.empty()) {
     throw std::runtime_error("--turn needs --turn-user and --turn-pass-file");
   }
-  const auto [host, port] = split_host_port(o.turn, kDefaultTurnPort);
-  const auto server = net::Endpoint::resolve(host, port, o.ipv6);
-  if (!server) throw std::runtime_error("cannot resolve TURN server " + host);
+  const TurnServer turn = parse_turn(o.turn);
+  if (turn.transport == net::RelayTransport::kTls && !net::tls_supported()) {
+    throw std::runtime_error("--turn " + o.turn + ": this build has no TLS (OpenSSL was not found)");
+  }
+  if (!o.turn_ca.empty() && turn.transport != net::RelayTransport::kTls) {
+    throw std::runtime_error("--turn-ca is for a TURN server reached over TLS (turns:)");
+  }
+  const auto server = net::Endpoint::resolve(turn.host, turn.port, o.ipv6);
+  if (!server) throw std::runtime_error("cannot resolve TURN server " + turn.host);
   if (!server->for_family(sock.is_ipv6())) {
     throw std::runtime_error("the TURN server " + server->to_string() +
                              " is IPv6, and this host has no IPv6 socket");
@@ -568,7 +626,9 @@ std::optional<teleop::RelayConfig> relay_of(const Options& o, const net::UdpSock
     std::fprintf(stderr, "note: %s is readable by other users (chmod 600 it)\n",
                  o.turn_pass_file.c_str());
   }
-  return teleop::RelayConfig{*server, o.turn_user, password};
+  // The certificate is checked for the name given, or the address.
+  return teleop::RelayConfig{*server, o.turn_user, password, turn.transport,
+                             net::TlsSettings{turn.host, o.turn_ca}};
 }
 
 std::string join(const std::vector<net::Endpoint>& v) {
@@ -904,6 +964,7 @@ int main(int argc, char** argv) {
       else if (a == "--turn") o.turn = next();
       else if (a == "--turn-user") o.turn_user = next();
       else if (a == "--turn-pass-file") o.turn_pass_file = next();
+      else if (a == "--turn-ca") o.turn_ca = next();
       else if (a == "--emulate-delay") o.delay_ms = parse_double(next(), "emulate-delay");
       else if (a == "--emulate-jitter") o.jitter_ms = parse_double(next(), "emulate-jitter");
       else if (a == "--emulate-reorder") o.reorder = true;
@@ -914,7 +975,7 @@ int main(int argc, char** argv) {
                o.host.empty()) o.host = a;
       else throw std::runtime_error("unknown option " + a);
     }
-    if (o.mode != "slave" && !o.turn.empty()) {
+    if (o.mode != "slave" && (!o.turn.empty() || !o.turn_ca.empty())) {
       throw std::runtime_error("--turn is for the slave; the master reaches its relay");
     }
     if (o.mode != "slave" && (o.kp >= 0.0 || o.kd >= 0.0)) {

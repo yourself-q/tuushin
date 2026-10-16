@@ -838,8 +838,10 @@ struct Relayed {
 // server outside both NATs, and the server announces its address to the
 // master. With `rebind`, the slave's NAT forgets its mappings once the
 // session runs, the relay's included, which the TURN server then no
-// longer knows.
-Relayed relayed_session(test::SimNat::Mapping master_mapping, bool turn, bool rebind = false) {
+// longer knows. Over TCP the slave reaches the TURN server past its NAT,
+// as through one that lets TCP out and not UDP.
+Relayed relayed_session(test::SimNat::Mapping master_mapping, bool turn, bool rebind = false,
+                        RelayTransport transport = RelayTransport::kUdp) {
   using test::SimNat;
   UdpSocket server_sock(ep("127.0.0.1", 0));
   const Endpoint server = ep("127.0.0.1", server_sock.local_endpoint().port());
@@ -861,7 +863,8 @@ Relayed relayed_session(test::SimNat::Mapping master_mapping, bool turn, bool re
   RendezvousConfig master_rc = rc, slave_rc = rc;
   master_rc.server = master_nat.proxy(server);
   slave_rc.server = slave_nat.proxy(server);
-  const Endpoint turn_at = slave_nat.proxy(turn_server.endpoint());
+  const Endpoint turn_at = transport == RelayTransport::kUdp ? slave_nat.proxy(turn_server.endpoint())
+                                                             : turn_server.endpoint();
   master_nat.start();
   slave_nat.start();
 
@@ -876,7 +879,7 @@ Relayed relayed_session(test::SimNat::Mapping master_mapping, bool turn, bool re
   scfg.once = true;
   scfg.psk = psk;
   scfg.rendezvous = slave_rc;
-  if (turn) scfg.relay = RelayConfig{turn_at, "tuushin", "relay-secret"};
+  if (turn) scfg.relay = RelayConfig{turn_at, "tuushin", "relay-secret", transport, {}};
   SlaveNodeHooks hooks;
   hooks.on_rendezvous = [&](const std::string& what) {
     std::lock_guard<std::mutex> lock(mu);
@@ -936,6 +939,22 @@ TEST_CASE(session_runs_through_the_relay_between_symmetric_nats) {
   CHECK(r.slave[0].link.received > 0.95 * static_cast<double>(r.master.link.sent));
   CHECK(r.relayed_datagrams >= r.slave[0].link.received);
   CHECK(r.slave[0].link.foreign == 0 && r.master.link.foreign == 0);
+}
+
+TEST_CASE(session_runs_through_a_relay_reached_over_tcp) {
+  const auto r = relayed_session(test::SimNat::Mapping::kAddressPortDependent, true, false,
+                                 RelayTransport::kTcp);
+  REQUIRE(!r.master.rendezvous_failed && !r.master.handshake_failed);
+  CHECK(any_contains(r.slave_events, " over TCP, which sees this end at "));
+  REQUIRE(r.master.relays.size() == 1);
+  CHECK(r.master.relayed && r.master.slave == r.master.relays[0]);
+  CHECK(r.master.authenticated && r.master.slave_answered && r.master.slave_final);
+  REQUIRE(r.slave.size() == 1);
+  CHECK(r.slave[0].relayed && r.slave[0].ended_by_final);
+  CHECK(r.master.ticks + r.master.skipped > 550);
+  CHECK(r.master.link.received > 0.95 * static_cast<double>(r.slave[0].link.sent));
+  CHECK(r.slave[0].link.received > 0.95 * static_cast<double>(r.master.link.sent));
+  CHECK(r.allocations == 1);
 }
 
 TEST_CASE(symmetric_nats_meet_but_cannot_open_a_path_without_a_relay) {

@@ -806,12 +806,17 @@ TEST_CASE(paths_over_tcp_retry_a_refused_or_garbled_connection) {
   UdpSocket direct2(*Endpoint::resolve("127.0.0.1", 0));
   PathsUnderTest g(direct2);
   g.paths.enable_relay(at, "alice", "secret", RelayTransport::kTcp);
-  REQUIRE(g.pump([&] { return g.paths.stream() && g.paths.stream()->state() == Stream::State::kOpen; }));
   const int conn = ::accept(listener, nullptr, nullptr);
   REQUIRE(conn >= 0);
-  // The Allocate arrives; the answer is "decode_error", fatal.
+  // The Allocate arrives (waited for as it is: the stream's state() alone
+  // opens the stream before the TURN client is told and writes); the
+  // answer is "decode_error", fatal.
   std::uint8_t request[512];
-  CHECK(::recv(conn, request, sizeof request, 0) >= 20);
+  ssize_t got = 0;
+  REQUIRE(g.pump([&] {
+    if (got < 20) got = std::max(got, ::recv(conn, request, sizeof request, MSG_DONTWAIT));
+    return got >= 20;
+  }));
   const std::uint8_t alert[] = {0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x32};
   CHECK(::send(conn, alert, sizeof alert, 0) == sizeof alert);
   REQUIRE(g.pump([&] { return g.paths.stream() == nullptr; }));

@@ -11,6 +11,7 @@
 #include <cerrno>
 #include <climits>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -275,6 +276,12 @@ TlsConnector::TlsConnector(const TlsSettings& settings) {
   SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
   SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
   if (!settings.ca_file.empty()) {
+    // The system's reason, where OpenSSL's would be "BIO lib".
+    if (std::FILE* f = std::fopen(settings.ca_file.c_str(), "r")) {
+      std::fclose(f);
+    } else {
+      throw std::runtime_error("TLS: cannot read " + settings.ca_file + ": " + std::strerror(errno));
+    }
     if (SSL_CTX_load_verify_locations(ctx, settings.ca_file.c_str(), nullptr) != 1) {
       throw std::runtime_error("TLS: cannot load the certificates in " + settings.ca_file + ": " +
                                last_error("unreadable"));

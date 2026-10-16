@@ -194,19 +194,21 @@ TEST_CASE(tls_holds_back_at_most_the_backlog_and_sends_it_in_order) {
   CHECK(!s->wants_write());
 
   // Writes of 1000 bytes, each byte numbered, until one is refused: none
-  // is taken in part, and the refusal comes after the backlog is full.
+  // is taken in part, and the refusal comes after the backlog is full (and
+  // the kernel's buffers on the way, which grow to megabytes on loopback).
   std::vector<std::uint8_t> chunk(1000);
   std::size_t taken = 0;
-  for (int i = 0; i < 100000; ++i) {
+  bool refused = false;
+  for (int i = 0; i < 100000 && !refused; ++i) {
     for (std::size_t j = 0; j < chunk.size(); ++j) {
       chunk[j] = static_cast<std::uint8_t>((taken + j) % 251);
     }
-    if (!s->write(chunk.data(), chunk.size())) break;
-    taken += chunk.size();
+    refused = !s->write(chunk.data(), chunk.size());
+    if (!refused) taken += chunk.size();
     s->flush();
   }
+  CHECK(refused);
   CHECK(taken >= Stream::kMaxBacklog);
-  CHECK(taken < 64 * Stream::kMaxBacklog);  // it did stop
   CHECK(s->wants_write());
   CHECK(s->state() == Stream::State::kOpen);
 

@@ -115,6 +115,8 @@ class Paths {
 
   // The connection to the TURN server, while one is open or opening.
   Stream* stream() { return stream_.get(); }
+  // How the TURN server is reached, if a relay is enabled.
+  RelayTransport relay_transport() const { return relay_transport_; }
 
  private:
   bool streamed() const { return turn_ && turn_->transport() == TurnClient::Transport::kStream; }
@@ -133,6 +135,7 @@ class Paths {
   std::optional<UdpSocket> relay_socket_;
   std::optional<TurnClient> turn_;
   Endpoint server_;  // in the form relay_socket_ or a stream sends to
+  RelayTransport relay_transport_ = RelayTransport::kUdp;
   std::vector<std::uint8_t> wrapped_;
   std::vector<std::uint8_t> rx_;
   std::function<std::unique_ptr<Stream>()> open_stream_;

@@ -241,10 +241,14 @@ class RelayAnnouncer {
       allocations_ = turn->allocations();
       lost_told_ = false;
       rv.set_relays({turn->relayed()});
+      const net::RelayTransport t = paths.relay_transport();
       return std::string(untold ? "relay lost (" + turn->last_error() + "), and " : "") +
              "relay allocated at " + turn->relayed().to_string() + " on " +
-             turn->server().to_string() + ", which sees this end at " +
-             turn->mapped().to_string();
+             turn->server().to_string() +
+             (t == net::RelayTransport::kTcp   ? " over TCP"
+              : t == net::RelayTransport::kTls ? " over TLS"
+                                               : "") +
+             ", which sees this end at " + turn->mapped().to_string();
     }
     if (!turn->allocated() && !rv.relays().empty()) {
       rv.set_relays({});
@@ -821,7 +825,8 @@ std::vector<SlaveSessionReport> run_slave_node(net::UdpSocket& socket, Device1D&
   RelayAnnouncer relay_announcer;
   if (cfg.relay) {
     if (!cfg.rendezvous) throw std::invalid_argument("run_slave_node: a relay needs a rendezvous");
-    paths.enable_relay(cfg.relay->server, cfg.relay->username, cfg.relay->password);
+    paths.enable_relay(cfg.relay->server, cfg.relay->username, cfg.relay->password,
+                       cfg.relay->transport, cfg.relay->tls);
   }
   bool rv_answered = false;
   std::uint64_t rv_changes = 0;
